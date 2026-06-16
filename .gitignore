@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+test.pdf
+test_out.pdf
+smoke_test.py
+dist/
+build/
+*.spec
+_err.txt
+_out.txt
