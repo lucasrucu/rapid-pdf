@@ -4,7 +4,7 @@ from PySide6.QtWidgets import (
     QGraphicsPixmapItem, QGraphicsTextItem, QGraphicsItem,
     QInputDialog, QStyle, QApplication,
 )
-from PySide6.QtCore import Qt, QRectF, QPointF, QLineF, Signal, QBuffer, QIODevice
+from PySide6.QtCore import Qt, QRectF, QPointF, QLineF, Signal, QBuffer, QIODevice, QTimer
 from PySide6.QtGui import (
     QPen, QBrush, QColor, QPainter, QFont, QFontMetrics, QPixmap,
     QUndoStack, QUndoCommand,
@@ -643,6 +643,14 @@ class PDFCanvas(QGraphicsView):
         # In-app annotation clipboard (clones of copied items)
         self._clipboard_items: list = []
 
+        # Copy-confirmation flash: a brief pulsing outline over the copied items
+        self._flash_items: list = []
+        self._flash_step = 0
+        self._flash_total = 8
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setInterval(40)
+        self._flash_timer.timeout.connect(self._on_flash_tick)
+
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
@@ -772,10 +780,43 @@ class PDFCanvas(QGraphicsView):
 
     def copy_selected(self):
         """Snapshot the current selection into the in-app annotation clipboard."""
-        self._clipboard_items = [
-            i.clone() for i in self._scene.selectedItems() if isinstance(i, AnnotationBase)
-        ]
+        selected = [i for i in self._scene.selectedItems() if isinstance(i, AnnotationBase)]
+        self._clipboard_items = [i.clone() for i in selected]
+        if selected:
+            self._flash(selected)
         return len(self._clipboard_items)
+
+    def _flash(self, items):
+        """Briefly pulse an outline around items to confirm a copy (no text popup)."""
+        self._flash_items = list(items)
+        self._flash_step = 0
+        self._flash_timer.start()
+        self.viewport().update()
+
+    def _on_flash_tick(self):
+        self._flash_step += 1
+        if self._flash_step >= self._flash_total:
+            self._flash_timer.stop()
+            self._flash_items = []
+        self.viewport().update()
+
+    def drawForeground(self, painter: QPainter, rect: QRectF):
+        super().drawForeground(painter, rect)
+        if not self._flash_items:
+            return
+        frac = 1.0 - (self._flash_step / self._flash_total)  # 1 → 0 as it fades
+        margin = 3 + self._flash_step * 2                     # expands outward
+        col = QColor(0, 120, 215)
+        col.setAlphaF(max(0.0, frac))
+        painter.save()
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(col, 2.5))
+        for it in self._flash_items:
+            if it.scene() is None or not it.isVisible():
+                continue
+            r = it.sceneBoundingRect().adjusted(-margin, -margin, margin, margin)
+            painter.drawRoundedRect(r, 4, 4)
+        painter.restore()
 
     def has_clipboard_items(self) -> bool:
         return bool(self._clipboard_items)
