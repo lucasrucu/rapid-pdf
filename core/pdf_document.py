@@ -1,4 +1,5 @@
 import fitz
+import json
 import os
 import shutil
 import tempfile
@@ -6,6 +7,9 @@ from PySide6.QtGui import QPixmap, QImage
 
 
 RAPID_PDF_TAG = "rapid-pdf"
+# Name of the embedded file that carries the editable annotation model, so a
+# document saved by rapid-pdf reopens with its objects still movable/editable.
+MODEL_EMBED_NAME = "rapid_pdf_model.json"
 
 
 class PDFDocument:
@@ -129,6 +133,54 @@ class PDFDocument:
         self.doc.insert_pdf(src, from_page=from_page, to_page=to_page, start_at=start_at)
         src.close()
 
+    # ------------------------------------------------------------------
+    # Editable annotation model (embedded JSON) — for save/reopen round-trip
+    # ------------------------------------------------------------------
+
+    def write_annotation_model(self, model: dict):
+        """Embed the editable annotation model as a JSON file inside the PDF.
+
+        Replaces any previous copy. Stored at the document (catalog) level so it
+        survives page reorder/delete and a deflate+garbage save.
+        """
+        if not self.doc:
+            return
+        try:
+            data = json.dumps(model).encode("utf-8")
+            # Replace any previous copy (embfile_upd is unreliable for raw bytes
+            # in this PyMuPDF build, so delete + add).
+            if MODEL_EMBED_NAME in set(self.doc.embfile_names()):
+                self.doc.embfile_del(MODEL_EMBED_NAME)
+            self.doc.embfile_add(MODEL_EMBED_NAME, data)
+        except Exception as e:
+            print(f"Embed model error: {e}")
+
+    def read_annotation_model(self) -> dict | None:
+        """Return the embedded editable annotation model, or None if absent."""
+        if not self.doc:
+            return None
+        try:
+            if MODEL_EMBED_NAME not in set(self.doc.embfile_names()):
+                return None
+            data = self.doc.embfile_get(MODEL_EMBED_NAME)
+            return json.loads(bytes(data).decode("utf-8"))
+        except Exception as e:
+            print(f"Read model error: {e}")
+            return None
+
+    def delete_tagged_annotations(self, page_num: int):
+        """Strip rapid-pdf's baked annotations from a page.
+
+        Used on open so reconstructed editable items don't double-render on top of
+        the markup that was baked into the file on the previous save.
+        """
+        if not self.doc or page_num >= len(self.doc):
+            return
+        page = self.doc[page_num]
+        for a in list(page.annots()):
+            if a.info.get("title") == RAPID_PDF_TAG:
+                page.delete_annot(a)
+
     def write_annotations(self, page_num: int, annotations: list):
         """Replace all rapid-pdf-tagged annotations on this page with the given list."""
         if not self.doc or page_num >= len(self.doc):
@@ -199,7 +251,6 @@ class PDFDocument:
                             fontsize=font_size,
                             text_color=color,
                             fill_color=None,
-                            rect_color=None,
                         )
                         info = annot.info
                         info["title"] = RAPID_PDF_TAG

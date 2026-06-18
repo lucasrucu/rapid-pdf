@@ -193,6 +193,9 @@ class MainWindow(QMainWindow):
         self._canvas.set_document(self._doc)
         self._page_panel.set_document(self._doc)
         self._current_page = 0
+        if len(paths) == 1:
+            # A single freshly opened file may carry an editable model to restore.
+            self._load_saved_annotations()
         self._update_status(
             f"Combined {len(paths)} files" if len(paths) > 1 else ""
         )
@@ -415,6 +418,22 @@ class MainWindow(QMainWindow):
         for page_num in range(self._doc.page_count()):
             dicts = self._canvas.get_all_annotation_dicts(page_num)
             self._doc.write_annotations(page_num, dicts)
+        # Embed the editable model so the document reopens with its objects editable.
+        self._doc.write_annotation_model(self._canvas.export_annotation_model())
+
+    def _load_saved_annotations(self):
+        """If the opened PDF carries our embedded model, rebuild editable objects.
+
+        The baked markup is stripped first so reconstructed items don't render on
+        top of it; it is re-baked on the next save.
+        """
+        model = self._doc.read_annotation_model()
+        if not model:
+            return
+        for pn in range(self._doc.page_count()):
+            self._doc.delete_tagged_annotations(pn)
+        self._canvas.load_annotation_model(model)
+        self._canvas.reload_current_page()
 
     def _on_page_selected(self, page_num: int):
         if page_num == self._current_page and self._doc.doc:

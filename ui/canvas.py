@@ -888,6 +888,111 @@ class PDFCanvas(QGraphicsView):
         return [item.to_annotation_dict(self._zoom)
                 for item in self._page_annotations.get(page_num, [])]
 
+    # ------------------------------------------------------------------
+    # Editable annotation model — JSON round-trip (save → reopen → still editable)
+    # ------------------------------------------------------------------
+
+    def _item_to_json(self, item) -> dict | None:
+        """Convert one annotation to a JSON-safe dict, or None to skip it.
+
+        Images are skipped: they are baked into page content on save and stay
+        editable on reopen via the existing embedded-image "lift" feature.
+        """
+        d = item.to_annotation_dict(self._zoom)
+        t = d.get("type")
+        if t == "image":
+            return None
+        j = {"type": t}
+        if "fitz_rect" in d:
+            r = d["fitz_rect"]
+            j["rect"] = [r.x0, r.y0, r.x1, r.y1]
+        if "p1" in d and "p2" in d:
+            j["p1"] = [d["p1"].x, d["p1"].y]
+            j["p2"] = [d["p2"].x, d["p2"].y]
+        for k in ("color", "stroke_color", "fill_color", "font_color"):
+            if k in d:
+                j[k] = list(d[k])
+        for k in ("opacity", "line_width", "font_size", "text"):
+            if k in d:
+                j[k] = d[k]
+        return j
+
+    def export_annotation_model(self) -> dict:
+        """Serialize every page's editable annotations for embedding in the PDF."""
+        pages: dict[str, list] = {}
+        for page_num, items in self._page_annotations.items():
+            out = [j for j in (self._item_to_json(it) for it in items) if j is not None]
+            if out:
+                pages[str(page_num)] = out
+        return {"version": 1, "pages": pages}
+
+    def _item_from_dict(self, j: dict, page_num: int):
+        """Rebuild a canvas item from its JSON form (inverse of _item_to_json)."""
+        z = self._zoom
+        t = j.get("type")
+
+        def col(key, default=(0.0, 0.0, 0.0)):
+            v = j.get(key, default)
+            return QColor.fromRgbF(float(v[0]), float(v[1]), float(v[2]))
+
+        try:
+            if t in ("rect", "highlight"):
+                r = j["rect"]
+                rect = QRectF(r[0] * z, r[1] * z, (r[2] - r[0]) * z, (r[3] - r[1]) * z)
+                opacity = j.get("opacity", 1.0)
+                if t == "highlight":
+                    item = HighlightItem(rect, col("color"), opacity, page_num)
+                else:
+                    fill = col("fill_color") if "fill_color" in j else None
+                    item = RectAnnotationItem(
+                        rect, col("stroke_color"), fill, opacity, page_num,
+                        j.get("line_width", 2.0),
+                    )
+                item.text = j.get("text", "")
+                item._font_size = j.get("font_size", 12)
+                if "font_color" in j:
+                    item._font_color = col("font_color")
+                return item
+            if t == "line":
+                p1, p2 = j["p1"], j["p2"]
+                line = QLineF(p1[0] * z, p1[1] * z, p2[0] * z, p2[1] * z)
+                return LineAnnotationItem(
+                    line, col("color"), j.get("opacity", 1.0), page_num,
+                    j.get("line_width", 2.0),
+                )
+            if t == "text":
+                r = j["rect"]
+                pos = QPointF(r[0] * z, r[1] * z)
+                return TextAnnotationItem(
+                    pos, j.get("text", ""), col("color"),
+                    j.get("font_size", 12), page_num,
+                )
+        except Exception as e:
+            print(f"Reconstruct error ({t}): {e}")
+        return None
+
+    def load_annotation_model(self, model: dict):
+        """Reconstruct editable items from an embedded model after opening a PDF."""
+        if not model:
+            return
+        for page_str, items_json in model.get("pages", {}).items():
+            try:
+                page_num = int(page_str)
+            except (ValueError, TypeError):
+                continue
+            for j in items_json:
+                item = self._item_from_dict(j, page_num)
+                if item is None:
+                    continue
+                self._scene.addItem(item)
+                self._page_annotations.setdefault(page_num, []).append(item)
+                item.setVisible(page_num == self._current_page)
+
+    def reload_current_page(self):
+        """Re-render the current page (e.g. after stripping baked markup on open)."""
+        if self._doc and self._doc.page_count() > 0:
+            self._load_page(self._current_page)
+
     def get_render_zoom(self) -> float:
         return self._zoom
 
