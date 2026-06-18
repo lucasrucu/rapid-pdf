@@ -99,11 +99,13 @@ class ToolBar(QWidget):
     fill_toggled = Signal(bool)
     line_width_changed = Signal(float)
     font_size_changed = Signal(int)
+    font_color_changed = Signal(QColor)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("ToolBar")
         self._color = PRESETS[0]
+        self._font_color = QColor(0, 0, 0)
         self._opacity = 0.5
         self._tool_btns: dict[str, QPushButton] = {}
         self._setup_ui()
@@ -173,6 +175,20 @@ class ToolBar(QWidget):
         self._font_spin.valueChanged.connect(lambda v: self.font_size_changed.emit(v))
         font_layout.addWidget(self._font_spin)
         layout.addWidget(font_row)
+
+        # Font color — governs text labels and text typed inside shapes
+        fcolor_row = QWidget()
+        fcolor_layout = QHBoxLayout(fcolor_row)
+        fcolor_layout.setContentsMargins(0, 0, 0, 0)
+        fcolor_layout.setSpacing(4)
+        fcolor_layout.addWidget(QLabel("Text"))
+        self._font_color_btn = QPushButton("Color…")
+        self._font_color_btn.setFixedHeight(24)
+        self._font_color_btn.setToolTip("Color of text labels and text inside shapes")
+        self._font_color_btn.clicked.connect(self._open_font_color_dialog)
+        fcolor_layout.addWidget(self._font_color_btn)
+        layout.addWidget(fcolor_row)
+        self._update_font_color_btn()
 
         layout.addWidget(self._divider())
 
@@ -258,6 +274,26 @@ class ToolBar(QWidget):
             f"border: 1px solid #666; border-radius: 3px; padding: 3px 4px; }}"
             f"QPushButton:hover {{ border: 1px solid #fff; }}"
         )
+
+    def _update_font_color_btn(self):
+        text_color = "#000" if _luminance(self._font_color) > 128 else "#fff"
+        self._font_color_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {self._font_color.name()}; color: {text_color}; "
+            f"border: 1px solid #666; border-radius: 3px; padding: 2px 4px; }}"
+            f"QPushButton:hover {{ border: 1px solid #fff; }}"
+        )
+
+    def _open_font_color_dialog(self):
+        color = QColorDialog.getColor(self._font_color, self, "Pick Text Color")
+        if color.isValid():
+            self._font_color = color
+            self._update_font_color_btn()
+            self.font_color_changed.emit(color)
+
+    def set_displayed_font_color(self, color: QColor):
+        """Reflect a selection's text color without emitting (no feedback loop)."""
+        self._font_color = QColor(color)
+        self._update_font_color_btn()
 
     def _on_tool(self, tool: str):
         for tid, btn in self._tool_btns.items():

@@ -34,6 +34,7 @@ class AnnotationBase:
     def set_fill(self, enabled: bool, color: QColor): pass
     def set_line_width(self, w: float): pass
     def set_font_size(self, size: int): pass
+    def set_font_color(self, c: QColor): pass
 
 
 # ---------------------------------------------------------------------------
@@ -49,11 +50,16 @@ class AnnotationItem(QGraphicsRectItem, AnnotationBase):
         self.ann_type = ann_type
         self.text = ""
         self._font_size = 12
+        self._font_color = QColor(0, 0, 0)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.setAcceptHoverEvents(True)
 
     def set_font_size(self, size: int):
         self._font_size = size
+        self.update()
+
+    def set_font_color(self, c: QColor):
+        self._font_color = QColor(c)
         self.update()
 
     def boundingRect(self) -> QRectF:
@@ -76,6 +82,8 @@ class AnnotationItem(QGraphicsRectItem, AnnotationBase):
         if self.text:
             d["text"] = self.text
             d["font_size"] = self._font_size
+            fc = self._font_color
+            d["font_color"] = (fc.redF(), fc.greenF(), fc.blueF())
         return d
 
     def clone(self) -> "AnnotationItem":
@@ -114,7 +122,7 @@ class AnnotationItem(QGraphicsRectItem, AnnotationBase):
         inner = r.adjusted(6, 6, -6, -6)
         painter.save()
         painter.setFont(QFont("Arial", self._font_size))
-        painter.setPen(QPen(QColor(0, 0, 0)))
+        painter.setPen(QPen(self._font_color))
         painter.drawText(
             inner,
             Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
@@ -158,6 +166,7 @@ class HighlightItem(AnnotationItem):
         item.setPos(self.pos())
         item.text = self.text
         item._font_size = self._font_size
+        item._font_color = QColor(self._font_color)
         return item
 
 
@@ -229,6 +238,7 @@ class RectAnnotationItem(AnnotationItem):
         item.setPos(self.pos())
         item.text = self.text
         item._font_size = self._font_size
+        item._font_color = QColor(self._font_color)
         return item
 
 
@@ -371,6 +381,10 @@ class TextAnnotationItem(QGraphicsTextItem, AnnotationBase):
         self._apply_style()
         self.update()
 
+    # For a free-floating text label the text color *is* its color.
+    def set_font_color(self, c: QColor):
+        self.set_color(c)
+
     def set_font_size(self, size: int):
         self._font_size = size
         self._apply_style()
@@ -429,7 +443,7 @@ class TextAnnotationItem(QGraphicsTextItem, AnnotationBase):
 def style_snapshot(item) -> dict:
     """Capture every style/text attribute an annotation item might carry."""
     snap = {}
-    for attr in ("_color", "_stroke", "_fill", "_opacity", "_line_width", "_font_size"):
+    for attr in ("_color", "_stroke", "_fill", "_opacity", "_line_width", "_font_size", "_font_color"):
         if hasattr(item, attr):
             v = getattr(item, attr)
             snap[attr] = QColor(v) if isinstance(v, QColor) else v
@@ -614,6 +628,7 @@ class PDFCanvas(QGraphicsView):
         self._fill_enabled = False
         self._line_width = 2.0
         self._font_size = 12
+        self._font_color = QColor(0, 0, 0)
 
         # Drawing state
         self._drawing = False
@@ -774,6 +789,13 @@ class PDFCanvas(QGraphicsView):
                  if isinstance(i, TextAnnotationItem)
                  or (isinstance(i, AnnotationItem) and not isinstance(i, ImageAnnotationItem))]
         self._apply_style_change(items, lambda it: it.set_font_size(size), "Change font size")
+
+    def set_font_color(self, color: QColor):
+        self._font_color = QColor(color)
+        items = [i for i in self._scene.selectedItems()
+                 if isinstance(i, TextAnnotationItem)
+                 or (isinstance(i, AnnotationItem) and not isinstance(i, ImageAnnotationItem))]
+        self._apply_style_change(items, lambda it: it.set_font_color(color), "Change font color")
 
     def delete_selected(self):
         items = [i for i in self._scene.selectedItems() if isinstance(i, AnnotationBase)]
@@ -1246,7 +1268,7 @@ class PDFCanvas(QGraphicsView):
                     text, ok = QInputDialog.getText(self, "Add Text", "Enter text:")
                     if ok and text.strip():
                         new_item = TextAnnotationItem(
-                            scene_pos, text, self._color, self._font_size, self._current_page
+                            scene_pos, text, self._font_color, self._font_size, self._current_page
                         )
                         self._attach_item(new_item)
                         self._scene.clearSelection()
@@ -1266,6 +1288,7 @@ class PDFCanvas(QGraphicsView):
                         self._line_width,
                     )
                     self._temp_item._font_size = self._font_size
+                    self._temp_item._font_color = QColor(self._font_color)
                 else:  # line
                     self._temp_item = LineAnnotationItem(
                         QLineF(scene_pos, scene_pos),
