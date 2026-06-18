@@ -157,7 +157,7 @@ class MainWindow(QMainWindow):
         menu.addAction(action)
 
     def _setup_shortcuts(self):
-        for key, tool in [("v", "select"), ("h", "highlight"), ("r", "rect"), ("l", "line"), ("t", "text")]:
+        for key, tool in [("v", "select"), ("r", "rect"), ("l", "line"), ("t", "text")]:
             sc = QShortcut(key, self)
             sc.activated.connect(lambda t=tool: self._toolbar.trigger_tool(t))
 

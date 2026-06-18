@@ -119,7 +119,6 @@ class ToolBar(QWidget):
         layout.addWidget(self._section_label("TOOLS"))
         for tid, label in [
             ("select",    "Select  V"),
-            ("highlight", "Highlight  H"),
             ("rect",      "Rectangle  R"),
             ("line",      "Line  L"),
             ("text",      "Text  T"),
@@ -151,11 +150,11 @@ class ToolBar(QWidget):
         width_layout.setSpacing(4)
         width_layout.addWidget(QLabel("Width"))
         self._width_spin = QSpinBox()
-        self._width_spin.setRange(1, 20)
+        self._width_spin.setRange(0, 20)
         self._width_spin.setValue(2)
         self._width_spin.setSuffix(" px")
         self._width_spin.setFixedHeight(24)
-        self._width_spin.setToolTip("Stroke width for rectangles and lines")
+        self._width_spin.setToolTip("Stroke width for rectangles and lines (0 = borderless)")
         self._width_spin.valueChanged.connect(lambda v: self.line_width_changed.emit(float(v)))
         width_layout.addWidget(self._width_spin)
         layout.addWidget(width_row)
@@ -222,7 +221,7 @@ class ToolBar(QWidget):
         # --- Keyboard hints ---
         layout.addWidget(self._divider())
         hints = QLabel(
-            "V/H/R/L/T — tools\n"
+            "V/R/L/T — tools\n"
             "Del — delete\n"
             "Dbl-click — text\n"
             "Ctrl+drag — copy\n"

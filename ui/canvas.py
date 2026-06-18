@@ -175,12 +175,18 @@ class RectAnnotationItem(AnnotationItem):
         self._apply_style()
 
     def _apply_style(self):
-        pen_c = QColor(self._stroke)
-        pen_c.setAlphaF(self._opacity)
-        self.setPen(QPen(pen_c, self._line_width))
+        borderless = self._line_width <= 0
+        if borderless:
+            self.setPen(QPen(Qt.PenStyle.NoPen))
+        else:
+            pen_c = QColor(self._stroke)
+            pen_c.setAlphaF(self._opacity)
+            self.setPen(QPen(pen_c, self._line_width))
         if self._fill:
             fill_c = QColor(self._fill)
-            fill_c.setAlphaF(self._opacity * 0.4)
+            # A borderless filled rect acts as a highlighter → honor opacity directly;
+            # a bordered rect keeps a lighter fill so the outline stays readable.
+            fill_c.setAlphaF(self._opacity if borderless else self._opacity * 0.4)
             self.setBrush(QBrush(fill_c))
         else:
             self.setBrush(QBrush(Qt.BrushStyle.NoBrush))
@@ -1248,16 +1254,11 @@ class PDFCanvas(QGraphicsView):
                         self._push(AddItemsCommand(self, [new_item], "Add text"))
                         self.annotation_changed.emit()
 
-            elif self._tool in ("highlight", "rect", "line"):
+            elif self._tool in ("rect", "line"):
                 self._drawing = True
                 self._draw_start = scene_pos
 
-                if self._tool == "highlight":
-                    self._temp_item = HighlightItem(
-                        QRectF(scene_pos, scene_pos),
-                        self._color, self._opacity, self._current_page,
-                    )
-                elif self._tool == "rect":
+                if self._tool == "rect":
                     fill = self._color if self._fill_enabled else None
                     self._temp_item = RectAnnotationItem(
                         QRectF(scene_pos, scene_pos),
