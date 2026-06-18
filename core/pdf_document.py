@@ -64,7 +64,8 @@ class PDFDocument:
         if not self.doc or not (self.path or path):
             return False
         target = path or self.path
-        is_same = os.path.abspath(target) == os.path.abspath(self.path)
+        # An untitled (merged) doc has no current path → it's never an in-place save.
+        is_same = self.path is not None and os.path.abspath(target) == os.path.abspath(self.path)
         try:
             if is_same:
                 dir_path = os.path.dirname(os.path.abspath(target))
@@ -76,6 +77,8 @@ class PDFDocument:
                 self.doc = fitz.open(target)
             else:
                 self.doc.save(target, garbage=4, deflate=True)
+            # Adopt the target as the canonical path so later saves write in place.
+            self.path = target
             return True
         except Exception as e:
             print(f"Save error: {e}")

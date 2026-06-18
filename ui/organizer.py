@@ -91,6 +91,7 @@ class PageOrganizer(QWidget):
     pages_reordered_perm = Signal(list)  # new page order (permutation of old indices)
     pages_deleted = Signal(list)        # list of deleted page indices (descending)
     needs_rebuild = Signal()            # ask the host to rebuild the markup thumbnails
+    pages_added = Signal(int)           # pages inserted via "+ Add Pages" (count) → host marks unsaved
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -206,6 +207,7 @@ class PageOrganizer(QWidget):
         paths = sorted(paths)
         selected = self._list.selectedItems()
         at = self._list.row(selected[-1]) + 1 if selected else self._doc.page_count()
+        total = 0
         errors = []
         for path in paths:
             try:
@@ -214,9 +216,12 @@ class PageOrganizer(QWidget):
                 src.close()
                 self._doc.insert_pdf(path, start_at=at)
                 at += count
+                total += count
             except Exception as e:
                 errors.append(f"{path}: {e}")
         self.needs_rebuild.emit()  # host rebuilds markup thumbnails + calls set_document
+        if total:
+            self.pages_added.emit(total)  # merge → host marks the doc untitled + unsaved
         if errors:
             QMessageBox.critical(self, "Insert Error", "\n".join(errors))
 
