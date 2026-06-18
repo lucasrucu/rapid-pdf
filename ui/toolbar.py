@@ -491,16 +491,19 @@ class ToolBar(QWidget):
         if stroke is not None:
             self._line_btn.set_current_color(stroke)
 
+        line_width = summary.get("line_width") if summary else None
+        if line_width is not None:
+            self._line_btn.set_width(line_width)
+            if line_width <= 0:
+                # A 0-width border IS "No Line" — show that, not a color chip.
+                self._line_btn.set_none()
+
         fill = summary.get("fill") if summary else None
         fill_color = summary.get("fill_color") if summary else None
         if fill is False:
             self._fill_btn.set_none()
         elif fill_color is not None:
             self._fill_btn.set_current_color(fill_color)
-
-        line_width = summary.get("line_width") if summary else None
-        if line_width is not None:
-            self._line_btn.set_width(line_width)
 
         opacity = summary.get("opacity") if summary else None
         if opacity is not None:

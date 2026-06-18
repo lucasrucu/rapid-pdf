@@ -1472,6 +1472,9 @@ class PDFCanvas(QGraphicsView):
                         self.annotation_changed.emit()
 
             elif self._tool in ("rect", "line"):
+                # Starting a new shape drops any current selection, so you can draw
+                # straight over an existing (selected) object without deselecting first.
+                self._scene.clearSelection()
                 self._drawing = True
                 self._draw_start = scene_pos
 
