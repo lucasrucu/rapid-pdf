@@ -56,7 +56,8 @@ class MainWindow(QMainWindow):
         self._doc = PDFDocument()
         self._current_page = 0
         self._org_render = None  # throwaway clone backing the Organizer's markup thumbnails
-        self.setWindowTitle("Rapid PDF")
+        self._dirty = False      # unsaved changes exist (annotations, page edits, merges)
+        self._update_title()
         self.setMinimumSize(1100, 720)
         self.setStyleSheet(_APP_STYLE)
         self._setup_ui()
@@ -99,6 +100,8 @@ class MainWindow(QMainWindow):
         self._toolbar.fill_toggled.connect(self._canvas.set_fill_enabled)
         self._toolbar.line_width_changed.connect(self._canvas.set_line_width)
         self._toolbar.font_size_changed.connect(self._canvas.set_font_size)
+        self._toolbar.font_color_changed.connect(self._canvas.set_font_color)
+        self._canvas.selection_changed.connect(self._toolbar.show_selection)
         editor_layout.addWidget(self._toolbar)
 
         self._tabs.addTab(editor_widget, "Editor")
@@ -108,6 +111,7 @@ class MainWindow(QMainWindow):
         self._organizer.page_activated.connect(self._on_organizer_page_activated)
         self._organizer.pages_reordered_perm.connect(self._on_pages_reordered_perm)
         self._organizer.pages_deleted.connect(self._on_pages_deleted)
+        self._organizer.pages_added.connect(self._on_pages_added)
         self._organizer.needs_rebuild.connect(self._refresh_organizer)
         self._tabs.addTab(self._organizer, "Organizer")
 
@@ -126,7 +130,7 @@ class MainWindow(QMainWindow):
         self._add_action(fm, "Save", self.save_pdf, QKeySequence.StandardKey.Save)
         self._add_action(fm, "Save As…", self.save_pdf_as, "Ctrl+Shift+S")
         fm.addSeparator()
-        self._add_action(fm, "Quit", QApplication.quit, QKeySequence.StandardKey.Quit)
+        self._add_action(fm, "Quit", self.close, QKeySequence.StandardKey.Quit)
 
         em = mb.addMenu("Edit")
         undo_act = self._canvas.undo_stack.createUndoAction(self, "Undo")
@@ -155,7 +159,7 @@ class MainWindow(QMainWindow):
         menu.addAction(action)
 
     def _setup_shortcuts(self):
-        for key, tool in [("v", "select"), ("h", "highlight"), ("r", "rect"), ("l", "line"), ("t", "text")]:
+        for key, tool in [("v", "select"), ("r", "rect"), ("l", "line"), ("t", "text")]:
             sc = QShortcut(key, self)
             sc.activated.connect(lambda t=tool: self._toolbar.trigger_tool(t))
 
@@ -184,11 +188,15 @@ class MainWindow(QMainWindow):
         if not self._doc.open(paths[0]):
             QMessageBox.critical(self, "Error", f"Could not open:\n{paths[0]}")
             return
+        self._dirty = False  # freshly opened, in sync with disk (combine below re-dirties)
         if len(paths) > 1:
             self._append_pdfs(paths[1:])
         self._canvas.set_document(self._doc)
         self._page_panel.set_document(self._doc)
         self._current_page = 0
+        if len(paths) == 1:
+            # A single freshly opened file may carry an editable model to restore.
+            self._load_saved_annotations()
         self._update_status(
             f"Combined {len(paths)} files" if len(paths) > 1 else ""
         )
@@ -206,6 +214,10 @@ class MainWindow(QMainWindow):
                 total += count
             except Exception as e:
                 errors.append(f"{os.path.basename(path)}: {e}")
+        if total:
+            # A merge produces a derived document → untitled + unsaved.
+            self._mark_untitled()
+            self._mark_dirty()
         if errors:
             QMessageBox.critical(self, "Insert Error", "\n".join(errors))
         return total
@@ -244,8 +256,11 @@ class MainWindow(QMainWindow):
         """Close the current document so the next Open starts fresh instead of appending."""
         if not self._doc.doc:
             return
+        if not self._maybe_save_before_close():
+            return
         self._close_org_render()
         self._doc.close()
+        self._dirty = False
         self._canvas.set_document(self._doc)
         self._page_panel.set_document(self._doc)
         self._current_page = 0
@@ -272,32 +287,43 @@ class MainWindow(QMainWindow):
                 total += count
             except Exception as e:
                 errors.append(f"{path}: {e}")
+        if total:
+            # A merge produces a derived document → untitled + unsaved.
+            self._mark_untitled()
+            self._mark_dirty()
         self._page_panel.refresh()
         if total:
             self._update_status(f"Inserted {total} pages after page {self._current_page + 1}")
         if errors:
             QMessageBox.critical(self, "Insert Error", "\n".join(errors))
 
-    def save_pdf(self):
+    def save_pdf(self) -> bool:
         if not self._doc.doc:
-            return
+            return False
+        # A merged/untitled doc has no source file → force a destination via Save As.
+        if self._doc.path is None:
+            return self.save_pdf_as()
         self._flush_annotations()
         if self._doc.save():
+            self._dirty = False
             self._update_status("Saved")
-        else:
-            QMessageBox.critical(self, "Save Error", "Could not save the PDF.")
+            return True
+        QMessageBox.critical(self, "Save Error", "Could not save the PDF.")
+        return False
 
-    def save_pdf_as(self):
+    def save_pdf_as(self) -> bool:
         if not self._doc.doc:
-            return
+            return False
         path, _ = QFileDialog.getSaveFileName(self, "Save PDF As", "", "PDF Files (*.pdf)")
         if not path:
-            return
+            return False
         self._flush_annotations()
-        if self._doc.save(path):
-            self._update_status(f"Saved copy to {path}")
-        else:
-            QMessageBox.critical(self, "Save Error", "Could not save the PDF.")
+        if self._doc.save(path):  # save() adopts `path` as the new canonical path
+            self._dirty = False
+            self._update_status(f"Saved to {path}")
+            return True
+        QMessageBox.critical(self, "Save Error", "Could not save the PDF.")
+        return False
 
     def delete_current_page(self):
         if not self._doc.doc or self._doc.page_count() <= 1:
@@ -311,6 +337,7 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
         self._doc.delete_page(self._current_page)
+        self._mark_dirty()
         self._canvas.remove_page_annotations(self._current_page)
         self._page_panel.refresh()
         new_page = min(self._current_page, self._doc.page_count() - 1)
@@ -360,6 +387,7 @@ class MainWindow(QMainWindow):
 
     def _on_pages_reordered_perm(self, new_order: list):
         # Organizer already reordered the live document; mirror it everywhere else.
+        self._mark_dirty()
         self._canvas.reorder_pages(new_order)
         self._page_panel.refresh()
         self._current_page = self._canvas._current_page
@@ -368,6 +396,8 @@ class MainWindow(QMainWindow):
         self._update_status()
 
     def _on_pages_deleted(self, rows: list):
+        if rows:
+            self._mark_dirty()
         for row in rows:  # already in descending order from organizer
             self._canvas.remove_page_annotations(row)
         self._page_panel.refresh()
@@ -389,6 +419,22 @@ class MainWindow(QMainWindow):
         for page_num in range(self._doc.page_count()):
             dicts = self._canvas.get_all_annotation_dicts(page_num)
             self._doc.write_annotations(page_num, dicts)
+        # Embed the editable model so the document reopens with its objects editable.
+        self._doc.write_annotation_model(self._canvas.export_annotation_model())
+
+    def _load_saved_annotations(self):
+        """If the opened PDF carries our embedded model, rebuild editable objects.
+
+        The baked markup is stripped first so reconstructed items don't render on
+        top of it; it is re-baked on the next save.
+        """
+        model = self._doc.read_annotation_model()
+        if not model:
+            return
+        for pn in range(self._doc.page_count()):
+            self._doc.delete_tagged_annotations(pn)
+        self._canvas.load_annotation_model(model)
+        self._canvas.reload_current_page()
 
     def _on_page_selected(self, page_num: int):
         if page_num == self._current_page and self._doc.doc:
@@ -400,6 +446,7 @@ class MainWindow(QMainWindow):
 
     def _on_annotation_changed(self):
         # Keep the left page panel's thumbnail of the current page in sync with edits.
+        self._mark_dirty()
         self._refresh_current_thumb()
 
     def _refresh_current_thumb(self):
@@ -409,13 +456,66 @@ class MainWindow(QMainWindow):
         self._page_panel.update_page_thumbnail(self._current_page, thumb)
 
     def _update_status(self, extra: str = ""):
+        self._update_title()
         if self._doc.doc:
-            base = f"{self._doc.path}  —  page {self._current_page + 1} of {self._doc.page_count()}"
+            name = self._doc.path or "Untitled"
+            base = f"{name}  —  page {self._current_page + 1} of {self._doc.page_count()}"
             self._status.showMessage(f"{base}  {extra}".strip())
         else:
             self._status.showMessage(extra or "Open a PDF to start  (Ctrl+O)")
 
+    # ------------------------------------------------------------------
+    # Unsaved-changes (dirty) + untitled (merged) state
+    # ------------------------------------------------------------------
+
+    def _update_title(self):
+        """Reflect the open file and unsaved state in the window title.
+
+        Qt renders the '[*]' placeholder as '*' only while windowModified is True.
+        """
+        if not self._doc.doc:
+            self.setWindowModified(False)
+            self.setWindowTitle("Rapid PDF")
+            return
+        name = os.path.basename(self._doc.path) if self._doc.path else "Untitled"
+        self.setWindowModified(self._dirty)
+        self.setWindowTitle(f"Rapid PDF — {name}[*]")
+
+    def _mark_dirty(self):
+        self._dirty = True
+        self._update_title()
+
+    def _mark_untitled(self):
+        """A merge produced a derived document with no source file → force Save As."""
+        self._doc.path = None
+
+    def _on_pages_added(self, count: int):
+        # Organizer "+ Add Pages" merged another PDF in → derived, unsaved document.
+        self._mark_untitled()
+        self._mark_dirty()
+
+    def _maybe_save_before_close(self) -> bool:
+        """Prompt to save unsaved changes. Returns True if it's safe to proceed."""
+        if not self._doc.doc or not self._dirty:
+            return True
+        reply = QMessageBox.question(
+            self, "Unsaved Changes",
+            "This document has unsaved changes. Save before closing?",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
+        )
+        if reply == QMessageBox.StandardButton.Save:
+            return self.save_pdf()      # may open Save As; a cancelled save aborts the close
+        if reply == QMessageBox.StandardButton.Discard:
+            return True
+        return False                     # Cancel (or dialog dismissed)
+
     def closeEvent(self, event):
+        if not self._maybe_save_before_close():
+            event.ignore()
+            return
         self._close_org_render()
         self._doc.close()
         super().closeEvent(event)

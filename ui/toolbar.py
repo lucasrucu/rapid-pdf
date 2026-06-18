@@ -99,27 +99,43 @@ class ToolBar(QWidget):
     fill_toggled = Signal(bool)
     line_width_changed = Signal(float)
     font_size_changed = Signal(int)
+    font_color_changed = Signal(QColor)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("ToolBar")
         self._color = PRESETS[0]
+        self._font_color = QColor(0, 0, 0)
         self._opacity = 0.5
         self._tool_btns: dict[str, QPushButton] = {}
+        self._swatch_btns: dict[str, QPushButton] = {}
+        self._current_tool = "select"
+        self._selection_types: set[str] = set()
         self._setup_ui()
-        self.setFixedWidth(128)
+        self.setFixedWidth(168)
         self.setStyleSheet(_STYLE)
+
+    def _section(self, *widgets, lead_divider: bool = False) -> QWidget:
+        """Wrap related controls in one container so it can be shown/hidden as a unit."""
+        box = QWidget()
+        vbox = QVBoxLayout(box)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(5)
+        if lead_divider:
+            vbox.addWidget(self._divider())
+        for w in widgets:
+            vbox.addWidget(w)
+        return box
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 10, 6, 10)
         layout.setSpacing(5)
 
-        # --- Tools ---
+        # --- Tools (always) ---
         layout.addWidget(self._section_label("TOOLS"))
         for tid, label in [
             ("select",    "Select  V"),
-            ("highlight", "Highlight  H"),
             ("rect",      "Rectangle  R"),
             ("line",      "Line  L"),
             ("text",      "Text  T"),
@@ -132,54 +148,10 @@ class ToolBar(QWidget):
             layout.addWidget(btn)
         self._tool_btns["select"].setChecked(True)
 
-        # Fill toggle
-        self._fill_btn = QPushButton("Fill Shape")
-        self._fill_btn.setCheckable(True)
-        self._fill_btn.setFixedHeight(26)
-        self._fill_btn.setToolTip("Fill rectangle with current color (40% opacity)")
-        self._fill_btn.toggled.connect(self.fill_toggled)
-        layout.addWidget(self._fill_btn)
-
         layout.addWidget(self._divider())
 
-        # --- Stroke width + font size ---
-        layout.addWidget(self._section_label("SIZE"))
-
-        width_row = QWidget()
-        width_layout = QHBoxLayout(width_row)
-        width_layout.setContentsMargins(0, 0, 0, 0)
-        width_layout.setSpacing(4)
-        width_layout.addWidget(QLabel("Width"))
-        self._width_spin = QSpinBox()
-        self._width_spin.setRange(1, 20)
-        self._width_spin.setValue(2)
-        self._width_spin.setSuffix(" px")
-        self._width_spin.setFixedHeight(24)
-        self._width_spin.setToolTip("Stroke width for rectangles and lines")
-        self._width_spin.valueChanged.connect(lambda v: self.line_width_changed.emit(float(v)))
-        width_layout.addWidget(self._width_spin)
-        layout.addWidget(width_row)
-
-        font_row = QWidget()
-        font_layout = QHBoxLayout(font_row)
-        font_layout.setContentsMargins(0, 0, 0, 0)
-        font_layout.setSpacing(4)
-        font_layout.addWidget(QLabel("Font"))
-        self._font_spin = QSpinBox()
-        self._font_spin.setRange(4, 144)
-        self._font_spin.setValue(12)
-        self._font_spin.setSuffix(" pt")
-        self._font_spin.setFixedHeight(24)
-        self._font_spin.setToolTip("Font size for text labels")
-        self._font_spin.valueChanged.connect(lambda v: self.font_size_changed.emit(v))
-        font_layout.addWidget(self._font_spin)
-        layout.addWidget(font_row)
-
-        layout.addWidget(self._divider())
-
-        # --- Color ---
+        # --- Colors (always): presets, custom, fill ---
         layout.addWidget(self._section_label("COLOR"))
-
         for row_colors in [PRESETS[:4], PRESETS[4:]]:
             row = QWidget()
             row_layout = QHBoxLayout(row)
@@ -191,20 +163,80 @@ class ToolBar(QWidget):
                 btn.setToolTip(c.name())
                 btn.setStyleSheet(self._swatch_style(c))
                 btn.clicked.connect(lambda _, col=c: self._on_color(col))
+                self._swatch_btns[c.name()] = btn
                 row_layout.addWidget(btn)
             layout.addWidget(row)
 
-        # Custom color button — shows current color as its background
         self._custom_btn = QPushButton("Custom…")
         self._custom_btn.setFixedHeight(28)
         self._custom_btn.setToolTip("Open color picker")
         self._custom_btn.clicked.connect(self._open_color_dialog)
         layout.addWidget(self._custom_btn)
-        self._update_custom_btn()
 
+        # Fill toggle — contextual (rectangles only)
+        self._fill_btn = QPushButton("Fill Shape")
+        self._fill_btn.setCheckable(True)
+        self._fill_btn.setFixedHeight(26)
+        self._fill_btn.setToolTip("Fill rectangle with current color")
+        self._fill_btn.toggled.connect(self.fill_toggled)
+        layout.addWidget(self._fill_btn)
+
+        self.set_active_color(self._color, emit=False)
+
+        # --- Text (contextual): font size + font color ---
+        font_row = QWidget()
+        font_layout = QHBoxLayout(font_row)
+        font_layout.setContentsMargins(0, 0, 0, 0)
+        font_layout.setSpacing(4)
+        font_layout.addWidget(QLabel("Size"))
+        self._font_spin = QSpinBox()
+        self._font_spin.setRange(4, 144)
+        self._font_spin.setValue(12)
+        self._font_spin.setSuffix(" pt")
+        self._font_spin.setFixedHeight(24)
+        self._font_spin.setToolTip("Font size for text labels and text inside shapes")
+        self._font_spin.valueChanged.connect(lambda v: self.font_size_changed.emit(v))
+        font_layout.addWidget(self._font_spin)
+
+        fcolor_row = QWidget()
+        fcolor_layout = QHBoxLayout(fcolor_row)
+        fcolor_layout.setContentsMargins(0, 0, 0, 0)
+        fcolor_layout.setSpacing(4)
+        fcolor_layout.addWidget(QLabel("Color"))
+        self._font_color_btn = QPushButton("Text…")
+        self._font_color_btn.setFixedHeight(24)
+        self._font_color_btn.setToolTip("Color of text labels and text inside shapes")
+        self._font_color_btn.clicked.connect(self._open_font_color_dialog)
+        fcolor_layout.addWidget(self._font_color_btn)
+        self._update_font_color_btn()
+
+        self._text_section = self._section(
+            self._section_label("TEXT"), font_row, fcolor_row, lead_divider=True
+        )
+        layout.addWidget(self._text_section)
+
+        # --- Stroke width (contextual): rectangles + lines ---
+        width_row = QWidget()
+        width_layout = QHBoxLayout(width_row)
+        width_layout.setContentsMargins(0, 0, 0, 0)
+        width_layout.setSpacing(4)
+        width_layout.addWidget(QLabel("Width"))
+        self._width_spin = QSpinBox()
+        self._width_spin.setRange(0, 20)
+        self._width_spin.setValue(2)
+        self._width_spin.setSuffix(" px")
+        self._width_spin.setFixedHeight(24)
+        self._width_spin.setToolTip("Stroke width for rectangles and lines (0 = borderless)")
+        self._width_spin.valueChanged.connect(lambda v: self.line_width_changed.emit(float(v)))
+        width_layout.addWidget(self._width_spin)
+
+        self._width_section = self._section(
+            self._section_label("STROKE"), width_row, lead_divider=True
+        )
+        layout.addWidget(self._width_section)
+
+        # --- Opacity (always) ---
         layout.addWidget(self._divider())
-
-        # --- Opacity ---
         layout.addWidget(self._section_label("OPACITY"))
         self._opacity_label = QLabel(f"{int(self._opacity * 100)}%")
         self._opacity_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -222,7 +254,7 @@ class ToolBar(QWidget):
         # --- Keyboard hints ---
         layout.addWidget(self._divider())
         hints = QLabel(
-            "V/H/R/L/T — tools\n"
+            "V/R/L/T — tools\n"
             "Del — delete\n"
             "Dbl-click — text\n"
             "Ctrl+drag — copy\n"
@@ -232,6 +264,8 @@ class ToolBar(QWidget):
         hints.setWordWrap(True)
         hints.setStyleSheet("font-size: 9px; color: #555; line-height: 1.4;")
         layout.addWidget(hints)
+
+        self._update_context()
 
     def _section_label(self, text: str) -> QLabel:
         lbl = QLabel(text)
@@ -245,30 +279,63 @@ class ToolBar(QWidget):
         return line
 
     @staticmethod
-    def _swatch_style(c: QColor) -> str:
+    def _swatch_style(c: QColor, selected: bool = False) -> str:
+        border = "3px solid #0078d4" if selected else "1px solid #555"
         return (
-            f"QPushButton {{ background-color: {c.name()}; border: 1px solid #555; border-radius: 3px; }}"
+            f"QPushButton {{ background-color: {c.name()}; border: {border}; border-radius: 3px; }}"
             f"QPushButton:hover {{ border: 2px solid #fff; }}"
             f"QPushButton:pressed {{ border: 2px solid #0078d4; }}"
         )
 
-    def _update_custom_btn(self):
+    def _update_custom_btn(self, active: bool = False):
         text_color = "#000" if _luminance(self._color) > 128 else "#fff"
+        border = "2px solid #0078d4" if active else "1px solid #666"
         self._custom_btn.setStyleSheet(
             f"QPushButton {{ background-color: {self._color.name()}; color: {text_color}; "
-            f"border: 1px solid #666; border-radius: 3px; padding: 3px 4px; }}"
+            f"border: {border}; border-radius: 3px; padding: 3px 4px; }}"
             f"QPushButton:hover {{ border: 1px solid #fff; }}"
         )
 
+    def set_active_color(self, color: QColor, emit: bool = True):
+        """Set the working color and highlight its swatch (or the Custom slot)."""
+        self._color = QColor(color)
+        name = self._color.name()
+        is_preset = any(name == c.name() for c in PRESETS)
+        for cname, btn in self._swatch_btns.items():
+            btn.setStyleSheet(self._swatch_style(QColor(cname), selected=(cname == name)))
+        self._update_custom_btn(active=not is_preset)
+        if emit:
+            self.color_changed.emit(self._color)
+
+    def _update_font_color_btn(self):
+        text_color = "#000" if _luminance(self._font_color) > 128 else "#fff"
+        self._font_color_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {self._font_color.name()}; color: {text_color}; "
+            f"border: 1px solid #666; border-radius: 3px; padding: 2px 4px; }}"
+            f"QPushButton:hover {{ border: 1px solid #fff; }}"
+        )
+
+    def _open_font_color_dialog(self):
+        color = QColorDialog.getColor(self._font_color, self, "Pick Text Color")
+        if color.isValid():
+            self._font_color = color
+            self._update_font_color_btn()
+            self.font_color_changed.emit(color)
+
+    def set_displayed_font_color(self, color: QColor):
+        """Reflect a selection's text color without emitting (no feedback loop)."""
+        self._font_color = QColor(color)
+        self._update_font_color_btn()
+
     def _on_tool(self, tool: str):
+        self._current_tool = tool
         for tid, btn in self._tool_btns.items():
             btn.setChecked(tid == tool)
+        self._update_context()
         self.tool_changed.emit(tool)
 
     def _on_color(self, color: QColor):
-        self._color = color
-        self._update_custom_btn()
-        self.color_changed.emit(color)
+        self.set_active_color(color, emit=True)
 
     def _open_color_dialog(self):
         color = QColorDialog.getColor(
@@ -282,6 +349,68 @@ class ToolBar(QWidget):
         self._opacity = value / 100.0
         self._opacity_label.setText(f"{value}%")
         self.opacity_changed.emit(self._opacity)
+
+    def show_selection(self, summary: dict):
+        """Reflect the selected object(s) in the controls without emitting signals.
+
+        Every widget mutation is wrapped in blockSignals so syncing the panel to a
+        selection never fires a change back to the canvas (no loops, no undo noise).
+        A property that differs across a mixed selection (None) is left unchanged.
+        """
+        self._selection_types = set(summary.get("types", set())) if summary else set()
+
+        color = summary.get("color") if summary else None
+        if color is not None:
+            self.set_active_color(color, emit=False)
+
+        opacity = summary.get("opacity") if summary else None
+        if opacity is not None:
+            pct = int(round(opacity * 100))
+            self._opacity = opacity
+            self._opacity_slider.blockSignals(True)
+            self._opacity_slider.setValue(pct)
+            self._opacity_slider.blockSignals(False)
+            self._opacity_label.setText(f"{pct}%")
+
+        line_width = summary.get("line_width") if summary else None
+        if line_width is not None:
+            self._width_spin.blockSignals(True)
+            self._width_spin.setValue(int(round(line_width)))
+            self._width_spin.blockSignals(False)
+
+        font_size = summary.get("font_size") if summary else None
+        if font_size is not None:
+            self._font_spin.blockSignals(True)
+            self._font_spin.setValue(int(font_size))
+            self._font_spin.blockSignals(False)
+
+        font_color = summary.get("font_color") if summary else None
+        if font_color is not None:
+            self.set_displayed_font_color(font_color)
+
+        fill = summary.get("fill") if summary else None
+        if fill is not None:
+            self._fill_btn.blockSignals(True)
+            self._fill_btn.setChecked(bool(fill))
+            self._fill_btn.blockSignals(False)
+
+        self._update_context()
+
+    def _update_context(self):
+        """Show only the property sections relevant to the current tool/selection."""
+        tool = self._current_tool
+        types = self._selection_types
+        # Text controls: text labels and text typed inside shapes
+        text_ctx = (tool in ("text", "rect")
+                    or bool(types & {"text", "rect", "highlight"}))
+        # Stroke width: rectangles and lines
+        stroke_ctx = (tool in ("rect", "line")
+                      or bool(types & {"rect", "line", "highlight"}))
+        # Fill: rectangles only
+        fill_ctx = tool == "rect" or "rect" in types
+        self._text_section.setVisible(text_ctx)
+        self._width_section.setVisible(stroke_ctx)
+        self._fill_btn.setVisible(fill_ctx)
 
     def trigger_tool(self, tool: str):
         if tool in self._tool_btns:

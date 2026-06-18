@@ -4,9 +4,9 @@ from PySide6.QtWidgets import (
     QGraphicsPixmapItem, QGraphicsTextItem, QGraphicsItem,
     QInputDialog, QStyle, QApplication,
 )
-from PySide6.QtCore import Qt, QRectF, QPointF, QLineF, Signal, QBuffer, QIODevice
+from PySide6.QtCore import Qt, QRectF, QPointF, QLineF, Signal, QBuffer, QIODevice, QTimer
 from PySide6.QtGui import (
-    QPen, QBrush, QColor, QPainter, QFont, QFontMetrics, QPixmap,
+    QPen, QBrush, QColor, QPainter, QFont, QPixmap,
     QUndoStack, QUndoCommand,
 )
 
@@ -34,6 +34,7 @@ class AnnotationBase:
     def set_fill(self, enabled: bool, color: QColor): pass
     def set_line_width(self, w: float): pass
     def set_font_size(self, size: int): pass
+    def set_font_color(self, c: QColor): pass
 
 
 # ---------------------------------------------------------------------------
@@ -48,8 +49,18 @@ class AnnotationItem(QGraphicsRectItem, AnnotationBase):
         self.page_num = page_num
         self.ann_type = ann_type
         self.text = ""
+        self._font_size = 12
+        self._font_color = QColor(0, 0, 0)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.setAcceptHoverEvents(True)
+
+    def set_font_size(self, size: int):
+        self._font_size = size
+        self.update()
+
+    def set_font_color(self, c: QColor):
+        self._font_color = QColor(c)
+        self.update()
 
     def boundingRect(self) -> QRectF:
         extra = HANDLE_SIZE + 2
@@ -70,6 +81,9 @@ class AnnotationItem(QGraphicsRectItem, AnnotationBase):
         d = {"type": self.ann_type, "fitz_rect": fitz_rect}
         if self.text:
             d["text"] = self.text
+            d["font_size"] = self._font_size
+            fc = self._font_color
+            d["font_color"] = (fc.redF(), fc.greenF(), fc.blueF())
         return d
 
     def clone(self) -> "AnnotationItem":
@@ -106,25 +120,15 @@ class AnnotationItem(QGraphicsRectItem, AnnotationBase):
         if r.width() < 16 or r.height() < 16:
             return
         inner = r.adjusted(6, 6, -6, -6)
-        font_size = self._fit_font_size(inner, self.text)
         painter.save()
-        painter.setFont(QFont("Arial", font_size))
-        painter.setPen(QPen(QColor(0, 0, 0)))
+        painter.setFont(QFont("Arial", self._font_size))
+        painter.setPen(QPen(self._font_color))
         painter.drawText(
             inner,
             Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
             self.text,
         )
         painter.restore()
-
-    def _fit_font_size(self, rect: QRectF, text: str) -> int:
-        w, h = int(rect.width()), int(rect.height())
-        for size in range(72, 4, -1):
-            fm = QFontMetrics(QFont("Arial", size))
-            br = fm.boundingRect(0, 0, w, h, Qt.TextFlag.TextWordWrap, text)
-            if br.width() <= w and br.height() <= h:
-                return size
-        return 4
 
 
 class HighlightItem(AnnotationItem):
@@ -161,6 +165,8 @@ class HighlightItem(AnnotationItem):
         item = HighlightItem(self.rect(), self._color, self._opacity, self.page_num)
         item.setPos(self.pos())
         item.text = self.text
+        item._font_size = self._font_size
+        item._font_color = QColor(self._font_color)
         return item
 
 
@@ -175,12 +181,18 @@ class RectAnnotationItem(AnnotationItem):
         self._apply_style()
 
     def _apply_style(self):
-        pen_c = QColor(self._stroke)
-        pen_c.setAlphaF(self._opacity)
-        self.setPen(QPen(pen_c, self._line_width))
+        borderless = self._line_width <= 0
+        if borderless:
+            self.setPen(QPen(Qt.PenStyle.NoPen))
+        else:
+            pen_c = QColor(self._stroke)
+            pen_c.setAlphaF(self._opacity)
+            self.setPen(QPen(pen_c, self._line_width))
         if self._fill:
             fill_c = QColor(self._fill)
-            fill_c.setAlphaF(self._opacity * 0.4)
+            # A borderless filled rect acts as a highlighter → honor opacity directly;
+            # a bordered rect keeps a lighter fill so the outline stays readable.
+            fill_c.setAlphaF(self._opacity if borderless else self._opacity * 0.4)
             self.setBrush(QBrush(fill_c))
         else:
             self.setBrush(QBrush(Qt.BrushStyle.NoBrush))
@@ -225,6 +237,8 @@ class RectAnnotationItem(AnnotationItem):
         )
         item.setPos(self.pos())
         item.text = self.text
+        item._font_size = self._font_size
+        item._font_color = QColor(self._font_color)
         return item
 
 
@@ -367,6 +381,10 @@ class TextAnnotationItem(QGraphicsTextItem, AnnotationBase):
         self._apply_style()
         self.update()
 
+    # For a free-floating text label the text color *is* its color.
+    def set_font_color(self, c: QColor):
+        self.set_color(c)
+
     def set_font_size(self, size: int):
         self._font_size = size
         self._apply_style()
@@ -425,7 +443,7 @@ class TextAnnotationItem(QGraphicsTextItem, AnnotationBase):
 def style_snapshot(item) -> dict:
     """Capture every style/text attribute an annotation item might carry."""
     snap = {}
-    for attr in ("_color", "_stroke", "_fill", "_opacity", "_line_width", "_font_size"):
+    for attr in ("_color", "_stroke", "_fill", "_opacity", "_line_width", "_font_size", "_font_color"):
         if hasattr(item, attr):
             v = getattr(item, attr)
             snap[attr] = QColor(v) if isinstance(v, QColor) else v
@@ -586,11 +604,13 @@ class StyleCommand(_Command):
 
 class PDFCanvas(QGraphicsView):
     annotation_changed = Signal()
+    selection_changed = Signal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._scene = QGraphicsScene(self)
         self.setScene(self._scene)
+        self._scene.selectionChanged.connect(self._on_selection_changed)
 
         self._doc = None
         self._current_page = 0
@@ -610,6 +630,7 @@ class PDFCanvas(QGraphicsView):
         self._fill_enabled = False
         self._line_width = 2.0
         self._font_size = 12
+        self._font_color = QColor(0, 0, 0)
 
         # Drawing state
         self._drawing = False
@@ -642,6 +663,14 @@ class PDFCanvas(QGraphicsView):
 
         # In-app annotation clipboard (clones of copied items)
         self._clipboard_items: list = []
+
+        # Copy-confirmation flash: a brief pulsing outline over the copied items
+        self._flash_items: list = []
+        self._flash_step = 0
+        self._flash_total = 8
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setInterval(40)
+        self._flash_timer.timeout.connect(self._on_flash_tick)
 
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
@@ -758,8 +787,17 @@ class PDFCanvas(QGraphicsView):
 
     def set_font_size(self, size: int):
         self._font_size = size
-        items = [i for i in self._scene.selectedItems() if isinstance(i, TextAnnotationItem)]
+        items = [i for i in self._scene.selectedItems()
+                 if isinstance(i, TextAnnotationItem)
+                 or (isinstance(i, AnnotationItem) and not isinstance(i, ImageAnnotationItem))]
         self._apply_style_change(items, lambda it: it.set_font_size(size), "Change font size")
+
+    def set_font_color(self, color: QColor):
+        self._font_color = QColor(color)
+        items = [i for i in self._scene.selectedItems()
+                 if isinstance(i, TextAnnotationItem)
+                 or (isinstance(i, AnnotationItem) and not isinstance(i, ImageAnnotationItem))]
+        self._apply_style_change(items, lambda it: it.set_font_color(color), "Change font color")
 
     def delete_selected(self):
         items = [i for i in self._scene.selectedItems() if isinstance(i, AnnotationBase)]
@@ -772,10 +810,43 @@ class PDFCanvas(QGraphicsView):
 
     def copy_selected(self):
         """Snapshot the current selection into the in-app annotation clipboard."""
-        self._clipboard_items = [
-            i.clone() for i in self._scene.selectedItems() if isinstance(i, AnnotationBase)
-        ]
+        selected = [i for i in self._scene.selectedItems() if isinstance(i, AnnotationBase)]
+        self._clipboard_items = [i.clone() for i in selected]
+        if selected:
+            self._flash(selected)
         return len(self._clipboard_items)
+
+    def _flash(self, items):
+        """Briefly pulse an outline around items to confirm a copy (no text popup)."""
+        self._flash_items = list(items)
+        self._flash_step = 0
+        self._flash_timer.start()
+        self.viewport().update()
+
+    def _on_flash_tick(self):
+        self._flash_step += 1
+        if self._flash_step >= self._flash_total:
+            self._flash_timer.stop()
+            self._flash_items = []
+        self.viewport().update()
+
+    def drawForeground(self, painter: QPainter, rect: QRectF):
+        super().drawForeground(painter, rect)
+        if not self._flash_items:
+            return
+        frac = 1.0 - (self._flash_step / self._flash_total)  # 1 → 0 as it fades
+        margin = 3 + self._flash_step * 2                     # expands outward
+        col = QColor(0, 120, 215)
+        col.setAlphaF(max(0.0, frac))
+        painter.save()
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(col, 2.5))
+        for it in self._flash_items:
+            if it.scene() is None or not it.isVisible():
+                continue
+            r = it.sceneBoundingRect().adjusted(-margin, -margin, margin, margin)
+            painter.drawRoundedRect(r, 4, 4)
+        painter.restore()
 
     def has_clipboard_items(self) -> bool:
         return bool(self._clipboard_items)
@@ -818,6 +889,155 @@ class PDFCanvas(QGraphicsView):
     def get_all_annotation_dicts(self, page_num: int) -> list:
         return [item.to_annotation_dict(self._zoom)
                 for item in self._page_annotations.get(page_num, [])]
+
+    # ------------------------------------------------------------------
+    # Selection → properties panel sync
+    # ------------------------------------------------------------------
+
+    def _on_selection_changed(self):
+        items = [i for i in self._scene.selectedItems() if isinstance(i, AnnotationBase)]
+        self.selection_changed.emit(self._selection_summary(items))
+
+    @staticmethod
+    def _item_color(it):
+        if isinstance(it, RectAnnotationItem):
+            return it._stroke
+        return getattr(it, "_color", None)
+
+    @staticmethod
+    def _item_font_color(it):
+        # A text label's own color IS its text color.
+        if isinstance(it, TextAnnotationItem):
+            return it._color
+        return getattr(it, "_font_color", None)
+
+    def _selection_summary(self, items) -> dict:
+        """Fold each style property across the selection (value if all agree, else None)."""
+        if not items:
+            return {}
+
+        def fold(getter):
+            vals = [v for v in (getter(i) for i in items) if v is not None]
+            if not vals:
+                return None
+            first = vals[0]
+            return first if all(v == first for v in vals[1:]) else None
+
+        return {
+            "color": fold(self._item_color),
+            "opacity": fold(lambda i: getattr(i, "_opacity", None)),
+            "line_width": fold(lambda i: getattr(i, "_line_width", None)),
+            "font_size": fold(lambda i: getattr(i, "_font_size", None)),
+            "font_color": fold(self._item_font_color),
+            "fill": fold(lambda i: (i._fill is not None)
+                         if isinstance(i, RectAnnotationItem) else None),
+            "types": {i.ann_type for i in items},
+        }
+
+    # ------------------------------------------------------------------
+    # Editable annotation model — JSON round-trip (save → reopen → still editable)
+    # ------------------------------------------------------------------
+
+    def _item_to_json(self, item) -> dict | None:
+        """Convert one annotation to a JSON-safe dict, or None to skip it.
+
+        Images are skipped: they are baked into page content on save and stay
+        editable on reopen via the existing embedded-image "lift" feature.
+        """
+        d = item.to_annotation_dict(self._zoom)
+        t = d.get("type")
+        if t == "image":
+            return None
+        j = {"type": t}
+        if "fitz_rect" in d:
+            r = d["fitz_rect"]
+            j["rect"] = [r.x0, r.y0, r.x1, r.y1]
+        if "p1" in d and "p2" in d:
+            j["p1"] = [d["p1"].x, d["p1"].y]
+            j["p2"] = [d["p2"].x, d["p2"].y]
+        for k in ("color", "stroke_color", "fill_color", "font_color"):
+            if k in d:
+                j[k] = list(d[k])
+        for k in ("opacity", "line_width", "font_size", "text"):
+            if k in d:
+                j[k] = d[k]
+        return j
+
+    def export_annotation_model(self) -> dict:
+        """Serialize every page's editable annotations for embedding in the PDF."""
+        pages: dict[str, list] = {}
+        for page_num, items in self._page_annotations.items():
+            out = [j for j in (self._item_to_json(it) for it in items) if j is not None]
+            if out:
+                pages[str(page_num)] = out
+        return {"version": 1, "pages": pages}
+
+    def _item_from_dict(self, j: dict, page_num: int):
+        """Rebuild a canvas item from its JSON form (inverse of _item_to_json)."""
+        z = self._zoom
+        t = j.get("type")
+
+        def col(key, default=(0.0, 0.0, 0.0)):
+            v = j.get(key, default)
+            return QColor.fromRgbF(float(v[0]), float(v[1]), float(v[2]))
+
+        try:
+            if t in ("rect", "highlight"):
+                r = j["rect"]
+                rect = QRectF(r[0] * z, r[1] * z, (r[2] - r[0]) * z, (r[3] - r[1]) * z)
+                opacity = j.get("opacity", 1.0)
+                if t == "highlight":
+                    item = HighlightItem(rect, col("color"), opacity, page_num)
+                else:
+                    fill = col("fill_color") if "fill_color" in j else None
+                    item = RectAnnotationItem(
+                        rect, col("stroke_color"), fill, opacity, page_num,
+                        j.get("line_width", 2.0),
+                    )
+                item.text = j.get("text", "")
+                item._font_size = j.get("font_size", 12)
+                if "font_color" in j:
+                    item._font_color = col("font_color")
+                return item
+            if t == "line":
+                p1, p2 = j["p1"], j["p2"]
+                line = QLineF(p1[0] * z, p1[1] * z, p2[0] * z, p2[1] * z)
+                return LineAnnotationItem(
+                    line, col("color"), j.get("opacity", 1.0), page_num,
+                    j.get("line_width", 2.0),
+                )
+            if t == "text":
+                r = j["rect"]
+                pos = QPointF(r[0] * z, r[1] * z)
+                return TextAnnotationItem(
+                    pos, j.get("text", ""), col("color"),
+                    j.get("font_size", 12), page_num,
+                )
+        except Exception as e:
+            print(f"Reconstruct error ({t}): {e}")
+        return None
+
+    def load_annotation_model(self, model: dict):
+        """Reconstruct editable items from an embedded model after opening a PDF."""
+        if not model:
+            return
+        for page_str, items_json in model.get("pages", {}).items():
+            try:
+                page_num = int(page_str)
+            except (ValueError, TypeError):
+                continue
+            for j in items_json:
+                item = self._item_from_dict(j, page_num)
+                if item is None:
+                    continue
+                self._scene.addItem(item)
+                self._page_annotations.setdefault(page_num, []).append(item)
+                item.setVisible(page_num == self._current_page)
+
+    def reload_current_page(self):
+        """Re-render the current page (e.g. after stripping baked markup on open)."""
+        if self._doc and self._doc.page_count() > 0:
+            self._load_page(self._current_page)
 
     def get_render_zoom(self) -> float:
         return self._zoom
@@ -1199,7 +1419,7 @@ class PDFCanvas(QGraphicsView):
                     text, ok = QInputDialog.getText(self, "Add Text", "Enter text:")
                     if ok and text.strip():
                         new_item = TextAnnotationItem(
-                            scene_pos, text, self._color, self._font_size, self._current_page
+                            scene_pos, text, self._font_color, self._font_size, self._current_page
                         )
                         self._attach_item(new_item)
                         self._scene.clearSelection()
@@ -1207,22 +1427,19 @@ class PDFCanvas(QGraphicsView):
                         self._push(AddItemsCommand(self, [new_item], "Add text"))
                         self.annotation_changed.emit()
 
-            elif self._tool in ("highlight", "rect", "line"):
+            elif self._tool in ("rect", "line"):
                 self._drawing = True
                 self._draw_start = scene_pos
 
-                if self._tool == "highlight":
-                    self._temp_item = HighlightItem(
-                        QRectF(scene_pos, scene_pos),
-                        self._color, self._opacity, self._current_page,
-                    )
-                elif self._tool == "rect":
+                if self._tool == "rect":
                     fill = self._color if self._fill_enabled else None
                     self._temp_item = RectAnnotationItem(
                         QRectF(scene_pos, scene_pos),
                         self._color, fill, self._opacity, self._current_page,
                         self._line_width,
                     )
+                    self._temp_item._font_size = self._font_size
+                    self._temp_item._font_color = QColor(self._font_color)
                 else:  # line
                     self._temp_item = LineAnnotationItem(
                         QLineF(scene_pos, scene_pos),

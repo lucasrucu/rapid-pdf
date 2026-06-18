@@ -33,6 +33,9 @@ class PagePanel(QWidget):
         self._list = QListWidget()
         self._list.setIconSize(QSize(THUMB_W, THUMB_H))
         self._list.setSpacing(2)
+        # Smooth pixel-based scrolling instead of jumping a whole page per wheel tick.
+        self._list.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
+        self._list.verticalScrollBar().setSingleStep(16)
         self._list.currentRowChanged.connect(self._on_row_changed)
         layout.addWidget(self._list)
 
