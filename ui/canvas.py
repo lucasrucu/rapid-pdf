@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QRectF, QPointF, QLineF, Signal, QBuffer, QIODevice, QTimer
 from PySide6.QtGui import (
-    QPen, QBrush, QColor, QPainter, QFont, QFontMetrics, QPixmap,
+    QPen, QBrush, QColor, QPainter, QFont, QPixmap,
     QUndoStack, QUndoCommand,
 )
 
@@ -48,8 +48,13 @@ class AnnotationItem(QGraphicsRectItem, AnnotationBase):
         self.page_num = page_num
         self.ann_type = ann_type
         self.text = ""
+        self._font_size = 12
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.setAcceptHoverEvents(True)
+
+    def set_font_size(self, size: int):
+        self._font_size = size
+        self.update()
 
     def boundingRect(self) -> QRectF:
         extra = HANDLE_SIZE + 2
@@ -70,6 +75,7 @@ class AnnotationItem(QGraphicsRectItem, AnnotationBase):
         d = {"type": self.ann_type, "fitz_rect": fitz_rect}
         if self.text:
             d["text"] = self.text
+            d["font_size"] = self._font_size
         return d
 
     def clone(self) -> "AnnotationItem":
@@ -106,9 +112,8 @@ class AnnotationItem(QGraphicsRectItem, AnnotationBase):
         if r.width() < 16 or r.height() < 16:
             return
         inner = r.adjusted(6, 6, -6, -6)
-        font_size = self._fit_font_size(inner, self.text)
         painter.save()
-        painter.setFont(QFont("Arial", font_size))
+        painter.setFont(QFont("Arial", self._font_size))
         painter.setPen(QPen(QColor(0, 0, 0)))
         painter.drawText(
             inner,
@@ -116,15 +121,6 @@ class AnnotationItem(QGraphicsRectItem, AnnotationBase):
             self.text,
         )
         painter.restore()
-
-    def _fit_font_size(self, rect: QRectF, text: str) -> int:
-        w, h = int(rect.width()), int(rect.height())
-        for size in range(72, 4, -1):
-            fm = QFontMetrics(QFont("Arial", size))
-            br = fm.boundingRect(0, 0, w, h, Qt.TextFlag.TextWordWrap, text)
-            if br.width() <= w and br.height() <= h:
-                return size
-        return 4
 
 
 class HighlightItem(AnnotationItem):
@@ -161,6 +157,7 @@ class HighlightItem(AnnotationItem):
         item = HighlightItem(self.rect(), self._color, self._opacity, self.page_num)
         item.setPos(self.pos())
         item.text = self.text
+        item._font_size = self._font_size
         return item
 
 
@@ -231,6 +228,7 @@ class RectAnnotationItem(AnnotationItem):
         )
         item.setPos(self.pos())
         item.text = self.text
+        item._font_size = self._font_size
         return item
 
 
@@ -772,7 +770,9 @@ class PDFCanvas(QGraphicsView):
 
     def set_font_size(self, size: int):
         self._font_size = size
-        items = [i for i in self._scene.selectedItems() if isinstance(i, TextAnnotationItem)]
+        items = [i for i in self._scene.selectedItems()
+                 if isinstance(i, TextAnnotationItem)
+                 or (isinstance(i, AnnotationItem) and not isinstance(i, ImageAnnotationItem))]
         self._apply_style_change(items, lambda it: it.set_font_size(size), "Change font size")
 
     def delete_selected(self):
@@ -1265,6 +1265,7 @@ class PDFCanvas(QGraphicsView):
                         self._color, fill, self._opacity, self._current_page,
                         self._line_width,
                     )
+                    self._temp_item._font_size = self._font_size
                 else:  # line
                     self._temp_item = LineAnnotationItem(
                         QLineF(scene_pos, scene_pos),
