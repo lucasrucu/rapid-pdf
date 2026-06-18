@@ -30,6 +30,8 @@ class AnnotationBase:
         raise NotImplementedError
 
     def set_color(self, c: QColor): pass
+    def set_stroke_color(self, c: QColor): self.set_color(c)
+    def set_fill_color(self, c: QColor): pass
     def set_opacity(self, o: float): pass
     def set_fill(self, enabled: bool, color: QColor): pass
     def set_line_width(self, w: float): pass
@@ -201,6 +203,18 @@ class RectAnnotationItem(AnnotationItem):
         self._stroke = QColor(c)
         if self._fill:
             self._fill = QColor(c)
+        self._apply_style()
+        self.update()
+
+    def set_stroke_color(self, c: QColor):
+        """Recolor just the outline, leaving any fill untouched."""
+        self._stroke = QColor(c)
+        self._apply_style()
+        self.update()
+
+    def set_fill_color(self, c: QColor):
+        """Set (and enable) the fill color, leaving the outline untouched."""
+        self._fill = QColor(c)
         self._apply_style()
         self.update()
 
@@ -623,9 +637,10 @@ class PDFCanvas(QGraphicsView):
         # Recomputed on every page load; clicking one "lifts" it into a movable object.
         self._embedded_images: list = []
 
-        # Tool state
+        # Tool state — stroke (outline/line) and fill are now independent colors.
         self._tool = "select"
-        self._color = QColor(255, 255, 0)
+        self._stroke_color = QColor(255, 255, 0)
+        self._fill_color = QColor(255, 255, 0)
         self._opacity = 0.5
         self._fill_enabled = False
         self._line_width = 2.0
@@ -645,6 +660,9 @@ class PDFCanvas(QGraphicsView):
         self._drag_is_lift = False        # dragging a freshly lifted image (not undoable)
         self._duplicating = False
         self._dup_clones: list = []
+        # Net displacement is computed from a fixed anchor so Shift can axis-lock it.
+        self._drag_anchor: QPointF | None = None
+        self._drag_applied = QPointF(0, 0)
 
         # Marquee (rubber-band) selection state
         self._press_empty_pos: QPointF | None = None
@@ -675,7 +693,9 @@ class PDFCanvas(QGraphicsView):
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
-        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        # NoAnchor: wheelEvent re-anchors the zoom under the cursor manually so that
+        # Ctrl+scroll keeps the point under the mouse fixed instead of drifting.
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setBackgroundBrush(QBrush(QColor(55, 55, 55)))
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -720,6 +740,8 @@ class PDFCanvas(QGraphicsView):
         self._drag_moved = False
         self._duplicating = False
         self._dup_clones = []
+        self._drag_anchor = None
+        self._drag_applied = QPointF(0, 0)
 
     def set_document(self, doc):
         self._doc = doc
@@ -764,10 +786,19 @@ class PDFCanvas(QGraphicsView):
         self._push(StyleCommand(self, before, after, text))
         self.annotation_changed.emit()
 
-    def set_color(self, color: QColor):
-        self._color = color
-        items = [i for i in self._scene.selectedItems() if isinstance(i, AnnotationBase)]
-        self._apply_style_change(items, lambda it: it.set_color(color), "Change color")
+    def set_stroke_color(self, color: QColor):
+        """Outline color for rectangles / color for lines (the 'Line' control)."""
+        self._stroke_color = QColor(color)
+        items = [i for i in self._scene.selectedItems()
+                 if isinstance(i, (RectAnnotationItem, LineAnnotationItem, HighlightItem))]
+        self._apply_style_change(items, lambda it: it.set_stroke_color(color), "Change line color")
+
+    def set_fill_color(self, color: QColor):
+        """Fill color for rectangles (the 'Fill' control). Picking a color enables fill."""
+        self._fill_color = QColor(color)
+        self._fill_enabled = True
+        items = [i for i in self._scene.selectedItems() if isinstance(i, RectAnnotationItem)]
+        self._apply_style_change(items, lambda it: it.set_fill_color(color), "Change fill color")
 
     def set_opacity(self, opacity: float):
         self._opacity = opacity
@@ -777,7 +808,7 @@ class PDFCanvas(QGraphicsView):
     def set_fill_enabled(self, enabled: bool):
         self._fill_enabled = enabled
         items = [i for i in self._scene.selectedItems() if isinstance(i, RectAnnotationItem)]
-        self._apply_style_change(items, lambda it: it.set_fill(enabled, self._color), "Toggle fill")
+        self._apply_style_change(items, lambda it: it.set_fill(enabled, self._fill_color), "Toggle fill")
 
     def set_line_width(self, width: float):
         self._line_width = width
@@ -899,10 +930,12 @@ class PDFCanvas(QGraphicsView):
         self.selection_changed.emit(self._selection_summary(items))
 
     @staticmethod
-    def _item_color(it):
+    def _item_stroke_color(it):
         if isinstance(it, RectAnnotationItem):
             return it._stroke
-        return getattr(it, "_color", None)
+        if isinstance(it, (LineAnnotationItem, HighlightItem)):
+            return it._color
+        return None
 
     @staticmethod
     def _item_font_color(it):
@@ -923,14 +956,21 @@ class PDFCanvas(QGraphicsView):
             first = vals[0]
             return first if all(v == first for v in vals[1:]) else None
 
+        # Fill on/off is folded over rectangles only (None = mixed or no rects).
+        rects = [i for i in items if isinstance(i, RectAnnotationItem)]
+        fill_flags = [i._fill is not None for i in rects]
+        fill = None
+        if fill_flags:
+            fill = fill_flags[0] if all(f == fill_flags[0] for f in fill_flags) else None
+
         return {
-            "color": fold(self._item_color),
+            "stroke_color": fold(self._item_stroke_color),
+            "fill_color": fold(lambda i: i._fill if isinstance(i, RectAnnotationItem) else None),
+            "fill": fill,
             "opacity": fold(lambda i: getattr(i, "_opacity", None)),
             "line_width": fold(lambda i: getattr(i, "_line_width", None)),
             "font_size": fold(lambda i: getattr(i, "_font_size", None)),
             "font_color": fold(self._item_font_color),
-            "fill": fold(lambda i: (i._fill is not None)
-                         if isinstance(i, RectAnnotationItem) else None),
             "types": {i.ann_type for i in items},
         }
 
@@ -1388,6 +1428,8 @@ class PDFCanvas(QGraphicsView):
                         self._drag_items = [i for i in self._scene.selectedItems()
                                             if isinstance(i, AnnotationBase)]
                     self._drag_start = scene_pos
+                    self._drag_anchor = scene_pos
+                    self._drag_applied = QPointF(0, 0)
                 else:
                     # No annotation here. An embedded PDF image lifts+drags on press;
                     # truly empty space begins a marquee (decided on first move).
@@ -1396,6 +1438,8 @@ class PDFCanvas(QGraphicsView):
                     if lifted:
                         self._drag_items = [lifted]
                         self._drag_start = scene_pos
+                        self._drag_anchor = scene_pos
+                        self._drag_applied = QPointF(0, 0)
                         self._drag_is_lift = True
                     else:
                         self._press_empty_pos = scene_pos
@@ -1432,19 +1476,22 @@ class PDFCanvas(QGraphicsView):
                 self._draw_start = scene_pos
 
                 if self._tool == "rect":
-                    fill = self._color if self._fill_enabled else None
+                    fill = self._fill_color if self._fill_enabled else None
                     self._temp_item = RectAnnotationItem(
                         QRectF(scene_pos, scene_pos),
-                        self._color, fill, self._opacity, self._current_page,
+                        self._stroke_color, fill, self._opacity, self._current_page,
                         self._line_width,
                     )
                     self._temp_item._font_size = self._font_size
                     self._temp_item._font_color = QColor(self._font_color)
                 else:  # line
+                    # A line tool always draws a visible stroke, even if the rect
+                    # border width is currently set to 0 ("No line").
+                    lw = self._line_width if self._line_width > 0 else 2.0
                     self._temp_item = LineAnnotationItem(
                         QLineF(scene_pos, scene_pos),
-                        self._color, self._opacity, self._current_page,
-                        self._line_width,
+                        self._stroke_color, self._opacity, self._current_page,
+                        lw,
                     )
 
                 self._scene.addItem(self._temp_item)
@@ -1486,12 +1533,21 @@ class PDFCanvas(QGraphicsView):
                 self._resize_item.update()
 
         elif self._drag_items and self._drag_start is not None:
-            delta = scene_pos - self._drag_start
-            for it in self._drag_items:
-                it.moveBy(delta.x(), delta.y())
-            self._drag_total += delta
-            self._drag_start = scene_pos
-            self._drag_moved = True
+            anchor = self._drag_anchor if self._drag_anchor is not None else self._drag_start
+            total = scene_pos - anchor
+            # Shift locks the move/duplicate to a straight horizontal or vertical path.
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                if abs(total.x()) >= abs(total.y()):
+                    total = QPointF(total.x(), 0.0)
+                else:
+                    total = QPointF(0.0, total.y())
+            delta = total - self._drag_applied
+            if delta.x() or delta.y():
+                for it in self._drag_items:
+                    it.moveBy(delta.x(), delta.y())
+                self._drag_applied = total
+                self._drag_total = total
+                self._drag_moved = True
 
         elif self._press_empty_pos is not None:
             # Begin/extend a marquee once the press has dragged past a small threshold.
@@ -1575,6 +1631,8 @@ class PDFCanvas(QGraphicsView):
                 self._drag_start = None
                 self._drag_moved = False
                 self._drag_is_lift = False
+                self._drag_anchor = None
+                self._drag_applied = QPointF(0, 0)
 
             elif self._rubber_item is not None:
                 rubber_rect = self._rubber_item.rect()
@@ -1603,6 +1661,10 @@ class PDFCanvas(QGraphicsView):
 
                 if keep:
                     self._page_annotations.setdefault(self._current_page, []).append(self._temp_item)
+                    # Leave the new object selected so its color/style can be tweaked
+                    # immediately, while the drawing tool stays active for the next shape.
+                    self._scene.clearSelection()
+                    self._temp_item.setSelected(True)
                     self._push(AddItemsCommand(self, [self._temp_item], "Draw"))
                     self.annotation_changed.emit()
                 else:
@@ -1641,7 +1703,15 @@ class PDFCanvas(QGraphicsView):
     def wheelEvent(self, event):
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             factor = 1.15 if event.angleDelta().y() > 0 else 1.0 / 1.15
+            # Re-anchor the zoom under the cursor: scale, then translate the view so
+            # the scene point that was under the mouse stays under the mouse.
+            cursor_pos = event.position().toPoint()
+            before = self.mapToScene(cursor_pos)
             self.scale(factor, factor)
+            after = self.mapToScene(cursor_pos)
+            delta = after - before
+            self.translate(delta.x(), delta.y())
+            event.accept()
         else:
             super().wheelEvent(event)
 
