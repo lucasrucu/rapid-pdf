@@ -101,6 +101,7 @@ class MainWindow(QMainWindow):
         self._toolbar.line_width_changed.connect(self._canvas.set_line_width)
         self._toolbar.font_size_changed.connect(self._canvas.set_font_size)
         self._toolbar.font_color_changed.connect(self._canvas.set_font_color)
+        self._canvas.selection_changed.connect(self._toolbar.show_selection)
         editor_layout.addWidget(self._toolbar)
 
         self._tabs.addTab(editor_widget, "Editor")

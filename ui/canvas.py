@@ -604,11 +604,13 @@ class StyleCommand(_Command):
 
 class PDFCanvas(QGraphicsView):
     annotation_changed = Signal()
+    selection_changed = Signal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._scene = QGraphicsScene(self)
         self.setScene(self._scene)
+        self._scene.selectionChanged.connect(self._on_selection_changed)
 
         self._doc = None
         self._current_page = 0
@@ -887,6 +889,50 @@ class PDFCanvas(QGraphicsView):
     def get_all_annotation_dicts(self, page_num: int) -> list:
         return [item.to_annotation_dict(self._zoom)
                 for item in self._page_annotations.get(page_num, [])]
+
+    # ------------------------------------------------------------------
+    # Selection → properties panel sync
+    # ------------------------------------------------------------------
+
+    def _on_selection_changed(self):
+        items = [i for i in self._scene.selectedItems() if isinstance(i, AnnotationBase)]
+        self.selection_changed.emit(self._selection_summary(items))
+
+    @staticmethod
+    def _item_color(it):
+        if isinstance(it, RectAnnotationItem):
+            return it._stroke
+        return getattr(it, "_color", None)
+
+    @staticmethod
+    def _item_font_color(it):
+        # A text label's own color IS its text color.
+        if isinstance(it, TextAnnotationItem):
+            return it._color
+        return getattr(it, "_font_color", None)
+
+    def _selection_summary(self, items) -> dict:
+        """Fold each style property across the selection (value if all agree, else None)."""
+        if not items:
+            return {}
+
+        def fold(getter):
+            vals = [v for v in (getter(i) for i in items) if v is not None]
+            if not vals:
+                return None
+            first = vals[0]
+            return first if all(v == first for v in vals[1:]) else None
+
+        return {
+            "color": fold(self._item_color),
+            "opacity": fold(lambda i: getattr(i, "_opacity", None)),
+            "line_width": fold(lambda i: getattr(i, "_line_width", None)),
+            "font_size": fold(lambda i: getattr(i, "_font_size", None)),
+            "font_color": fold(self._item_font_color),
+            "fill": fold(lambda i: (i._fill is not None)
+                         if isinstance(i, RectAnnotationItem) else None),
+            "types": {i.ann_type for i in items},
+        }
 
     # ------------------------------------------------------------------
     # Editable annotation model — JSON round-trip (save → reopen → still editable)

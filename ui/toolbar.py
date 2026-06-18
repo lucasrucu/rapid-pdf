@@ -108,6 +108,9 @@ class ToolBar(QWidget):
         self._font_color = QColor(0, 0, 0)
         self._opacity = 0.5
         self._tool_btns: dict[str, QPushButton] = {}
+        self._swatch_btns: dict[str, QPushButton] = {}
+        self._current_tool = "select"
+        self._selection_types: set[str] = set()
         self._setup_ui()
         self.setFixedWidth(128)
         self.setStyleSheet(_STYLE)
@@ -206,6 +209,7 @@ class ToolBar(QWidget):
                 btn.setToolTip(c.name())
                 btn.setStyleSheet(self._swatch_style(c))
                 btn.clicked.connect(lambda _, col=c: self._on_color(col))
+                self._swatch_btns[c.name()] = btn
                 row_layout.addWidget(btn)
             layout.addWidget(row)
 
@@ -215,7 +219,7 @@ class ToolBar(QWidget):
         self._custom_btn.setToolTip("Open color picker")
         self._custom_btn.clicked.connect(self._open_color_dialog)
         layout.addWidget(self._custom_btn)
-        self._update_custom_btn()
+        self.set_active_color(self._color, emit=False)
 
         layout.addWidget(self._divider())
 
@@ -260,20 +264,33 @@ class ToolBar(QWidget):
         return line
 
     @staticmethod
-    def _swatch_style(c: QColor) -> str:
+    def _swatch_style(c: QColor, selected: bool = False) -> str:
+        border = "3px solid #0078d4" if selected else "1px solid #555"
         return (
-            f"QPushButton {{ background-color: {c.name()}; border: 1px solid #555; border-radius: 3px; }}"
+            f"QPushButton {{ background-color: {c.name()}; border: {border}; border-radius: 3px; }}"
             f"QPushButton:hover {{ border: 2px solid #fff; }}"
             f"QPushButton:pressed {{ border: 2px solid #0078d4; }}"
         )
 
-    def _update_custom_btn(self):
+    def _update_custom_btn(self, active: bool = False):
         text_color = "#000" if _luminance(self._color) > 128 else "#fff"
+        border = "2px solid #0078d4" if active else "1px solid #666"
         self._custom_btn.setStyleSheet(
             f"QPushButton {{ background-color: {self._color.name()}; color: {text_color}; "
-            f"border: 1px solid #666; border-radius: 3px; padding: 3px 4px; }}"
+            f"border: {border}; border-radius: 3px; padding: 3px 4px; }}"
             f"QPushButton:hover {{ border: 1px solid #fff; }}"
         )
+
+    def set_active_color(self, color: QColor, emit: bool = True):
+        """Set the working color and highlight its swatch (or the Custom slot)."""
+        self._color = QColor(color)
+        name = self._color.name()
+        is_preset = any(name == c.name() for c in PRESETS)
+        for cname, btn in self._swatch_btns.items():
+            btn.setStyleSheet(self._swatch_style(QColor(cname), selected=(cname == name)))
+        self._update_custom_btn(active=not is_preset)
+        if emit:
+            self.color_changed.emit(self._color)
 
     def _update_font_color_btn(self):
         text_color = "#000" if _luminance(self._font_color) > 128 else "#fff"
@@ -296,14 +313,13 @@ class ToolBar(QWidget):
         self._update_font_color_btn()
 
     def _on_tool(self, tool: str):
+        self._current_tool = tool
         for tid, btn in self._tool_btns.items():
             btn.setChecked(tid == tool)
         self.tool_changed.emit(tool)
 
     def _on_color(self, color: QColor):
-        self._color = color
-        self._update_custom_btn()
-        self.color_changed.emit(color)
+        self.set_active_color(color, emit=True)
 
     def _open_color_dialog(self):
         color = QColorDialog.getColor(
@@ -317,6 +333,56 @@ class ToolBar(QWidget):
         self._opacity = value / 100.0
         self._opacity_label.setText(f"{value}%")
         self.opacity_changed.emit(self._opacity)
+
+    def show_selection(self, summary: dict):
+        """Reflect the selected object(s) in the controls without emitting signals.
+
+        Every widget mutation is wrapped in blockSignals so syncing the panel to a
+        selection never fires a change back to the canvas (no loops, no undo noise).
+        A property that differs across a mixed selection (None) is left unchanged.
+        """
+        self._selection_types = set(summary.get("types", set())) if summary else set()
+
+        color = summary.get("color") if summary else None
+        if color is not None:
+            self.set_active_color(color, emit=False)
+
+        opacity = summary.get("opacity") if summary else None
+        if opacity is not None:
+            pct = int(round(opacity * 100))
+            self._opacity = opacity
+            self._opacity_slider.blockSignals(True)
+            self._opacity_slider.setValue(pct)
+            self._opacity_slider.blockSignals(False)
+            self._opacity_label.setText(f"{pct}%")
+
+        line_width = summary.get("line_width") if summary else None
+        if line_width is not None:
+            self._width_spin.blockSignals(True)
+            self._width_spin.setValue(int(round(line_width)))
+            self._width_spin.blockSignals(False)
+
+        font_size = summary.get("font_size") if summary else None
+        if font_size is not None:
+            self._font_spin.blockSignals(True)
+            self._font_spin.setValue(int(font_size))
+            self._font_spin.blockSignals(False)
+
+        font_color = summary.get("font_color") if summary else None
+        if font_color is not None:
+            self.set_displayed_font_color(font_color)
+
+        fill = summary.get("fill") if summary else None
+        if fill is not None:
+            self._fill_btn.blockSignals(True)
+            self._fill_btn.setChecked(bool(fill))
+            self._fill_btn.blockSignals(False)
+
+        self._update_context()
+
+    def _update_context(self):
+        """Hook for contextual section visibility (see _setup_ui sections)."""
+        pass
 
     def trigger_tool(self, tool: str):
         if tool in self._tool_btns:
