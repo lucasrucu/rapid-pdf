@@ -626,6 +626,7 @@ class StyleCommand(_Command):
 class PDFCanvas(QGraphicsView):
     annotation_changed = Signal()
     selection_changed = Signal(dict)
+    page_changed = Signal(int)   # canvas-initiated page turn (continuous scroll)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -698,6 +699,10 @@ class PDFCanvas(QGraphicsView):
         self._flash_timer = QTimer(self)
         self._flash_timer.setInterval(40)
         self._flash_timer.timeout.connect(self._on_flash_tick)
+
+        # Where to position the next rendered page: a continuous-scroll page turn
+        # lands at the top (scrolled down) or bottom (scrolled up) of the new page.
+        self._pending_scroll_to: str | None = None
 
         # Page-render debounce so blitzing through pages only renders the landing.
         self._pending_page: int | None = None
@@ -1344,6 +1349,35 @@ class PDFCanvas(QGraphicsView):
                 self._scene.addItem(item)
             item.setVisible(True)
 
+        self._apply_pending_scroll()
+
+    def _apply_pending_scroll(self):
+        """Position a continuous-scroll page turn at the top/bottom of the new page.
+        Reasserted on the next event-loop tick because the scrollbar range only
+        settles after the new scene rect is laid out."""
+        if self._pending_scroll_to is None:
+            return
+        where = self._pending_scroll_to
+        self._pending_scroll_to = None
+        vbar = self.verticalScrollBar()
+
+        def place():
+            vbar.setValue(vbar.minimum() if where == "top" else vbar.maximum())
+
+        place()
+        QTimer.singleShot(0, place)
+
+    def _goto_adjacent_page(self, delta: int) -> bool:
+        """Turn to the previous/next page (continuous scroll). Returns False at the ends."""
+        if not self._doc:
+            return False
+        target = self._current_page + delta
+        if not (0 <= target < self._doc.page_count()):
+            return False
+        self._pending_scroll_to = "top" if delta > 0 else "bottom"
+        self.page_changed.emit(target)   # main window mirrors panel + status
+        return True
+
     def _compute_embedded_images(self, page_num: int) -> list:
         """List (xref, PDF-coord Rect) for every raster image currently drawn on the page.
 
@@ -1820,6 +1854,18 @@ class PDFCanvas(QGraphicsView):
             self._mark_interacting()   # fast scaling while zooming, crisp on settle
             event.accept()
         else:
+            # Continuous scroll: scrolling past the bottom of a page turns to the
+            # next page (landing at its top); past the top turns back (landing at
+            # its bottom) — like Adobe.
+            vbar = self.verticalScrollBar()
+            dy = event.angleDelta().y()
+            if dy < 0 and vbar.value() >= vbar.maximum() and self._goto_adjacent_page(1):
+                event.accept()
+                return
+            if dy > 0 and vbar.value() <= vbar.minimum() and self._goto_adjacent_page(-1):
+                event.accept()
+                return
+            self._mark_interacting()   # fast scaling while panning the page
             super().wheelEvent(event)
 
     def keyPressEvent(self, event):

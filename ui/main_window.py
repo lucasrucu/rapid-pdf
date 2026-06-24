@@ -91,6 +91,7 @@ class MainWindow(QMainWindow):
 
         self._canvas = PDFCanvas()
         self._canvas.annotation_changed.connect(self._on_annotation_changed)
+        self._canvas.page_changed.connect(self._on_canvas_page_changed)
         editor_layout.addWidget(self._canvas, stretch=1)
 
         self._toolbar = ToolBar()
@@ -407,6 +408,15 @@ class MainWindow(QMainWindow):
 
     def _on_page_selected(self, page_num: int):
         if page_num == self._current_page and self._doc.doc:
+            return
+        self._current_page = page_num
+        self._canvas.set_page(page_num)
+        self._page_panel.set_current_page(page_num)
+        self._update_status()
+
+    def _on_canvas_page_changed(self, page_num: int):
+        """The canvas turned the page itself (continuous scroll past an edge)."""
+        if not self._doc.doc:
             return
         self._current_page = page_num
         self._canvas.set_page(page_num)
