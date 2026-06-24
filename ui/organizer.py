@@ -2,9 +2,10 @@ import fitz as _fitz
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QListWidget, QListWidgetItem, QLabel, QFileDialog, QMessageBox,
+    QStyledItemDelegate, QStyle,
 )
-from PySide6.QtCore import Signal, Qt, QSize
-from PySide6.QtGui import QIcon
+from PySide6.QtCore import Signal, Qt, QSize, QRect
+from PySide6.QtGui import QIcon, QColor
 
 THUMB_W = 160
 THUMB_H = 210
@@ -12,6 +13,47 @@ ITEM_W = 184
 ITEM_H = 244
 
 _PAGE_ID = Qt.ItemDataRole.UserRole  # stores each item's source page index
+
+
+class _ThumbDelegate(QStyledItemDelegate):
+    """Draw each page thumbnail with its 'Page N' label centred BELOW it.
+
+    The list stays in ListMode (so reordering re-flows the grid cleanly); this
+    delegate just owns the in-cell layout, which ListMode otherwise renders with
+    the label beside the thumbnail where it gets clipped to nothing.
+    """
+    _TEXT_H = 22
+
+    def paint(self, painter, option, index):
+        painter.save()
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        if selected:
+            painter.fillRect(option.rect, QColor(0, 120, 212))
+        elif option.state & QStyle.StateFlag.State_MouseOver:
+            painter.fillRect(option.rect, QColor(46, 46, 46))
+
+        inner = option.rect.adjusted(6, 6, -6, -6)
+        icon = index.data(Qt.ItemDataRole.DecorationRole)
+        if icon is not None:
+            area = QRect(inner.x(), inner.y(), inner.width(),
+                         max(1, inner.height() - self._TEXT_H))
+            pm = icon.pixmap(area.size())
+            painter.drawPixmap(
+                area.x() + (area.width() - pm.width()) // 2,
+                area.y() + (area.height() - pm.height()) // 2,
+                pm,
+            )
+        text = index.data(Qt.ItemDataRole.DisplayRole)
+        if text:
+            painter.setPen(QColor("#ffffff") if selected else QColor("#cccccc"))
+            trect = QRect(inner.x(), inner.bottom() - self._TEXT_H + 2,
+                          inner.width(), self._TEXT_H)
+            painter.drawText(
+                trect,
+                Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                str(text),
+            )
+        painter.restore()
 
 
 class _DragList(QListWidget):
@@ -145,6 +187,7 @@ class PageOrganizer(QWidget):
         self._list.setDropIndicatorShown(True)
         self._list.setSpacing(4)
         self._list.setUniformItemSizes(True)
+        self._list.setItemDelegate(_ThumbDelegate(self._list))
         self._list.reordered.connect(self._on_reordered)
         self._list.reorder_invalid.connect(self.needs_rebuild)
         self._list.itemDoubleClicked.connect(self._on_item_activated)

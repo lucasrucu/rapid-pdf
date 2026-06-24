@@ -2,7 +2,7 @@ import fitz
 from PySide6.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsLineItem,
     QGraphicsPixmapItem, QGraphicsTextItem, QGraphicsItem,
-    QInputDialog, QStyle, QApplication, QLabel,
+    QInputDialog, QStyle, QApplication,
 )
 from PySide6.QtCore import (
     Qt, QRectF, QRect, QPointF, QLineF, Signal, QBuffer, QIODevice, QTimer,
@@ -741,16 +741,6 @@ class PDFCanvas(QGraphicsView):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
-        # Floating page-number badge (bottom-centre), like the Organizer's labels.
-        self._page_badge = QLabel(self.viewport())
-        self._page_badge.setStyleSheet(
-            "background-color: rgba(20, 20, 20, 190); color: #e0e0e0;"
-            " border: 1px solid #555; border-radius: 5px; padding: 2px 10px;"
-            " font-size: 11px;"
-        )
-        self._page_badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self._page_badge.hide()
-
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -807,8 +797,6 @@ class PDFCanvas(QGraphicsView):
         self._cancel_interaction()
         if doc and doc.page_count() > 0:
             self._load_page(0)
-        else:
-            self._update_page_badge()
 
     def set_page(self, page_num: int, immediate: bool = False):
         """Switch to a page. Navigation debounces the heavy render so fast paging
@@ -1371,28 +1359,6 @@ class PDFCanvas(QGraphicsView):
             item.setVisible(True)
 
         self._apply_pending_scroll()
-        self._update_page_badge()
-
-    def _update_page_badge(self):
-        if not self._doc or self._doc.page_count() == 0:
-            self._page_badge.hide()
-            return
-        self._page_badge.setText(
-            f"Page {self._current_page + 1} / {self._doc.page_count()}")
-        self._page_badge.adjustSize()
-        self._position_page_badge()
-        self._page_badge.show()
-        self._page_badge.raise_()
-
-    def _position_page_badge(self):
-        vp = self.viewport().rect()
-        b = self._page_badge
-        b.move(max(0, (vp.width() - b.width()) // 2), vp.height() - b.height() - 10)
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if hasattr(self, "_page_badge"):
-            self._position_page_badge()
 
     def _apply_pending_scroll(self):
         """Position a continuous-scroll page turn at the top/bottom of the new page.

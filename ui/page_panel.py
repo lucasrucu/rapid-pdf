@@ -55,6 +55,15 @@ class PagePanel(QWidget):
         self._list = QListWidget()
         self._list.setIconSize(QSize(THUMB_W, THUMB_H))
         self._list.setSpacing(2)
+        # IconMode draws the page number centred *below* each thumbnail (like the
+        # Organizer). TopToBottom + no wrapping keeps it a single vertical column.
+        self._list.setViewMode(QListWidget.ViewMode.IconMode)
+        self._list.setFlow(QListWidget.Flow.TopToBottom)
+        self._list.setWrapping(False)
+        self._list.setMovement(QListWidget.Movement.Static)
+        self._list.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self._list.setDragDropMode(QListWidget.DragDropMode.NoDragDrop)
+        self._list.setUniformItemSizes(True)
         # Smooth pixel-based scrolling instead of jumping a whole page per wheel tick.
         self._list.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
         self._list.verticalScrollBar().setSingleStep(16)
@@ -75,8 +84,9 @@ class PagePanel(QWidget):
         self._rendered.clear()
         if self._doc:
             for i in range(self._doc.page_count()):
-                item = QListWidgetItem(QIcon(self._placeholder_for(i)), f"  {i + 1}")
+                item = QListWidgetItem(QIcon(self._placeholder_for(i)), str(i + 1))
                 item.setSizeHint(QSize(ITEM_W, ITEM_H))
+                item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
                 self._list.addItem(item)
             if self._list.count() > 0:
                 self._list.setCurrentRow(0)
