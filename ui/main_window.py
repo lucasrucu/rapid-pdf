@@ -95,10 +95,11 @@ class MainWindow(QMainWindow):
 
         self._toolbar = ToolBar()
         self._toolbar.tool_changed.connect(self._canvas.set_tool)
-        self._toolbar.color_changed.connect(self._canvas.set_color)
-        self._toolbar.opacity_changed.connect(self._canvas.set_opacity)
-        self._toolbar.fill_toggled.connect(self._canvas.set_fill_enabled)
+        self._toolbar.line_color_changed.connect(self._canvas.set_stroke_color)
+        self._toolbar.fill_color_changed.connect(self._canvas.set_fill_color)
+        self._toolbar.fill_cleared.connect(lambda: self._canvas.set_fill_enabled(False))
         self._toolbar.line_width_changed.connect(self._canvas.set_line_width)
+        self._toolbar.opacity_changed.connect(self._canvas.set_opacity)
         self._toolbar.font_size_changed.connect(self._canvas.set_font_size)
         self._toolbar.font_color_changed.connect(self._canvas.set_font_color)
         self._canvas.selection_changed.connect(self._toolbar.show_selection)
@@ -124,7 +125,6 @@ class MainWindow(QMainWindow):
 
         fm = mb.addMenu("File")
         self._add_action(fm, "Open / Combine PDFs…", self.open_pdf, QKeySequence.StandardKey.Open)
-        self._add_action(fm, "Insert Pages from PDF…", self.insert_pages)
         self._add_action(fm, "Close PDF", self.close_pdf)
         fm.addSeparator()
         self._add_action(fm, "Save", self.save_pdf, QKeySequence.StandardKey.Save)
@@ -265,37 +265,6 @@ class MainWindow(QMainWindow):
         self._page_panel.set_document(self._doc)
         self._current_page = 0
         self._update_status()
-
-    def insert_pages(self):
-        if not self._doc.doc:
-            QMessageBox.warning(self, "No PDF", "Open a PDF first.")
-            return
-        paths, _ = QFileDialog.getOpenFileNames(self, "Select PDFs to Insert", "", "PDF Files (*.pdf)")
-        if not paths:
-            return
-        paths = sorted(paths)
-        insert_at = self._current_page + 1
-        total = 0
-        errors = []
-        for path in paths:
-            try:
-                src = fitz.open(path)
-                count = len(src)
-                src.close()
-                self._doc.insert_pdf(path, start_at=insert_at)
-                insert_at += count
-                total += count
-            except Exception as e:
-                errors.append(f"{path}: {e}")
-        if total:
-            # A merge produces a derived document → untitled + unsaved.
-            self._mark_untitled()
-            self._mark_dirty()
-        self._page_panel.refresh()
-        if total:
-            self._update_status(f"Inserted {total} pages after page {self._current_page + 1}")
-        if errors:
-            QMessageBox.critical(self, "Insert Error", "\n".join(errors))
 
     def save_pdf(self) -> bool:
         if not self._doc.doc:
