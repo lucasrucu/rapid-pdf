@@ -12,6 +12,13 @@ from PySide6.QtGui import (
 
 HANDLE_SIZE = 8
 
+# Rapid page switches coalesce within this window, so only the page you land on
+# pays for a full fitz render (fast-scroll, render-on-land).
+PAGE_RENDER_DEBOUNCE_MS = 80
+# After motion stops for this long, smooth scaling is restored and the page is
+# repainted crisply.
+SETTLE_MS = 140
+
 
 # ---------------------------------------------------------------------------
 # Shared base
@@ -634,8 +641,10 @@ class PDFCanvas(QGraphicsView):
         self._page_annotations: dict[int, list] = {}
 
         # Embedded images on the CURRENT page, as (xref, fitz.Rect in PDF coords).
-        # Recomputed on every page load; clicking one "lifts" it into a movable object.
-        self._embedded_images: list = []
+        # Scanned lazily on first use (deferred off the page-load path); clicking
+        # one "lifts" it into a movable object.
+        self._embedded_images = None          # None = not yet scanned for this page
+        self._embedded_images_page = -1       # page the current scan belongs to
 
         # Tool state — stroke (outline/line) and fill are now independent colors.
         self._tool = "select"
@@ -690,8 +699,26 @@ class PDFCanvas(QGraphicsView):
         self._flash_timer.setInterval(40)
         self._flash_timer.timeout.connect(self._on_flash_tick)
 
+        # Page-render debounce so blitzing through pages only renders the landing.
+        self._pending_page: int | None = None
+        self._page_timer = QTimer(self)
+        self._page_timer.setSingleShot(True)
+        self._page_timer.timeout.connect(self._render_pending_page)
+
+        # Interaction "settle": smooth pixmap scaling is turned off while actively
+        # drawing/dragging/zooming (cheap nearest-neighbour repaints on a big page)
+        # and restored once motion stops, so markup never lags.
+        self._smooth_on = True
+        self._settle_timer = QTimer(self)
+        self._settle_timer.setSingleShot(True)
+        self._settle_timer.timeout.connect(self._end_active_render)
+
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        # Our custom paint() methods manage their own painter state, so Qt needn't
+        # save/restore it between items.
+        self.setOptimizationFlag(
+            QGraphicsView.OptimizationFlag.DontSavePainterState, True)
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         # NoAnchor: wheelEvent re-anchors the zoom under the cursor manually so that
         # Ctrl+scroll keeps the point under the mouse fixed instead of drifting.
@@ -746,7 +773,9 @@ class PDFCanvas(QGraphicsView):
     def set_document(self, doc):
         self._doc = doc
         self._page_annotations.clear()
-        self._embedded_images = []
+        self._embedded_images = None
+        self._embedded_images_page = -1
+        self._pending_page = None
         self._current_page = 0
         self._scene.clear()
         self._bg_item = None
@@ -755,16 +784,27 @@ class PDFCanvas(QGraphicsView):
         if doc and doc.page_count() > 0:
             self._load_page(0)
 
-    def set_page(self, page_num: int):
-        if not self._doc or page_num == self._current_page:
+    def set_page(self, page_num: int, immediate: bool = False):
+        """Switch to a page. Navigation debounces the heavy render so fast paging
+        stays smooth; structural callers (delete/reorder) pass immediate=True so the
+        new page is rendered synchronously before they read it back."""
+        if not self._doc:
             return
         if not (0 <= page_num < self._doc.page_count()):
             return
+        if page_num == self._current_page and not immediate:
+            return
         self._cancel_interaction()
+        # Hide the outgoing page's overlays now; the incoming page's background and
+        # overlays are drawn by the (possibly debounced) render.
         for item in self._page_annotations.get(self._current_page, []):
             item.setVisible(False)
         self._current_page = page_num
-        self._load_page(page_num)
+        self._pending_page = page_num
+        if immediate:
+            self._render_pending_page()
+        else:
+            self._page_timer.start(PAGE_RENDER_DEBOUNCE_MS)
 
     def set_tool(self, tool: str):
         self._cancel_interaction()
@@ -1132,6 +1172,7 @@ class PDFCanvas(QGraphicsView):
         Used to keep the left page panel in sync with unsaved edits without flushing
         annotations into the PDF.
         """
+        self._flush_pending_render()   # capture the page that is actually landed on
         if not self._bg_item:
             return QPixmap()
         src = self._scene.sceneRect()
@@ -1235,16 +1276,68 @@ class PDFCanvas(QGraphicsView):
     # Internal
     # ------------------------------------------------------------------
 
+    def _render_pending_page(self):
+        self._page_timer.stop()
+        if self._pending_page is None:
+            return
+        page = self._pending_page
+        self._pending_page = None
+        self._load_page(page)
+
+    def _flush_pending_render(self):
+        """Force any debounced page render to happen now — before hit-testing,
+        thumbnail grabs, or structural ops that read back the rendered page."""
+        if self._pending_page is not None:
+            self._render_pending_page()
+
+    def _begin_active_render(self):
+        if self._smooth_on:
+            self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+            self._smooth_on = False
+
+    def _end_active_render(self):
+        if not self._smooth_on:
+            self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            self._smooth_on = True
+            self.viewport().update()
+
+    def _mark_interacting(self):
+        """Drop to fast (nearest-neighbour) scaling during motion; a short idle
+        timer restores smooth scaling and repaints crisply once motion stops.
+        Covers drawing, dragging, resizing, marquee, keyboard nudge and zoom."""
+        self._begin_active_render()
+        self._settle_timer.start(SETTLE_MS)
+
+    def _ensure_embedded_images(self) -> list:
+        """The embedded-image scan is deferred off the page-load path; compute it
+        on first use for the current page (recompute if the page changed)."""
+        if (self._embedded_images is None
+                or self._embedded_images_page != self._current_page):
+            self._embedded_images = self._compute_embedded_images(self._current_page)
+            self._embedded_images_page = self._current_page
+        return self._embedded_images
+
     def _load_page(self, page_num: int):
         pixmap = self._doc.render_page(page_num, self._zoom)
         if self._bg_item is None:
             self._bg_item = self._scene.addPixmap(pixmap)
             self._bg_item.setZValue(-1)
+            # Cache the rasterised page in ITEM coordinates so per-frame markup
+            # repaints blit a cached tile instead of re-scaling a huge pixmap.
+            # Item (not Device) coordinate cache keeps memory bounded to the native
+            # raster size — DeviceCoordinateCache would balloon to hundreds of MB
+            # when zoomed in on an A1 drawing.
+            self._bg_item.setCacheMode(QGraphicsItem.CacheMode.ItemCoordinateCache)
+            self._bg_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
         else:
             self._bg_item.setPixmap(pixmap)
+            self._bg_item.update()   # invalidate the item cache for the new page
+
         self._scene.setSceneRect(QRectF(pixmap.rect()))
 
-        self._embedded_images = self._compute_embedded_images(page_num)
+        # Defer the embedded-image scan; computed lazily on first interaction.
+        self._embedded_images = None
+        self._embedded_images_page = page_num
 
         for item in self._page_annotations.get(page_num, []):
             if item.scene() is None:
@@ -1287,7 +1380,7 @@ class PDFCanvas(QGraphicsView):
             return None
         px, py = scene_pos.x() / self._zoom, scene_pos.y() / self._zoom
         best, best_area = None, None
-        for xref, r in self._embedded_images:
+        for xref, r in self._ensure_embedded_images():
             if r.x0 <= px <= r.x1 and r.y0 <= py <= r.y1:
                 area = r.width * r.height
                 if best_area is None or area < best_area:
@@ -1326,6 +1419,7 @@ class PDFCanvas(QGraphicsView):
 
         # Background now renders without the lifted image.
         self._bg_item.setPixmap(self._doc.render_page(page_num, self._zoom))
+        self._bg_item.update()   # invalidate item cache so the redacted image clears
 
         z = self._zoom
         rect = QRectF(fitz_rect.x0 * z, fitz_rect.y0 * z,
@@ -1334,6 +1428,7 @@ class PDFCanvas(QGraphicsView):
         self._scene.addItem(item)
         self._page_annotations.setdefault(page_num, []).append(item)
         self._embedded_images = self._compute_embedded_images(page_num)
+        self._embedded_images_page = page_num
         self._scene.clearSelection()
         item.setSelected(True)
         self.annotation_changed.emit()
@@ -1382,6 +1477,8 @@ class PDFCanvas(QGraphicsView):
     # ------------------------------------------------------------------
 
     def mousePressEvent(self, event):
+        # A click can't be acted on until the page it targets is actually rendered.
+        self._flush_pending_render()
         scene_pos = self.mapToScene(event.pos())
 
         if event.button() == Qt.MouseButton.LeftButton:
@@ -1503,6 +1600,12 @@ class PDFCanvas(QGraphicsView):
 
     def mouseMoveEvent(self, event):
         scene_pos = self.mapToScene(event.pos())
+
+        # Any active gesture means the page is moving under the cursor → switch to
+        # fast scaling until motion settles.
+        if (self._resize_item or self._drag_items or self._drawing
+                or self._press_empty_pos is not None):
+            self._mark_interacting()
 
         if self._resize_item and self._resize_handle:
             if isinstance(self._resize_item, LineAnnotationItem):
@@ -1714,6 +1817,7 @@ class PDFCanvas(QGraphicsView):
             after = self.mapToScene(cursor_pos)
             delta = after - before
             self.translate(delta.x(), delta.y())
+            self._mark_interacting()   # fast scaling while zooming, crisp on settle
             event.accept()
         else:
             super().wheelEvent(event)
@@ -1741,6 +1845,7 @@ class PDFCanvas(QGraphicsView):
                 for it in items:
                     it.moveBy(dx, dy)
                 self._push(NudgeCommand(self, items, dx, dy))
+                self._mark_interacting()
                 self.annotation_changed.emit()
             else:
                 super().keyPressEvent(event)

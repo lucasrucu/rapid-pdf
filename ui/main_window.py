@@ -311,7 +311,7 @@ class MainWindow(QMainWindow):
         self._page_panel.refresh()
         new_page = min(self._current_page, self._doc.page_count() - 1)
         self._current_page = new_page
-        self._canvas.set_page(new_page)
+        self._canvas.set_page(new_page, immediate=True)
         self._page_panel.set_current_page(new_page)
         self._update_status()
 
@@ -373,7 +373,7 @@ class MainWindow(QMainWindow):
         if self._doc.doc:
             new_page = min(self._current_page, self._doc.page_count() - 1)
             self._current_page = new_page
-            self._canvas.set_page(new_page)
+            self._canvas.set_page(new_page, immediate=True)
             self._page_panel.set_current_page(new_page)
             self._refresh_current_thumb()
         self._update_status()
