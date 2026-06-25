@@ -4,13 +4,25 @@ from PySide6.QtWidgets import (
     QGraphicsPixmapItem, QGraphicsTextItem, QGraphicsItem,
     QInputDialog, QStyle, QApplication,
 )
-from PySide6.QtCore import Qt, QRectF, QPointF, QLineF, Signal, QBuffer, QIODevice, QTimer
+from PySide6.QtCore import (
+    Qt, QRectF, QRect, QPointF, QLineF, Signal, QBuffer, QIODevice, QTimer,
+)
 from PySide6.QtGui import (
     QPen, QBrush, QColor, QPainter, QFont, QPixmap,
     QUndoStack, QUndoCommand,
 )
 
 HANDLE_SIZE = 8
+
+# Rapid page switches coalesce within this window, so only the page you land on
+# pays for a full fitz render (fast-scroll, render-on-land).
+PAGE_RENDER_DEBOUNCE_MS = 80
+# After motion stops for this long, smooth scaling is restored and the page is
+# repainted crisply.
+SETTLE_MS = 140
+# Minimum drag distance (scene units) before a press over an embedded image lifts
+# it — kept well above double-click jitter so a click/double-click never lifts.
+LIFT_DRAG_THRESHOLD = 8
 
 
 # ---------------------------------------------------------------------------
@@ -619,6 +631,7 @@ class StyleCommand(_Command):
 class PDFCanvas(QGraphicsView):
     annotation_changed = Signal()
     selection_changed = Signal(dict)
+    page_changed = Signal(int)   # canvas-initiated page turn (continuous scroll)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -634,8 +647,10 @@ class PDFCanvas(QGraphicsView):
         self._page_annotations: dict[int, list] = {}
 
         # Embedded images on the CURRENT page, as (xref, fitz.Rect in PDF coords).
-        # Recomputed on every page load; clicking one "lifts" it into a movable object.
-        self._embedded_images: list = []
+        # Scanned lazily on first use (deferred off the page-load path); clicking
+        # one "lifts" it into a movable object.
+        self._embedded_images = None          # None = not yet scanned for this page
+        self._embedded_images_page = -1       # page the current scan belongs to
 
         # Tool state — stroke (outline/line) and fill are now independent colors.
         self._tool = "select"
@@ -668,6 +683,9 @@ class PDFCanvas(QGraphicsView):
         self._press_empty_pos: QPointF | None = None
         self._press_additive = False
         self._rubber_item: QGraphicsRectItem | None = None
+        # An embedded image under the press becomes liftable only if the gesture
+        # turns into a drag — a plain click / double-click never lifts.
+        self._lift_candidate = None
 
         # Resize state
         self._resize_item: AnnotationBase | None = None
@@ -690,8 +708,30 @@ class PDFCanvas(QGraphicsView):
         self._flash_timer.setInterval(40)
         self._flash_timer.timeout.connect(self._on_flash_tick)
 
+        # Where to position the next rendered page: a continuous-scroll page turn
+        # lands at the top (scrolled down) or bottom (scrolled up) of the new page.
+        self._pending_scroll_to: str | None = None
+
+        # Page-render debounce so blitzing through pages only renders the landing.
+        self._pending_page: int | None = None
+        self._page_timer = QTimer(self)
+        self._page_timer.setSingleShot(True)
+        self._page_timer.timeout.connect(self._render_pending_page)
+
+        # Interaction "settle": smooth pixmap scaling is turned off while actively
+        # drawing/dragging/zooming (cheap nearest-neighbour repaints on a big page)
+        # and restored once motion stops, so markup never lags.
+        self._smooth_on = True
+        self._settle_timer = QTimer(self)
+        self._settle_timer.setSingleShot(True)
+        self._settle_timer.timeout.connect(self._end_active_render)
+
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        # Our custom paint() methods manage their own painter state, so Qt needn't
+        # save/restore it between items.
+        self.setOptimizationFlag(
+            QGraphicsView.OptimizationFlag.DontSavePainterState, True)
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         # NoAnchor: wheelEvent re-anchors the zoom under the cursor manually so that
         # Ctrl+scroll keeps the point under the mouse fixed instead of drifting.
@@ -735,6 +775,7 @@ class PDFCanvas(QGraphicsView):
             self._scene.removeItem(self._rubber_item)
         self._rubber_item = None
         self._press_empty_pos = None
+        self._lift_candidate = None
         self._drag_items = []
         self._drag_start = None
         self._drag_moved = False
@@ -746,7 +787,9 @@ class PDFCanvas(QGraphicsView):
     def set_document(self, doc):
         self._doc = doc
         self._page_annotations.clear()
-        self._embedded_images = []
+        self._embedded_images = None
+        self._embedded_images_page = -1
+        self._pending_page = None
         self._current_page = 0
         self._scene.clear()
         self._bg_item = None
@@ -755,16 +798,27 @@ class PDFCanvas(QGraphicsView):
         if doc and doc.page_count() > 0:
             self._load_page(0)
 
-    def set_page(self, page_num: int):
-        if not self._doc or page_num == self._current_page:
+    def set_page(self, page_num: int, immediate: bool = False):
+        """Switch to a page. Navigation debounces the heavy render so fast paging
+        stays smooth; structural callers (delete/reorder) pass immediate=True so the
+        new page is rendered synchronously before they read it back."""
+        if not self._doc:
             return
         if not (0 <= page_num < self._doc.page_count()):
             return
+        if page_num == self._current_page and not immediate:
+            return
         self._cancel_interaction()
+        # Hide the outgoing page's overlays now; the incoming page's background and
+        # overlays are drawn by the (possibly debounced) render.
         for item in self._page_annotations.get(self._current_page, []):
             item.setVisible(False)
         self._current_page = page_num
-        self._load_page(page_num)
+        self._pending_page = page_num
+        if immediate:
+            self._render_pending_page()
+        else:
+            self._page_timer.start(PAGE_RENDER_DEBOUNCE_MS)
 
     def set_tool(self, tool: str):
         self._cancel_interaction()
@@ -1132,6 +1186,7 @@ class PDFCanvas(QGraphicsView):
         Used to keep the left page panel in sync with unsaved edits without flushing
         annotations into the PDF.
         """
+        self._flush_pending_render()   # capture the page that is actually landed on
         if not self._bg_item:
             return QPixmap()
         src = self._scene.sceneRect()
@@ -1235,21 +1290,102 @@ class PDFCanvas(QGraphicsView):
     # Internal
     # ------------------------------------------------------------------
 
+    def _render_pending_page(self):
+        self._page_timer.stop()
+        if self._pending_page is None:
+            return
+        page = self._pending_page
+        self._pending_page = None
+        self._load_page(page)
+
+    def _flush_pending_render(self):
+        """Force any debounced page render to happen now — before hit-testing,
+        thumbnail grabs, or structural ops that read back the rendered page."""
+        if self._pending_page is not None:
+            self._render_pending_page()
+
+    def _begin_active_render(self):
+        if self._smooth_on:
+            self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+            self._smooth_on = False
+
+    def _end_active_render(self):
+        if not self._smooth_on:
+            self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            self._smooth_on = True
+            self.viewport().update()
+
+    def _mark_interacting(self):
+        """Drop to fast (nearest-neighbour) scaling during motion; a short idle
+        timer restores smooth scaling and repaints crisply once motion stops.
+        Covers drawing, dragging, resizing, marquee, keyboard nudge and zoom."""
+        self._begin_active_render()
+        self._settle_timer.start(SETTLE_MS)
+
+    def _ensure_embedded_images(self) -> list:
+        """The embedded-image scan is deferred off the page-load path; compute it
+        on first use for the current page (recompute if the page changed)."""
+        if (self._embedded_images is None
+                or self._embedded_images_page != self._current_page):
+            self._embedded_images = self._compute_embedded_images(self._current_page)
+            self._embedded_images_page = self._current_page
+        return self._embedded_images
+
     def _load_page(self, page_num: int):
         pixmap = self._doc.render_page(page_num, self._zoom)
         if self._bg_item is None:
             self._bg_item = self._scene.addPixmap(pixmap)
             self._bg_item.setZValue(-1)
+            # Cache the rasterised page in ITEM coordinates so per-frame markup
+            # repaints blit a cached tile instead of re-scaling a huge pixmap.
+            # Item (not Device) coordinate cache keeps memory bounded to the native
+            # raster size — DeviceCoordinateCache would balloon to hundreds of MB
+            # when zoomed in on an A1 drawing.
+            self._bg_item.setCacheMode(QGraphicsItem.CacheMode.ItemCoordinateCache)
+            self._bg_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
         else:
             self._bg_item.setPixmap(pixmap)
+            self._bg_item.update()   # invalidate the item cache for the new page
+
         self._scene.setSceneRect(QRectF(pixmap.rect()))
 
-        self._embedded_images = self._compute_embedded_images(page_num)
+        # Defer the embedded-image scan; computed lazily on first interaction.
+        self._embedded_images = None
+        self._embedded_images_page = page_num
 
         for item in self._page_annotations.get(page_num, []):
             if item.scene() is None:
                 self._scene.addItem(item)
             item.setVisible(True)
+
+        self._apply_pending_scroll()
+
+    def _apply_pending_scroll(self):
+        """Position a continuous-scroll page turn at the top/bottom of the new page.
+        Reasserted on the next event-loop tick because the scrollbar range only
+        settles after the new scene rect is laid out."""
+        if self._pending_scroll_to is None:
+            return
+        where = self._pending_scroll_to
+        self._pending_scroll_to = None
+        vbar = self.verticalScrollBar()
+
+        def place():
+            vbar.setValue(vbar.minimum() if where == "top" else vbar.maximum())
+
+        place()
+        QTimer.singleShot(0, place)
+
+    def _goto_adjacent_page(self, delta: int) -> bool:
+        """Turn to the previous/next page (continuous scroll). Returns False at the ends."""
+        if not self._doc:
+            return False
+        target = self._current_page + delta
+        if not (0 <= target < self._doc.page_count()):
+            return False
+        self._pending_scroll_to = "top" if delta > 0 else "bottom"
+        self.page_changed.emit(target)   # main window mirrors panel + status
+        return True
 
     def _compute_embedded_images(self, page_num: int) -> list:
         """List (xref, PDF-coord Rect) for every raster image currently drawn on the page.
@@ -1283,13 +1419,20 @@ class PDFCanvas(QGraphicsView):
         Smallest-area wins so a small image on top of a full-page background is the one
         you grab (a scanned page that is one big image still lifts as a whole — by design).
         """
-        if self._zoom <= 0:
+        if self._zoom <= 0 or not self._doc:
             return None
         px, py = scene_pos.x() / self._zoom, scene_pos.y() / self._zoom
+        pw, ph = self._doc.get_page_size(self._current_page)
+        page_area = pw * ph
         best, best_area = None, None
-        for xref, r in self._embedded_images:
+        for xref, r in self._ensure_embedded_images():
             if r.x0 <= px <= r.x1 and r.y0 <= py <= r.y1:
                 area = r.width * r.height
+                # Skip a near-full-page raster (a whole drawing scanned as one
+                # image): it's the page background, not a liftable element — and
+                # lifting it was the cause of the "page turns into a flipped copy" bug.
+                if page_area > 0 and area >= 0.9 * page_area:
+                    continue
                 if best_area is None or area < best_area:
                     best, best_area = (xref, r), area
         return best
@@ -1303,17 +1446,40 @@ class PDFCanvas(QGraphicsView):
         """
         page_num = self._current_page
         doc = self._doc.doc
+        z = self._zoom
+        page = doc[page_num]
+
+        # Grab the exact pixels currently shown for this image — straight from the
+        # rendered page — so the lifted object keeps the page's orientation. PDFs
+        # often place an image with a vertically-flipped matrix; re-inserting the raw
+        # extracted bytes un-flipped is what made a lifted raster look rotated 180°.
+        # Cropping the render sidesteps the placement transform entirely.
+        # fitz_rect is in PDF user space; convert to pixel coords via the page's
+        # rendering transform so the crop is correct even for rotated pages.
+        pdf_to_px = page.transformation_matrix * fitz.Matrix(z, z)
+        pr = fitz.Rect(fitz_rect) * pdf_to_px
+        src = QRect(round(pr.x0), round(pr.y0),
+                    max(1, round(pr.width)), max(1, round(pr.height)))
+        pixmap = self._bg_item.pixmap().copy(src) if self._bg_item else QPixmap()
+        if pixmap.isNull():
+            try:
+                pixmap = QPixmap()
+                pixmap.loadFromData(doc.extract_image(xref)["image"])
+            except Exception as e:
+                print(f"Lift extract failed: {e}")
+                return None
+            if pixmap.isNull():
+                return None
+
+        # Encode what we display (PNG) so a later save re-inserts exactly that —
+        # display and saved file stay identical, no flip on round-trip.
+        buf = QBuffer()
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        pixmap.save(buf, "PNG")
+        buf.close()
+        image_bytes = bytes(buf.data())
+
         try:
-            ext = doc.extract_image(xref)
-            image_bytes = ext["image"]
-        except Exception as e:
-            print(f"Lift extract failed: {e}")
-            return None
-        pixmap = QPixmap()
-        if not pixmap.loadFromData(image_bytes):
-            return None
-        try:
-            page = doc[page_num]
             page.add_redact_annot(fitz_rect, fill=None)
             page.apply_redactions(
                 images=fitz.PDF_REDACT_IMAGE_REMOVE,
@@ -1326,14 +1492,15 @@ class PDFCanvas(QGraphicsView):
 
         # Background now renders without the lifted image.
         self._bg_item.setPixmap(self._doc.render_page(page_num, self._zoom))
+        self._bg_item.update()   # invalidate item cache so the redacted image clears
 
-        z = self._zoom
-        rect = QRectF(fitz_rect.x0 * z, fitz_rect.y0 * z,
-                      fitz_rect.width * z, fitz_rect.height * z)
+        # pr is already in pixel/scene space (computed above via pdf_to_px).
+        rect = QRectF(pr.x0, pr.y0, pr.width, pr.height)
         item = ImageAnnotationItem(pixmap, image_bytes, rect, page_num)
         self._scene.addItem(item)
         self._page_annotations.setdefault(page_num, []).append(item)
         self._embedded_images = self._compute_embedded_images(page_num)
+        self._embedded_images_page = page_num
         self._scene.clearSelection()
         item.setSelected(True)
         self.annotation_changed.emit()
@@ -1382,6 +1549,8 @@ class PDFCanvas(QGraphicsView):
     # ------------------------------------------------------------------
 
     def mousePressEvent(self, event):
+        # A click can't be acted on until the page it targets is actually rendered.
+        self._flush_pending_render()
         scene_pos = self.mapToScene(event.pos())
 
         if event.button() == Qt.MouseButton.LeftButton:
@@ -1431,21 +1600,16 @@ class PDFCanvas(QGraphicsView):
                     self._drag_anchor = scene_pos
                     self._drag_applied = QPointF(0, 0)
                 else:
-                    # No annotation here. An embedded PDF image lifts+drags on press;
-                    # truly empty space begins a marquee (decided on first move).
-                    emb = self._embedded_image_at(scene_pos)
-                    lifted = self._lift_embedded_image(*emb) if emb else None
-                    if lifted:
-                        self._drag_items = [lifted]
-                        self._drag_start = scene_pos
-                        self._drag_anchor = scene_pos
-                        self._drag_applied = QPointF(0, 0)
-                        self._drag_is_lift = True
-                    else:
-                        self._press_empty_pos = scene_pos
-                        self._press_additive = additive
-                        self._drag_items = []
-                        self._drag_start = None
+                    # No annotation here. Empty space begins a marquee on first move.
+                    # If the press is over a (sub-page) embedded image, a DRAG lifts it
+                    # into a movable object — but a plain click or double-click never
+                    # does. (Lifting on press previously fired on the first half of a
+                    # double-click and turned the whole page into a flipped copy.)
+                    self._press_empty_pos = scene_pos
+                    self._press_additive = additive
+                    self._lift_candidate = self._embedded_image_at(scene_pos)
+                    self._drag_items = []
+                    self._drag_start = None
 
             elif self._tool == "text":
                 existing = self._annotation_at(scene_pos)
@@ -1504,6 +1668,12 @@ class PDFCanvas(QGraphicsView):
     def mouseMoveEvent(self, event):
         scene_pos = self.mapToScene(event.pos())
 
+        # Any active gesture means the page is moving under the cursor → switch to
+        # fast scaling until motion settles.
+        if (self._resize_item or self._drag_items or self._drawing
+                or self._press_empty_pos is not None):
+            self._mark_interacting()
+
         if self._resize_item and self._resize_handle:
             if isinstance(self._resize_item, LineAnnotationItem):
                 local_pos = self._resize_item.mapFromScene(scene_pos)
@@ -1553,15 +1723,42 @@ class PDFCanvas(QGraphicsView):
                 self._drag_moved = True
 
         elif self._press_empty_pos is not None:
-            # Begin/extend a marquee once the press has dragged past a small threshold.
-            if self._rubber_item is None:
-                if (scene_pos - self._press_empty_pos).manhattanLength() > 3:
-                    self._rubber_item = QGraphicsRectItem()
-                    self._rubber_item.setPen(
-                        QPen(QColor(0, 120, 215), 0, Qt.PenStyle.DashLine))
-                    self._rubber_item.setBrush(QBrush(QColor(0, 120, 215, 40)))
-                    self._rubber_item.setZValue(1000)
-                    self._scene.addItem(self._rubber_item)
+            moved = (scene_pos - self._press_empty_pos).manhattanLength()
+            if self._lift_candidate is not None:
+                # The press is over an embedded image: a deliberate DRAG lifts it
+                # into a movable object. We never start a marquee here, and the
+                # threshold is well above double-click jitter, so a click/double-click
+                # never lifts. (Below the threshold we simply wait.)
+                if moved > LIFT_DRAG_THRESHOLD:
+                    emb = self._lift_candidate
+                    self._lift_candidate = None
+                    press_pos = self._press_empty_pos
+                    lifted = self._lift_embedded_image(*emb)
+                    if lifted:
+                        self._press_empty_pos = None
+                        self._drag_items = [lifted]
+                        self._drag_start = press_pos
+                        self._drag_anchor = press_pos
+                        delta = scene_pos - press_pos
+                        lifted.moveBy(delta.x(), delta.y())
+                        self._drag_applied = delta
+                        self._drag_total = delta
+                        self._drag_moved = True
+                        self._drag_is_lift = True
+                        self._mark_interacting()
+                    else:
+                        # Lift failed → fall back to a marquee from here on.
+                        self._lift_candidate = None
+                event.accept()
+                return
+            # Empty space → begin/extend a marquee past a small threshold.
+            if self._rubber_item is None and moved > 3:
+                self._rubber_item = QGraphicsRectItem()
+                self._rubber_item.setPen(
+                    QPen(QColor(0, 120, 215), 0, Qt.PenStyle.DashLine))
+                self._rubber_item.setBrush(QBrush(QColor(0, 120, 215, 40)))
+                self._rubber_item.setZValue(1000)
+                self._scene.addItem(self._rubber_item)
             if self._rubber_item is not None:
                 self._rubber_item.setRect(
                     QRectF(self._press_empty_pos, scene_pos).normalized())
@@ -1647,12 +1844,15 @@ class PDFCanvas(QGraphicsView):
                     if self._item_intersects(it, rubber_rect):
                         it.setSelected(True)
                 self._press_empty_pos = None
+                self._lift_candidate = None
 
             elif self._press_empty_pos is not None:
                 # A plain click on empty space — clear selection (unless additive).
+                # No drag happened, so a candidate image is never lifted.
                 if not self._press_additive:
                     self._scene.clearSelection()
                 self._press_empty_pos = None
+                self._lift_candidate = None
 
             elif self._drawing and self._temp_item:
                 keep = False
@@ -1714,8 +1914,21 @@ class PDFCanvas(QGraphicsView):
             after = self.mapToScene(cursor_pos)
             delta = after - before
             self.translate(delta.x(), delta.y())
+            self._mark_interacting()   # fast scaling while zooming, crisp on settle
             event.accept()
         else:
+            # Continuous scroll: scrolling past the bottom of a page turns to the
+            # next page (landing at its top); past the top turns back (landing at
+            # its bottom) — like Adobe.
+            vbar = self.verticalScrollBar()
+            dy = event.angleDelta().y()
+            if dy < 0 and vbar.value() >= vbar.maximum() and self._goto_adjacent_page(1):
+                event.accept()
+                return
+            if dy > 0 and vbar.value() <= vbar.minimum() and self._goto_adjacent_page(-1):
+                event.accept()
+                return
+            self._mark_interacting()   # fast scaling while panning the page
             super().wheelEvent(event)
 
     def keyPressEvent(self, event):
@@ -1741,6 +1954,7 @@ class PDFCanvas(QGraphicsView):
                 for it in items:
                     it.moveBy(dx, dy)
                 self._push(NudgeCommand(self, items, dx, dy))
+                self._mark_interacting()
                 self.annotation_changed.emit()
             else:
                 super().keyPressEvent(event)

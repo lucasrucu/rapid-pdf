@@ -91,6 +91,7 @@ class MainWindow(QMainWindow):
 
         self._canvas = PDFCanvas()
         self._canvas.annotation_changed.connect(self._on_annotation_changed)
+        self._canvas.page_changed.connect(self._on_canvas_page_changed)
         editor_layout.addWidget(self._canvas, stretch=1)
 
         self._toolbar = ToolBar()
@@ -275,6 +276,7 @@ class MainWindow(QMainWindow):
         self._flush_annotations()
         if self._doc.save():
             self._dirty = False
+            self._strip_baked_annotations()
             self._update_status("Saved")
             return True
         QMessageBox.critical(self, "Save Error", "Could not save the PDF.")
@@ -289,6 +291,7 @@ class MainWindow(QMainWindow):
         self._flush_annotations()
         if self._doc.save(path):  # save() adopts `path` as the new canonical path
             self._dirty = False
+            self._strip_baked_annotations()
             self._update_status(f"Saved to {path}")
             return True
         QMessageBox.critical(self, "Save Error", "Could not save the PDF.")
@@ -311,7 +314,7 @@ class MainWindow(QMainWindow):
         self._page_panel.refresh()
         new_page = min(self._current_page, self._doc.page_count() - 1)
         self._current_page = new_page
-        self._canvas.set_page(new_page)
+        self._canvas.set_page(new_page, immediate=True)
         self._page_panel.set_current_page(new_page)
         self._update_status()
 
@@ -369,11 +372,14 @@ class MainWindow(QMainWindow):
             self._mark_dirty()
         for row in rows:  # already in descending order from organizer
             self._canvas.remove_page_annotations(row)
+        # Page deletion is structurally irreversible — the undo stack holds references
+        # to items on pages that no longer exist. Clear it to prevent corrupted undos.
+        self._canvas.undo_stack.clear()
         self._page_panel.refresh()
         if self._doc.doc:
             new_page = min(self._current_page, self._doc.page_count() - 1)
             self._current_page = new_page
-            self._canvas.set_page(new_page)
+            self._canvas.set_page(new_page, immediate=True)
             self._page_panel.set_current_page(new_page)
             self._refresh_current_thumb()
         self._update_status()
@@ -391,6 +397,20 @@ class MainWindow(QMainWindow):
         # Embed the editable model so the document reopens with its objects editable.
         self._doc.write_annotation_model(self._canvas.export_annotation_model())
 
+    def _strip_baked_annotations(self):
+        """After saving, remove baked markup from the live fitz document.
+
+        _flush_annotations() writes canvas items as PDF annotation objects so they
+        survive a save. The canvas also renders them as Qt items; if the baked
+        objects remain in the live doc, the next _load_page() produces a background
+        pixmap that already includes them — every annotation then appears twice, the
+        second copy as an unselectable ghost at a rotated position for rotated pages.
+        """
+        if not self._doc.doc:
+            return
+        for pn in range(self._doc.page_count()):
+            self._doc.delete_tagged_annotations(pn)
+
     def _load_saved_annotations(self):
         """If the opened PDF carries our embedded model, rebuild editable objects.
 
@@ -407,6 +427,15 @@ class MainWindow(QMainWindow):
 
     def _on_page_selected(self, page_num: int):
         if page_num == self._current_page and self._doc.doc:
+            return
+        self._current_page = page_num
+        self._canvas.set_page(page_num)
+        self._page_panel.set_current_page(page_num)
+        self._update_status()
+
+    def _on_canvas_page_changed(self, page_num: int):
+        """The canvas turned the page itself (continuous scroll past an edge)."""
+        if not self._doc.doc:
             return
         self._current_page = page_num
         self._canvas.set_page(page_num)

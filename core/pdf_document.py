@@ -40,7 +40,8 @@ class PDFDocument:
     def get_page_size(self, page_num: int) -> tuple[float, float]:
         if not self.doc or page_num >= len(self.doc):
             return (0.0, 0.0)
-        r = self.doc[page_num].rect
+        # page.bound() gives the visible dimensions after rotation; page.rect does not.
+        r = self.doc[page_num].bound()
         return (r.width, r.height)
 
     def render_page(self, page_num: int, zoom: float = 1.5) -> QPixmap:
@@ -57,7 +58,8 @@ class PDFDocument:
         if not self.doc or page_num >= len(self.doc):
             return QPixmap()
         page = self.doc[page_num]
-        zoom = max_width / page.rect.width
+        # page.bound() gives the visible (post-rotation) dimensions; page.rect does not.
+        zoom = max_width / page.bound().width
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat, alpha=False)
         img = QImage(bytes(pix.samples), pix.width, pix.height, pix.stride,
@@ -77,7 +79,19 @@ class PDFDocument:
                     tmp_path = tf.name
                 self.doc.save(tmp_path, garbage=4, deflate=True)
                 self.doc.close()
-                shutil.move(tmp_path, target)
+                try:
+                    shutil.move(tmp_path, target)
+                except Exception as move_err:
+                    # Original is gone; salvage the temp file so no data is lost.
+                    bak = target + ".bak"
+                    try:
+                        shutil.move(tmp_path, bak)
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        f"Could not overwrite the original file.\n"
+                        f"Your work was saved to: {bak}"
+                    ) from move_err
                 self.doc = fitz.open(target)
             else:
                 self.doc.save(target, garbage=4, deflate=True)
@@ -109,16 +123,20 @@ class PDFDocument:
         owns the returned doc and should close() it when done.
         """
         clone = fitz.open()
-        if self.doc:
-            clone.insert_pdf(self.doc)
-            writer = PDFDocument()
-            writer.doc = clone           # reuse write_annotations on the clone
-            try:
-                for pn, dicts in dicts_by_page.items():
-                    if dicts and 0 <= pn < len(clone):
-                        writer.write_annotations(pn, dicts)
-            finally:
-                writer.doc = None        # detach so it never closes the clone
+        try:
+            if self.doc:
+                clone.insert_pdf(self.doc)
+                writer = PDFDocument()
+                writer.doc = clone           # reuse write_annotations on the clone
+                try:
+                    for pn, dicts in dicts_by_page.items():
+                        if dicts and 0 <= pn < len(clone):
+                            writer.write_annotations(pn, dicts)
+                finally:
+                    writer.doc = None        # detach so it never closes the clone
+        except Exception:
+            clone.close()
+            raise
         return clone
 
     def delete_page(self, page_num: int):
@@ -182,10 +200,19 @@ class PDFDocument:
                 page.delete_annot(a)
 
     def write_annotations(self, page_num: int, annotations: list):
-        """Replace all rapid-pdf-tagged annotations on this page with the given list."""
+        """Replace all rapid-pdf-tagged annotations on this page with the given list.
+
+        Annotation dicts carry fitz_rects in the page's visible coordinate space
+        (matching the canvas render). For rotated pages, fitz annotation APIs expect
+        PDF user space coords, so we apply the page's derotation matrix to convert.
+        """
         if not self.doc or page_num >= len(self.doc):
             return
         page = self.doc[page_num]
+
+        # For rotated pages, annotation rects/points are in visible (rendered) space
+        # but fitz expects native PDF user space. Derotation converts between the two.
+        derot = page.derotation_matrix if page.rotation != 0 else None
 
         # Remove only our tagged annotations
         to_delete = [a for a in page.annots() if a.info.get("title") == RAPID_PDF_TAG]
@@ -197,6 +224,10 @@ class PDFDocument:
             rect = ann.get("fitz_rect")
             color = ann.get("color")
             opacity = ann.get("opacity", 1.0)
+
+            # Convert from visible space to PDF user space for rotated pages.
+            if rect is not None and derot is not None:
+                rect = fitz.Rect(rect) * derot
 
             try:
                 if ann_type == "highlight":
@@ -231,6 +262,9 @@ class PDFDocument:
                     p1 = ann.get("p1")
                     p2 = ann.get("p2")
                     if p1 and p2:
+                        if derot is not None:
+                            p1 = fitz.Point(p1) * derot
+                            p2 = fitz.Point(p2) * derot
                         annot = page.add_line_annot(p1, p2)
                         stroke = ann.get("color") or (0.0, 0.0, 0.0)
                         annot.set_colors(stroke=stroke)
@@ -261,6 +295,7 @@ class PDFDocument:
                     image_bytes = ann.get("image_bytes")
                     if rect and image_bytes:
                         page.insert_image(rect, stream=image_bytes)
+                        # Note: rect was already derotated above for rotated pages.
 
             except Exception as e:
                 print(f"Annotation write error ({ann_type}): {e}")
