@@ -1,17 +1,62 @@
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QListWidget, QListWidgetItem, QLabel,
+    QStyledItemDelegate, QStyle,
 )
-from PySide6.QtCore import Signal, Qt, QSize, QTimer
-from PySide6.QtGui import QIcon, QPixmap, QColor
+from PySide6.QtCore import Signal, Qt, QSize, QTimer, QRect
+from PySide6.QtGui import QIcon, QPixmap, QColor, QPainter
 
 
 THUMB_W = 100
 THUMB_H = 130
 ITEM_W = 118
 ITEM_H = 155
+_TEXT_H = 18
 # Render thumbnails this many pixels above/below the viewport so they're ready
 # just before they scroll into view.
 PREFETCH_PX = 300
+
+
+class _PageDelegate(QStyledItemDelegate):
+    """Draw thumbnail above label, selection highlight covering the whole cell.
+
+    IconMode has a Qt quirk where the selection rect drifts away from the visual
+    item position when icon sizes vary. ListMode + this delegate is pixel-perfect.
+    """
+
+    def paint(self, painter, option, index):
+        painter.save()
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        if selected:
+            painter.fillRect(option.rect, QColor(0, 120, 212))
+        elif option.state & QStyle.StateFlag.State_MouseOver:
+            painter.fillRect(option.rect, QColor(46, 46, 46))
+
+        inner = option.rect.adjusted(6, 6, -6, -6)
+        icon = index.data(Qt.ItemDataRole.DecorationRole)
+        if icon is not None:
+            thumb_area = QRect(inner.x(), inner.y(), inner.width(),
+                               max(1, inner.height() - _TEXT_H))
+            pm = icon.pixmap(thumb_area.size())
+            painter.drawPixmap(
+                thumb_area.x() + (thumb_area.width() - pm.width()) // 2,
+                thumb_area.y() + (thumb_area.height() - pm.height()) // 2,
+                pm,
+            )
+
+        text = index.data(Qt.ItemDataRole.DisplayRole)
+        if text:
+            painter.setPen(QColor("#ffffff") if selected else QColor("#aaaaaa"))
+            trect = QRect(inner.x(), inner.bottom() - _TEXT_H + 2,
+                          inner.width(), _TEXT_H)
+            painter.drawText(
+                trect,
+                Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                str(text),
+            )
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        return QSize(ITEM_W, ITEM_H)
 
 
 class PagePanel(QWidget):
@@ -55,15 +100,16 @@ class PagePanel(QWidget):
         self._list = QListWidget()
         self._list.setIconSize(QSize(THUMB_W, THUMB_H))
         self._list.setSpacing(2)
-        # IconMode draws the page number centred *below* each thumbnail (like the
-        # Organizer). TopToBottom + no wrapping keeps it a single vertical column.
-        self._list.setViewMode(QListWidget.ViewMode.IconMode)
+        # ListMode + custom delegate: avoids the IconMode Qt quirk where the
+        # selection highlight rect drifts below the visual item position.
+        self._list.setViewMode(QListWidget.ViewMode.ListMode)
         self._list.setFlow(QListWidget.Flow.TopToBottom)
         self._list.setWrapping(False)
         self._list.setMovement(QListWidget.Movement.Static)
         self._list.setResizeMode(QListWidget.ResizeMode.Adjust)
         self._list.setDragDropMode(QListWidget.DragDropMode.NoDragDrop)
         self._list.setUniformItemSizes(True)
+        self._list.setItemDelegate(_PageDelegate(self._list))
         # Smooth pixel-based scrolling instead of jumping a whole page per wheel tick.
         self._list.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
         self._list.verticalScrollBar().setSingleStep(16)

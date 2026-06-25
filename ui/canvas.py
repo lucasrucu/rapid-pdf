@@ -1447,14 +1447,19 @@ class PDFCanvas(QGraphicsView):
         page_num = self._current_page
         doc = self._doc.doc
         z = self._zoom
+        page = doc[page_num]
 
         # Grab the exact pixels currently shown for this image — straight from the
         # rendered page — so the lifted object keeps the page's orientation. PDFs
         # often place an image with a vertically-flipped matrix; re-inserting the raw
         # extracted bytes un-flipped is what made a lifted raster look rotated 180°.
         # Cropping the render sidesteps the placement transform entirely.
-        src = QRect(round(fitz_rect.x0 * z), round(fitz_rect.y0 * z),
-                    max(1, round(fitz_rect.width * z)), max(1, round(fitz_rect.height * z)))
+        # fitz_rect is in PDF user space; convert to pixel coords via the page's
+        # rendering transform so the crop is correct even for rotated pages.
+        pdf_to_px = page.transformation_matrix * fitz.Matrix(z, z)
+        pr = fitz.Rect(fitz_rect) * pdf_to_px
+        src = QRect(round(pr.x0), round(pr.y0),
+                    max(1, round(pr.width)), max(1, round(pr.height)))
         pixmap = self._bg_item.pixmap().copy(src) if self._bg_item else QPixmap()
         if pixmap.isNull():
             try:
@@ -1475,7 +1480,6 @@ class PDFCanvas(QGraphicsView):
         image_bytes = bytes(buf.data())
 
         try:
-            page = doc[page_num]
             page.add_redact_annot(fitz_rect, fill=None)
             page.apply_redactions(
                 images=fitz.PDF_REDACT_IMAGE_REMOVE,
@@ -1490,8 +1494,8 @@ class PDFCanvas(QGraphicsView):
         self._bg_item.setPixmap(self._doc.render_page(page_num, self._zoom))
         self._bg_item.update()   # invalidate item cache so the redacted image clears
 
-        rect = QRectF(fitz_rect.x0 * z, fitz_rect.y0 * z,
-                      fitz_rect.width * z, fitz_rect.height * z)
+        # pr is already in pixel/scene space (computed above via pdf_to_px).
+        rect = QRectF(pr.x0, pr.y0, pr.width, pr.height)
         item = ImageAnnotationItem(pixmap, image_bytes, rect, page_num)
         self._scene.addItem(item)
         self._page_annotations.setdefault(page_num, []).append(item)
