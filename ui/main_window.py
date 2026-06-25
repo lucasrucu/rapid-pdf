@@ -311,6 +311,10 @@ class MainWindow(QMainWindow):
         self._doc.delete_page(self._current_page)
         self._mark_dirty()
         self._canvas.remove_page_annotations(self._current_page)
+        # Page deletion renumbers/removes items the undo stack still references;
+        # clear it so a later undo can't replay against stale page indices.
+        # (Mirrors _on_pages_deleted — the Organizer delete path.)
+        self._canvas.undo_stack.clear()
         self._page_panel.refresh()
         new_page = min(self._current_page, self._doc.page_count() - 1)
         self._current_page = new_page
@@ -361,6 +365,10 @@ class MainWindow(QMainWindow):
         # Organizer already reordered the live document; mirror it everywhere else.
         self._mark_dirty()
         self._canvas.reorder_pages(new_order)
+        # Reorder re-bases every item's page_num; the undo stack's commands still
+        # reference the old numbering, so undo would land items on the wrong page.
+        # Structural page ops are incompatible with the item-level undo stack — clear it.
+        self._canvas.undo_stack.clear()
         self._page_panel.refresh()
         self._current_page = self._canvas._current_page
         self._page_panel.set_current_page(self._current_page)
