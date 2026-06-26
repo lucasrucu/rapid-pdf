@@ -1792,6 +1792,14 @@ class PDFCanvas(QGraphicsView):
                 self.setCursor(self._handle_cursor(res_handle))
             elif self._annotation_at(scene_pos):
                 self.setCursor(Qt.CursorShape.SizeAllCursor)
+            elif self._embedded_image_at(scene_pos) is not None:
+                # Hovering a liftable embedded image — including images placed by
+                # other apps (e.g. pasted in Acrobat's Edit PDF). An open-hand
+                # cursor signals "drag to grab": without it the image looks
+                # unselectable, because a plain click never lifts — only a drag
+                # past the threshold does. The cursor is also a live detector:
+                # if it appears over a third-party image, detection is working.
+                self.setCursor(Qt.CursorShape.OpenHandCursor)
             else:
                 self.setCursor(Qt.CursorShape.ArrowCursor)
 
