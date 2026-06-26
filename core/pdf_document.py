@@ -1,7 +1,6 @@
 import fitz
 import json
 import os
-import shutil
 import tempfile
 from PySide6.QtGui import QPixmap, QImage
 
@@ -78,20 +77,31 @@ class PDFDocument:
                 with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False, dir=dir_path) as tf:
                     tmp_path = tf.name
                 self.doc.save(tmp_path, garbage=4, deflate=True)
+                # PyMuPDF can't write over its own open file, so close before the
+                # swap. Drop the handle to None immediately: if anything below
+                # fails, the except must never leave self.doc pointing at a closed
+                # document (that would make every later render/save raise
+                # "document closed" with no way to recover from the UI).
                 self.doc.close()
+                self.doc = None
                 try:
-                    shutil.move(tmp_path, target)
+                    # os.replace is atomic and overwrites on both POSIX and Windows.
+                    # shutil.move falls back to a non-atomic copy when the target
+                    # already exists on Windows, which can leave a truncated,
+                    # corrupt original if the process dies mid-copy.
+                    os.replace(tmp_path, target)
                 except Exception as move_err:
-                    # Original is gone; salvage the temp file so no data is lost.
+                    # Couldn't swap the new file in; salvage it so no work is lost.
                     bak = target + ".bak"
                     try:
-                        shutil.move(tmp_path, bak)
+                        os.replace(tmp_path, bak)
                     except Exception:
                         pass
                     raise RuntimeError(
                         f"Could not overwrite the original file.\n"
                         f"Your work was saved to: {bak}"
                     ) from move_err
+                # Reopen the freshly written file as the live document.
                 self.doc = fitz.open(target)
             else:
                 self.doc.save(target, garbage=4, deflate=True)
