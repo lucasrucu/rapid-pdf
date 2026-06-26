@@ -157,8 +157,8 @@ class PageOrganizer(QWidget):
         bar.addWidget(self._add_btn)
 
         self._del_btn = QPushButton("Delete Selected")
-        self._del_btn.setToolTip("Permanently remove selected pages from the document")
-        self._del_btn.clicked.connect(self._delete_selected)
+        self._del_btn.setToolTip("Permanently remove selected pages from the document (Del)")
+        self._del_btn.clicked.connect(self.delete_selected)
         bar.addWidget(self._del_btn)
 
         bar.addStretch()
@@ -268,7 +268,7 @@ class PageOrganizer(QWidget):
         if errors:
             QMessageBox.critical(self, "Insert Error", "\n".join(errors))
 
-    def _delete_selected(self):
+    def delete_selected(self):
         if not self._doc or not self._doc.doc:
             return
         rows = sorted(

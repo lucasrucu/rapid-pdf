@@ -17,8 +17,15 @@ Verified end-to-end with rapid-pdf's **real code** on the real file:
 
 So the machinery was fine. **The only gap was interaction:** lifting an image only fired on a click-and-**drag** past a threshold; a plain click did nothing. You clicked, nothing happened, and reasonably concluded the app couldn't touch them. (Adobe can also move objects other apps made because it edits page content; Edge — like rapid-pdf before this — only moves its own objects.)
 
+## The rotation crop bug (the visual breakage)
+
+The first interaction fix made the lift *reachable*, but on these 90°-rotated pages it was visually broken: grabbing made much of the page look wrong and the cutout was the wrong pixels in the wrong place. Root cause, confirmed by rendering the result and **looking** at it:
+
+`_lift_embedded_image` mapped the image's PDF rect to screen pixels with `page.transformation_matrix`. In this PyMuPDF build that matrix is **only a y-flip with the unrotated height — it carries no rotation**. So on rotated pages the crop/placement landed in the wrong region (it grabbed drawing lines instead of the image, at the wrong spot). `page.rotation_matrix` gives the correct PDF→displayed mapping there. Fix: pick `transformation_matrix` when `rotation == 0`, else `rotation_matrix`. Verified visually — the cutout is now the actual image (a legend box) at its true location, and the page stays intact.
+
 ## The fix (this branch)
 
+0. **Rotation-correct crop/placement** (above) — the lifted image is the right pixels at the right place on rotated pages.
 1. **Click-to-grab** (`canvas.py`, `mouseReleaseEvent`): a plain click on an embedded image now lifts it into a movable, selected object — reachable with a click, not just an obscure drag. The hand cursor on hover (already shipped) signals it's grabbable. The near-full-page guard still prevents lifting a whole-page scan. Shift+click preserves selection; double-click no longer opens the "text in shape" dialog over an image.
 2. **Double-bake fix** (`drop_baked_image_items`, called after each save): images bake into the page content stream and can't be stripped like tagged annotations, so the live overlay was being re-baked on every save (1→2→3 copies). After a save, the overlay is dropped and the page re-rendered, so the baked image shows once and stays re-liftable. Verified: image count stays constant across repeated saves.
 

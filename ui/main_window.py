@@ -57,6 +57,7 @@ class MainWindow(QMainWindow):
         self._current_page = 0
         self._org_render = None  # throwaway clone backing the Organizer's markup thumbnails
         self._dirty = False      # unsaved changes exist (annotations, page edits, merges)
+        self._force_quit = False # Quit menu wants a real app quit, not "close PDF"
         self._update_title()
         self.setMinimumSize(1100, 720)
         self.setStyleSheet(_APP_STYLE)
@@ -131,7 +132,7 @@ class MainWindow(QMainWindow):
         self._add_action(fm, "Save", self.save_pdf, QKeySequence.StandardKey.Save)
         self._add_action(fm, "Save As…", self.save_pdf_as, "Ctrl+Shift+S")
         fm.addSeparator()
-        self._add_action(fm, "Quit", self.close, QKeySequence.StandardKey.Quit)
+        self._add_action(fm, "Quit", self._quit_app, QKeySequence.StandardKey.Quit)
 
         em = mb.addMenu("Edit")
         undo_act = self._canvas.undo_stack.createUndoAction(self, "Undo")
@@ -143,7 +144,7 @@ class MainWindow(QMainWindow):
         em.addSeparator()
         self._add_action(em, "Copy", self.copy_selection, QKeySequence.StandardKey.Copy)
         self._add_action(em, "Paste", self.paste, QKeySequence.StandardKey.Paste)
-        self._add_action(em, "Delete Selected", self._canvas.delete_selected,
+        self._add_action(em, "Delete Selected", self._delete_key,
                          QKeySequence.StandardKey.Delete)
         em.addSeparator()
         self._add_action(em, "Bring to Front", self._canvas.bring_to_front, "Ctrl+]")
@@ -298,6 +299,14 @@ class MainWindow(QMainWindow):
             return True
         QMessageBox.critical(self, "Save Error", "Could not save the PDF.")
         return False
+
+    def _delete_key(self):
+        """Delete (keypad) routes by active tab: pages in the Organizer, else
+        selected canvas objects in the Editor."""
+        if self._tabs.currentIndex() == 1:   # Organizer tab
+            self._organizer.delete_selected()
+        else:
+            self._canvas.delete_selected()
 
     def delete_current_page(self):
         if not self._doc.doc or self._doc.page_count() <= 1:
@@ -520,8 +529,28 @@ class MainWindow(QMainWindow):
             return True
         return False                     # Cancel (or dialog dismissed)
 
+    def _quit_app(self):
+        """Quit menu / Ctrl+Q → actually quit, even with a PDF open."""
+        self._force_quit = True
+        self.close()
+
     def closeEvent(self, event):
+        # The close button (X) closes an open PDF, not the app — only quitting
+        # when nothing is open. The Quit menu sets _force_quit to override that.
+        if self._doc.doc and not self._force_quit:
+            if self._maybe_save_before_close():
+                self._close_org_render()
+                self._doc.close()
+                self._dirty = False
+                self._canvas.set_document(self._doc)
+                self._page_panel.set_document(self._doc)
+                self._current_page = 0
+                self._update_status()
+            event.ignore()   # keep the app running
+            return
+        # Quit the app (Quit menu, or X with nothing open) — prompt to save first.
         if not self._maybe_save_before_close():
+            self._force_quit = False
             event.ignore()
             return
         self._close_org_render()

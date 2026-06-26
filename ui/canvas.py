@@ -1482,7 +1482,12 @@ class PDFCanvas(QGraphicsView):
         # Cropping the render sidesteps the placement transform entirely.
         # fitz_rect is in PDF user space; convert to pixel coords via the page's
         # rendering transform so the crop is correct even for rotated pages.
-        pdf_to_px = page.transformation_matrix * fitz.Matrix(z, z)
+        # NOTE: in this PyMuPDF build transformation_matrix is only a y-flip (no
+        # rotation), so it's right for unrotated pages but lands the crop in the
+        # wrong place on rotated ones. rotation_matrix gives the correct
+        # PDF->displayed mapping there. Pick the right one per page rotation.
+        disp = page.transformation_matrix if page.rotation == 0 else page.rotation_matrix
+        pdf_to_px = disp * fitz.Matrix(z, z)
         pr = fitz.Rect(fitz_rect) * pdf_to_px
         src = QRect(round(pr.x0), round(pr.y0),
                     max(1, round(pr.width)), max(1, round(pr.height)))
