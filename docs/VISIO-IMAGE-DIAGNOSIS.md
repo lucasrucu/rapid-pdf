@@ -1,48 +1,32 @@
-# Why rapid-pdf can't move images from Visio/automation PDFs
+# Moving images from Visio/automation PDFs — diagnosis & fix
 
-Diagnosed 2026-06-26 against a real file: `NoE Drawings COMM-0311 (last 3).pdf` (Visio → print-to-PDF, 3 pages, with images added by automation). This is Lucas's actual painpoint: Adobe can move these images, rapid-pdf can't.
+Diagnosed and fixed 2026-06-26 against a real file: `NoE Drawings COMM-0311 (last 3).pdf` (Visio → print-to-PDF, 3 pages rotated 90°, with images added by automation). Painpoint: Adobe can move these images, rapid-pdf couldn't.
 
-## What the file actually contains (measured, not assumed)
+## What's in the file (measured)
 
-| Page | Size | Rotation | Raster images | Vector paths |
-|---|---|---|---|---|
-| 0 | 2448×1584 | (large drawing) | 3 (1 full-page bg + 2 small) | ~4 |
-| 1 | 792×612 *(displayed)* | **90°** (mediabox 612×792) | 3 small | **~9,190** (26k lines) |
-| 2 | 792×612 *(displayed)* | **90°** | 3 small | ~9,113 |
+Images are drawn **directly in the page content stream** (`/Im0 Do` … on each page) — not annotations, not nested in Form XObjects. Pages 1–2 are rotated 90° and carry ~9,000 vector paths each (the Visio drawing). Each page also has 3 small raster images (logos/stamps).
 
-The images are drawn **directly in the page content stream** (`/Im0 Do`, `/Im1 Do`, `/Im2 Do`) — not nested in Form XObjects, not annotations.
+## The real cause (after correcting a wrong first pass)
 
-## The two findings that matter
+> **Correction:** an earlier pass concluded "redaction can't remove these images, so we need content-stream surgery." That was a **test artifact** — `get_image_rects` was read from a *stale page object* that wasn't re-fetched after `apply_redactions`. Re-checking with `get_image_info` (which reflects actual rendering) and a re-fetched page shows redaction works fine.
 
-**1. Detection already works.** rapid-pdf's `get_images()` + `get_image_rects()` finds every image with its correct rectangle. So "rapid-pdf doesn't recognize the image" is **not** a detection failure.
+Verified end-to-end with rapid-pdf's **real code** on the real file:
+- **Detection works** — `_compute_embedded_images` finds all images with correct rects.
+- **Lift works** — `_lift_embedded_image` redacts the original out (`still drawn → False`) and creates a movable copy.
+- **Move + save round-trip works** — lift → move → save → reopen leaves the image at its new position, **count unchanged (no duplicate)**.
 
-**2. The lift (removal) is what fails.** rapid-pdf moves an image by *redacting* the original and dropping a draggable copy in its place. On these files, `apply_redactions(images=PDF_REDACT_IMAGE_REMOVE)` **removes nothing** — proven by redacting the image's exact rect, an inflated rect, the rect in every rotation space, and **the entire page**. All left the image in place. So the lift produces (at best) a floating duplicate over an original that never goes away → the image is effectively un-moveable.
+So the machinery was fine. **The only gap was interaction:** lifting an image only fired on a click-and-**drag** past a threshold; a plain click did nothing. You clicked, nothing happened, and reasonably concluded the app couldn't touch them. (Adobe can also move objects other apps made because it edits page content; Edge — like rapid-pdf before this — only moves its own objects.)
 
-**Root cause:** two things compound —
-- These pages are **rotated 90°**. `get_image_rects` returns rects in *unrotated* (mediabox) space, which fall outside the *displayed* page box. rapid-pdf's lift and redaction don't fully reconcile the two spaces (the same mismatch even crashed a clipped render during diagnosis).
-- More fundamentally, **redaction-based removal doesn't work on these content-stream images at all**, even ignoring rotation. The lift's whole "redact the original" strategy is the wrong tool here.
+## The fix (this branch)
 
-This is exactly why **Adobe** can move them (it does true content-stream editing — it rewrites the image's placement matrix) while **Edge and rapid-pdf** can only move their *own* objects: neither does content-stream editing of foreign objects.
+1. **Click-to-grab** (`canvas.py`, `mouseReleaseEvent`): a plain click on an embedded image now lifts it into a movable, selected object — reachable with a click, not just an obscure drag. The hand cursor on hover (already shipped) signals it's grabbable. The near-full-page guard still prevents lifting a whole-page scan. Shift+click preserves selection; double-click no longer opens the "text in shape" dialog over an image.
+2. **Double-bake fix** (`drop_baked_image_items`, called after each save): images bake into the page content stream and can't be stripped like tagged annotations, so the live overlay was being re-baked on every save (1→2→3 copies). After a save, the overlay is dropped and the page re-rendered, so the baked image shows once and stays re-liftable. Verified: image count stays constant across repeated saves.
 
-## The fix: move the image by editing its placement matrix (the Adobe way)
+## Known trade-offs (intentional)
 
-Each image is positioned by a `cm` (matrix) operator right before its `Do`:
-```
-q  <a b c d e f> cm  /Im0 Do  Q
-```
-`e, f` are the translation. **Moving the image = rewriting that `cm`**, not redacting it. This is the content-stream approach from [rapid-pdf-movable-objects.md](../../ai-assistant/research/rapid-pdf-movable-objects.md) and the foundation of the chosen "native content objects" direction — and it works identically for any app's objects, which is the cross-app behavior Lucas wants.
+- A lift isn't on the undo stack (same as the pre-existing drag-lift). It's non-destructive — the image just becomes a movable copy — so this is acceptable; making it undoable would require reversing the content-stream redaction (risky surgery on rotated pages).
+- The double-bake fix clears the undo stack on a save *only when an image was actually dropped* (a pasted-image Add command could otherwise redo a dropped overlay back in). Shape/text-only sessions keep their undo history.
 
-The Do/cm operators are confirmed present in the file, so the approach is structurally viable. The real work is doing it **robustly**:
-- Consolidate the page's content stream(s) (`clean_contents`) and locate the `q…cm…/ImN Do…Q` block for the target image (map resource name → xref).
-- Rewrite the `cm` translation to the new position; handle the **90° page rotation** (convert the on-screen drag delta into the unrotated content-stream space).
-- Handle nested `q/Q` graphics-state, multiple images, and shared XObjects without corrupting the stream.
+## Validation (headless, against the real rotated file)
 
-## Plan
-
-- **Phase A — proof:** headlessly move one image in this exact file via `cm` edit; confirm by re-reading its rect and rendering. Pin down the rotation transform. *(Probed 2026-06-26: the `cm` directly before `/Im1 Do` is `[269 0 0 253 2154 205]` but the image renders at `(457,652)` — so an **enclosing `q…cm…Q` transform** combines with it. The move must resolve the full CTM stack, not edit a single `cm`. This is the crux of Phase A.)*
-- **Phase B — integrate:** replace the image lift's redaction step with `cm`-edit move-in-place for content-stream images; keep the rotation-correct mapping. Validate in rapid-pdf on this file + in Adobe.
-- **Phase C — generalize:** extend the same content-stream handling to vector objects (`get_drawings`) so Visio shapes become moveable too — the full "native content" goal.
-
-## Status
-
-Diagnosis complete and file-verified. Fix is identified and structurally confirmed but **not yet built** — it's real content-stream engineering, not a one-line change, and it must be validated against this file in both rapid-pdf and Adobe. This sample file is the test gate.
+Detection, lift, click-to-grab, Shift+click (no lift, selection intact), double-click exclusion, and no-double-bake-across-saves all pass; `smoke_test.py` passes. GUI feel (the actual drag/click in the window) still needs hands-on testing — that's what this branch is for.

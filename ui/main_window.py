@@ -277,6 +277,7 @@ class MainWindow(QMainWindow):
         if self._doc.save():
             self._dirty = False
             self._strip_baked_annotations()
+            self._canvas.drop_baked_image_items()  # avoid re-baking images on the next save
             self._update_status("Saved")
             return True
         QMessageBox.critical(self, "Save Error", "Could not save the PDF.")
@@ -292,6 +293,7 @@ class MainWindow(QMainWindow):
         if self._doc.save(path):  # save() adopts `path` as the new canonical path
             self._dirty = False
             self._strip_baked_annotations()
+            self._canvas.drop_baked_image_items()  # avoid re-baking images on the next save
             self._update_status(f"Saved to {path}")
             return True
         QMessageBox.critical(self, "Save Error", "Could not save the PDF.")

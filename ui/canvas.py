@@ -1133,6 +1133,32 @@ class PDFCanvas(QGraphicsView):
         if self._doc and self._doc.page_count() > 0:
             self._load_page(self._current_page)
 
+    def drop_baked_image_items(self):
+        """After a save, image objects have been baked into the page content stream.
+        Drop their live overlays so a later save can't bake a second copy, then
+        re-render: the baked image still shows (from the content) and stays
+        re-liftable. Unlike shape/text markup, images aren't stripped-and-rebuilt
+        from the embedded model, so this is what keeps them from duplicating."""
+        removed = False
+        new_map: dict[int, list] = {}
+        for pnum, items in self._page_annotations.items():
+            kept = []
+            for item in items:
+                if isinstance(item, ImageAnnotationItem):
+                    if item.scene():
+                        self._scene.removeItem(item)
+                    removed = True
+                else:
+                    kept.append(item)
+            new_map[pnum] = kept
+        self._page_annotations = new_map
+        if removed and self._doc and self._doc.page_count() > 0:
+            # A pasted-image Add command could otherwise redo a dropped item back
+            # in (and re-bake a duplicate); clearing avoids that. Only fires when
+            # an image was actually dropped, so shape/text-only sessions keep undo.
+            self.undo_stack.clear()
+            self._load_page(self._current_page)
+
     def get_render_zoom(self) -> float:
         return self._zoom
 
@@ -1601,10 +1627,11 @@ class PDFCanvas(QGraphicsView):
                     self._drag_applied = QPointF(0, 0)
                 else:
                     # No annotation here. Empty space begins a marquee on first move.
-                    # If the press is over a (sub-page) embedded image, a DRAG lifts it
-                    # into a movable object — but a plain click or double-click never
-                    # does. (Lifting on press previously fired on the first half of a
-                    # double-click and turned the whole page into a flipped copy.)
+                    # If the press is over a (sub-page) embedded image, either a
+                    # plain click or a drag lifts it into a movable object (handled
+                    # on release / on drag-threshold). The near-full-page guard in
+                    # _embedded_image_at skips a whole-page scan, so lifting can't
+                    # turn the page into a flipped copy.
                     self._press_empty_pos = scene_pos
                     self._press_additive = additive
                     self._lift_candidate = self._embedded_image_at(scene_pos)
@@ -1795,10 +1822,9 @@ class PDFCanvas(QGraphicsView):
             elif self._embedded_image_at(scene_pos) is not None:
                 # Hovering a liftable embedded image — including images placed by
                 # other apps (e.g. pasted in Acrobat's Edit PDF). An open-hand
-                # cursor signals "drag to grab": without it the image looks
-                # unselectable, because a plain click never lifts — only a drag
-                # past the threshold does. The cursor is also a live detector:
-                # if it appears over a third-party image, detection is working.
+                # cursor signals it's grabbable: click or drag lifts it into a
+                # movable object. The cursor is also a live detector — if it
+                # appears over a third-party image, detection is working.
                 self.setCursor(Qt.CursorShape.OpenHandCursor)
             else:
                 self.setCursor(Qt.CursorShape.ArrowCursor)
@@ -1855,9 +1881,17 @@ class PDFCanvas(QGraphicsView):
                 self._lift_candidate = None
 
             elif self._press_empty_pos is not None:
-                # A plain click on empty space — clear selection (unless additive).
-                # No drag happened, so a candidate image is never lifted.
-                if not self._press_additive:
+                # A plain click (no drag). On an embedded image, grab it — lift
+                # into a movable object (already selected) so images placed by
+                # other apps are reachable with a click, not just an obscure drag.
+                # _embedded_image_at's near-full-page guard keeps a whole-page
+                # scan from being lifted, so this can't flip the page.
+                # (Note: a lift isn't on the undo stack — same as the drag path —
+                # but it's non-destructive: the image just becomes a movable copy.)
+                # A Shift (additive) click never lifts: it preserves the selection.
+                if self._lift_candidate is not None and not self._press_additive:
+                    self._lift_embedded_image(*self._lift_candidate)
+                elif not self._press_additive:
                     self._scene.clearSelection()
                 self._press_empty_pos = None
                 self._lift_candidate = None
@@ -1901,7 +1935,7 @@ class PDFCanvas(QGraphicsView):
                         lambda it: (it.setPlainText(text), setattr(it, "text", text)),
                         "Edit text",
                     )
-            elif isinstance(item, AnnotationItem):
+            elif isinstance(item, AnnotationItem) and not isinstance(item, ImageAnnotationItem):
                 text, ok = QInputDialog.getText(
                     self, "Text", "Text inside shape:", text=item.text
                 )
