@@ -32,16 +32,26 @@ class _ThumbDelegate(QStyledItemDelegate):
     The list stays in ListMode (so reordering re-flows the grid cleanly); this
     delegate just owns the in-cell layout, which ListMode otherwise renders with
     the label beside the thumbnail where it gets clipped to nothing.
+
+    Selection / hover / label colors come from the theme (set on the instance by
+    PageOrganizer.apply_palette) so the grid follows light/dark.
     """
     _TEXT_H = 22
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.sel_color = QColor("#F1AE04")
+        self.hover_color = QColor("#F3EFE6")
+        self.text_color = QColor("#2A2620")
+        self.sel_text_color = QColor("#2A2010")
 
     def paint(self, painter, option, index):
         painter.save()
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         if selected:
-            painter.fillRect(option.rect, QColor(0, 120, 212))
+            painter.fillRect(option.rect, self.sel_color)
         elif option.state & QStyle.StateFlag.State_MouseOver:
-            painter.fillRect(option.rect, QColor(46, 46, 46))
+            painter.fillRect(option.rect, self.hover_color)
 
         inner = option.rect.adjusted(6, 6, -6, -6)
         icon = index.data(Qt.ItemDataRole.DecorationRole)
@@ -56,7 +66,7 @@ class _ThumbDelegate(QStyledItemDelegate):
             )
         text = index.data(Qt.ItemDataRole.DisplayRole)
         if text:
-            painter.setPen(QColor("#ffffff") if selected else QColor("#cccccc"))
+            painter.setPen(self.sel_text_color if selected else self.text_color)
             trect = QRect(inner.x(), inner.bottom() - self._TEXT_H + 2,
                           inner.width(), self._TEXT_H)
             painter.drawText(
@@ -96,47 +106,6 @@ class _DragList(QListWidget):
             self.reordered.emit(order)
 
 
-_ORG_STYLE = """
-QWidget {
-    background-color: #1a1a1a;
-    color: #d4d4d4;
-}
-QPushButton {
-    background-color: #2d2d2d;
-    border: 1px solid #444;
-    border-radius: 3px;
-    color: #d4d4d4;
-    padding: 4px 10px;
-    min-height: 26px;
-}
-QPushButton:hover {
-    background-color: #3a3a3a;
-    border-color: #666;
-    color: #fff;
-}
-QPushButton:pressed {
-    background-color: #0078d4;
-}
-QListWidget {
-    background-color: #242424;
-    border: none;
-    outline: none;
-}
-QListWidget::item {
-    border-radius: 4px;
-    color: #ccc;
-    padding: 4px;
-}
-QListWidget::item:selected {
-    background-color: #0078d4;
-    color: #fff;
-}
-QListWidget::item:hover:!selected {
-    background-color: #2e2e2e;
-}
-"""
-
-
 class PageOrganizer(QWidget):
     """Grid view for reviewing and reordering PDF pages."""
 
@@ -150,8 +119,8 @@ class PageOrganizer(QWidget):
         super().__init__(parent)
         self._doc = None       # real document — all structural edits happen here
         self._render = None    # optional PDFDocument whose pages have markup baked in
+        self._placeholder_color = QColor("#F3EFE6")  # themed via apply_palette()
         self._setup_ui()
-        self.setStyleSheet(_ORG_STYLE)
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -175,7 +144,8 @@ class PageOrganizer(QWidget):
         bar.addStretch()
 
         hint = QLabel("Drag to reorder  ·  Double-click to edit in canvas")
-        hint.setStyleSheet("color: #555; font-size: 10px;")
+        hint.setObjectName("section")
+        hint.setStyleSheet("font-size: 10px;")
         bar.addWidget(hint)
 
         layout.addLayout(bar)
@@ -198,7 +168,8 @@ class PageOrganizer(QWidget):
         self._list.setDropIndicatorShown(True)
         self._list.setSpacing(4)
         self._list.setUniformItemSizes(True)
-        self._list.setItemDelegate(_ThumbDelegate(self._list))
+        self._delegate = _ThumbDelegate(self._list)
+        self._list.setItemDelegate(self._delegate)
         self._list.reordered.connect(self._on_reordered)
         self._list.reorder_invalid.connect(self.needs_rebuild)
         self._list.itemDoubleClicked.connect(self._on_item_activated)
@@ -233,9 +204,20 @@ class PageOrganizer(QWidget):
         pm = self._placeholder_cache.get(h)
         if pm is None:
             pm = QPixmap(THUMB_W, h)
-            pm.fill(QColor(60, 60, 60))
+            pm.fill(self._placeholder_color)
             self._placeholder_cache[h] = pm
         return pm
+
+    def apply_palette(self, palette):
+        """Theme the delegate (selection/hover/label) and placeholder fill, then
+        repaint. Called once at start and on every light/dark toggle."""
+        self._delegate.sel_color = QColor(palette.selection)
+        self._delegate.hover_color = QColor(palette.surface)
+        self._delegate.text_color = QColor(palette.text_dim)
+        self._delegate.sel_text_color = QColor(palette.selection_text)
+        self._placeholder_color = QColor(palette.surface_sunken)
+        self._placeholder_cache.clear()
+        self._list.viewport().update()
 
     def refresh(self):
         """Populate cells with placeholders immediately; real page thumbnails are

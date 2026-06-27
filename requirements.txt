@@ -1,2 +1,6 @@
 pymupdf>=1.24.0
 PySide6>=6.7.0
+qtawesome>=1.3.0
+# Optional: Win11 Mica/acrylic window backdrop. The app degrades gracefully
+# without it (apply_mica is a silent no-op), so it's safe to omit on Win10/other.
+pywinstyles>=1.8 ; sys_platform == "win32"

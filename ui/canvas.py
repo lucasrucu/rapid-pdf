@@ -737,7 +737,8 @@ class PDFCanvas(QGraphicsView):
         # Ctrl+scroll keeps the point under the mouse fixed instead of drifting.
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
-        self.setBackgroundBrush(QBrush(QColor(55, 55, 55)))
+        self._backdrop_color = QColor("#E8E3D8")  # themed via set_backdrop_color()
+        self.setBackgroundBrush(QBrush(self._backdrop_color))
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
@@ -748,6 +749,11 @@ class PDFCanvas(QGraphicsView):
     @property
     def undo_stack(self) -> QUndoStack:
         return self._undo_stack
+
+    def set_backdrop_color(self, color):
+        """Set the color of the work area behind the page (themed light/dark)."""
+        self._backdrop_color = QColor(color)
+        self.setBackgroundBrush(QBrush(self._backdrop_color))
 
     def _push(self, command):
         self._undo_stack.push(command)

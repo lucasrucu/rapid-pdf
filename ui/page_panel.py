@@ -23,13 +23,18 @@ class _PageDelegate(QStyledItemDelegate):
     item position when icon sizes vary. ListMode + this delegate is pixel-perfect.
     """
 
+    sel_color = QColor("#F1AE04")
+    hover_color = QColor("#FFFFFF")
+    text_color = QColor("#7A7264")
+    sel_text_color = QColor("#2A2010")
+
     def paint(self, painter, option, index):
         painter.save()
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         if selected:
-            painter.fillRect(option.rect, QColor(0, 120, 212))
+            painter.fillRect(option.rect, self.sel_color)
         elif option.state & QStyle.StateFlag.State_MouseOver:
-            painter.fillRect(option.rect, QColor(46, 46, 46))
+            painter.fillRect(option.rect, self.hover_color)
 
         inner = option.rect.adjusted(6, 6, -6, -6)
         icon = index.data(Qt.ItemDataRole.DecorationRole)
@@ -45,7 +50,7 @@ class _PageDelegate(QStyledItemDelegate):
 
         text = index.data(Qt.ItemDataRole.DisplayRole)
         if text:
-            painter.setPen(QColor("#ffffff") if selected else QColor("#aaaaaa"))
+            painter.setPen(self.sel_text_color if selected else self.text_color)
             trect = QRect(inner.x(), inner.bottom() - _TEXT_H + 2,
                           inner.width(), _TEXT_H)
             painter.drawText(
@@ -72,6 +77,7 @@ class PagePanel(QWidget):
         # Rows whose real thumbnail has been rendered (others show a placeholder).
         self._rendered: set[int] = set()
         self._placeholder_cache: dict[int, QPixmap] = {}
+        self._placeholder_color = QColor("#F3EFE6")  # themed via apply_palette()
         self._setup_ui()
         self.setFixedWidth(130)
 
@@ -92,9 +98,20 @@ class PagePanel(QWidget):
         pm = self._placeholder_cache.get(h)
         if pm is None:
             pm = QPixmap(THUMB_W, h)
-            pm.fill(QColor(60, 60, 60))
+            pm.fill(self._placeholder_color)
             self._placeholder_cache[h] = pm
         return pm
+
+    def apply_palette(self, palette):
+        """Theme the delegate (selection/hover/label) and placeholder fill, then
+        repaint. Called once at start and on every light/dark toggle."""
+        _PageDelegate.sel_color = QColor(palette.selection)
+        _PageDelegate.hover_color = QColor(palette.surface)
+        _PageDelegate.text_color = QColor(palette.text_dim)
+        _PageDelegate.sel_text_color = QColor(palette.selection_text)
+        self._placeholder_color = QColor(palette.surface_sunken)
+        self._placeholder_cache.clear()
+        self._list.viewport().update()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
