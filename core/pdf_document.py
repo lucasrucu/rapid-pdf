@@ -1,6 +1,7 @@
 import fitz
 import json
 import os
+import re
 import tempfile
 from PySide6.QtGui import QPixmap, QImage
 
@@ -111,6 +112,42 @@ class PDFDocument:
         except Exception as e:
             print(f"Save error: {e}")
             return False
+
+    def remove_image_placement(self, page_num: int, xref: int) -> bool:
+        """Remove the single content-stream draw of `xref` on this page, non-destructively.
+
+        Visio/automation pages (e.g. from noe_painter) stamp each image with one
+        `<a b c d e f> cm /Name Do` operator on top of a full-page background raster.
+        Redacting the image's rect to "erase" it also blanks the background pixels
+        underneath -> a white hole. Deleting just that one placement operator removes
+        the image while leaving everything behind it untouched (no hole), the way a
+        real PDF editor moves an object.
+
+        Only the tight `cm` (six numbers) immediately-before-`Do` form is removed —
+        that cm exists solely to place this image, so dropping it is self-contained.
+        Returns True if a placement was removed; False if the safe pattern wasn't
+        found (caller should fall back to redaction).
+        """
+        if not self.doc or page_num >= len(self.doc):
+            return False
+        page = self.doc[page_num]
+        name = None
+        for im in page.get_images(full=True):
+            if im[0] == xref:
+                name = im[7]
+                break
+        if not name:
+            return False
+        esc = re.escape(name.encode("latin-1"))
+        # six-number cm directly followed by the image's /Name Do
+        pat = re.compile(rb'(?:-?[\d.]+\s+){6}cm\s*/' + esc + rb'\s+Do\b')
+        for sx in page.get_contents():
+            raw = self.doc.xref_stream(sx)
+            new, n = pat.subn(b'', raw)
+            if n >= 1:
+                self.doc.update_stream(sx, new)
+                return True
+        return False
 
     def move_page(self, from_idx: int, to_idx: int):
         if self.doc:

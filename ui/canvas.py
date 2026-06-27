@@ -1522,20 +1522,22 @@ class PDFCanvas(QGraphicsView):
         image_bytes = bytes(buf.data())
 
         try:
-            page.add_redact_annot(fitz_rect, fill=None)
-            # IMAGE_PIXELS, not IMAGE_REMOVE: REMOVE deletes every image that
-            # *overlaps* the redaction rect, so lifting one small legend on a
-            # Visio/automation page also wipes the full-page background raster the
-            # drawing is printed as — the whole page goes blank. PIXELS only blanks
-            # the pixels under the rect, so the lifted image disappears while the
-            # background (and any other overlapping image) stays intact.
-            page.apply_redactions(
-                images=fitz.PDF_REDACT_IMAGE_PIXELS,
-                text=fitz.PDF_REDACT_TEXT_NONE,
-                graphics=fitz.PDF_REDACT_LINE_ART_NONE,
-            )
+            # Preferred: drop the image's single content-stream placement operator.
+            # That removes the image while leaving the background behind it intact —
+            # no white hole where it sat (the way a real editor moves an object).
+            if not self._doc.remove_image_placement(page_num, xref):
+                # Fallback for images that aren't a tight `cm /Name Do` placement:
+                # redact PIXELS (blanks only the pixels under the rect, so it never
+                # wipes the whole-page background like IMAGE_REMOVE would — but it can
+                # leave a hole where the image was).
+                page.add_redact_annot(fitz_rect, fill=None)
+                page.apply_redactions(
+                    images=fitz.PDF_REDACT_IMAGE_PIXELS,
+                    text=fitz.PDF_REDACT_TEXT_NONE,
+                    graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+                )
         except Exception as e:
-            print(f"Lift redaction failed: {e}")
+            print(f"Lift image removal failed: {e}")
             return None
 
         # Background now renders without the lifted image.
