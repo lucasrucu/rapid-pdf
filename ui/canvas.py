@@ -1448,14 +1448,16 @@ class PDFCanvas(QGraphicsView):
         if self._zoom <= 0 or not self._doc or not self._doc.doc:
             return None
         page = self._doc.doc[self._current_page]
-        # get_image_rects() returns rects in native PDF user space, but scene_pos is
-        # in rendered/displayed pixels. On unrotated pages the render is a y-flip of
-        # PDF space, and on rotated pages it also swaps axes — so the click must be
-        # tested against each image's rect mapped THROUGH the page's render transform
-        # (the same mapping the crop/placement use). Comparing raw PDF rects against
-        # the click made hit-testing y-flipped: clicking an image grabbed whichever
-        # one sat at the mirrored position instead.
-        disp = page.transformation_matrix if page.rotation == 0 else page.rotation_matrix
+        # get_image_rects() returns rects in the page's UNROTATED user space, but
+        # scene_pos is in rendered/displayed pixels. page.rotation_matrix is the
+        # mapping from unrotated user space to the rendered (visible, post-rotation)
+        # image for EVERY page — rot=0 included. We previously used
+        # transformation_matrix (a pure y-flip) on rot=0 pages, which double-flipped
+        # these rects vertically and put the hit region on the OPPOSITE side of the
+        # image from where it draws. Verified against ground truth (pixels that change
+        # when an image's placement is removed): rotation_matrix matches the true draw
+        # rect on all pages (rot=0 and rot=270); transformation_matrix never does.
+        disp = page.rotation_matrix
         pdf_to_px = disp * fitz.Matrix(self._zoom, self._zoom)
         pw, ph = self._doc.get_page_size(self._current_page)
         page_area = (pw * self._zoom) * (ph * self._zoom)
@@ -1491,13 +1493,13 @@ class PDFCanvas(QGraphicsView):
         # often place an image with a vertically-flipped matrix; re-inserting the raw
         # extracted bytes un-flipped is what made a lifted raster look rotated 180°.
         # Cropping the render sidesteps the placement transform entirely.
-        # fitz_rect is in PDF user space; convert to pixel coords via the page's
-        # rendering transform so the crop is correct even for rotated pages.
-        # NOTE: in this PyMuPDF build transformation_matrix is only a y-flip (no
-        # rotation), so it's right for unrotated pages but lands the crop in the
-        # wrong place on rotated ones. rotation_matrix gives the correct
-        # PDF->displayed mapping there. Pick the right one per page rotation.
-        disp = page.transformation_matrix if page.rotation == 0 else page.rotation_matrix
+        # fitz_rect is in the page's unrotated user space; convert to pixel coords
+        # via page.rotation_matrix, which maps unrotated user space to the rendered
+        # (visible) image for every page — rot=0 and rotated alike. Using
+        # transformation_matrix (a y-flip) here mis-placed the crop vertically on
+        # rot=0 pages, mirroring the lifted cutout to the opposite side. Must match
+        # the same mapping _embedded_image_at uses for the hit-test.
+        disp = page.rotation_matrix
         pdf_to_px = disp * fitz.Matrix(z, z)
         pr = fitz.Rect(fitz_rect) * pdf_to_px
         src = QRect(round(pr.x0), round(pr.y0),
