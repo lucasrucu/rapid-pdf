@@ -1445,15 +1445,26 @@ class PDFCanvas(QGraphicsView):
         Smallest-area wins so a small image on top of a full-page background is the one
         you grab (a scanned page that is one big image still lifts as a whole — by design).
         """
-        if self._zoom <= 0 or not self._doc:
+        if self._zoom <= 0 or not self._doc or not self._doc.doc:
             return None
-        px, py = scene_pos.x() / self._zoom, scene_pos.y() / self._zoom
+        page = self._doc.doc[self._current_page]
+        # get_image_rects() returns rects in native PDF user space, but scene_pos is
+        # in rendered/displayed pixels. On unrotated pages the render is a y-flip of
+        # PDF space, and on rotated pages it also swaps axes — so the click must be
+        # tested against each image's rect mapped THROUGH the page's render transform
+        # (the same mapping the crop/placement use). Comparing raw PDF rects against
+        # the click made hit-testing y-flipped: clicking an image grabbed whichever
+        # one sat at the mirrored position instead.
+        disp = page.transformation_matrix if page.rotation == 0 else page.rotation_matrix
+        pdf_to_px = disp * fitz.Matrix(self._zoom, self._zoom)
         pw, ph = self._doc.get_page_size(self._current_page)
-        page_area = pw * ph
+        page_area = (pw * self._zoom) * (ph * self._zoom)
         best, best_area = None, None
         for xref, r in self._ensure_embedded_images():
-            if r.x0 <= px <= r.x1 and r.y0 <= py <= r.y1:
-                area = r.width * r.height
+            dr = fitz.Rect(r) * pdf_to_px
+            dr.normalize()
+            if dr.x0 <= scene_pos.x() <= dr.x1 and dr.y0 <= scene_pos.y() <= dr.y1:
+                area = dr.width * dr.height
                 # Skip a near-full-page raster (a whole drawing scanned as one
                 # image): it's the page background, not a liftable element — and
                 # lifting it was the cause of the "page turns into a flipped copy" bug.
