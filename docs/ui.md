@@ -1,5 +1,25 @@
 # rapid-pdf UI direction
 
+> **IMPLEMENTED (Qori reskin).** The recommendation below was adopted and built:
+> refined custom QSS + icon-led `qtawesome` buttons, with optional Win11 Mica.
+> The one change from the prototype: the theme is now **Qori Sovereign** (cream +
+> amber/gold `#F1AE04`), **light by default**, with a light/dark toggle (View menu
+> or Ctrl+D). The whole look lives in a reusable module, **`ui/theme.py`**.
+>
+> **Reusing the theme in another app (e.g. VideoOS):** copy `ui/theme.py`, then in
+> `main.py` do `theme = apply_theme(app)` and pass it to your main window. Tokens
+> are named by ROLE in the `Palette` dataclass (two ship: `LIGHT` default, `DARK`),
+> so re-skinning is a one-Palette edit. `ThemeManager` handles apply/toggle/persist
+> and emits `theme_changed` so code-drawn surfaces (scene backgrounds, custom-drawn
+> icons, item delegates) can re-tint — wire those through an `apply_palette(palette)`
+> method like rapid-pdf's toolbar/organizer/page-panel do. `themed_icon(name, color)`
+> wraps qtawesome with a graceful empty-icon fallback; `apply_mica(win, dark)` is a
+> silent no-op off Win11.
+
+---
+
+# Original options report
+
 The current toolbar buttons read as dated ("Windows XP"): flat grey raised
 buttons (`#2d2d2d`), hard 1px `#444` borders, a 3px radius, and a flat `#0078d4`
 blue for the active state. The app already uses a hand-rolled dark QSS theme, so

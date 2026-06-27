@@ -1,11 +1,83 @@
 # Packaging rapid-pdf as a formal Windows application
 
-Research notes and a recommended path for turning rapid-pdf from a `python main.py`
-script into a proper installable Windows app: an installer, Start-menu entry,
-desktop shortcut, uninstall support, and an app icon.
+How to turn rapid-pdf from a `python main.py` script into a proper installable
+Windows app: an installer, Start-menu entry, desktop shortcut, uninstall support,
+and an app icon.
 
-Status: **research only**. Nothing here is built yet. This document exists so Lucas
-can pick an approach. The packaging approach is a decision waiting on him.
+Status: **IMPLEMENTED** (PyInstaller onedir + Inno Setup, unsigned). The
+"Build it" section below is the exact recipe; the research that led here is kept
+underneath for context. Decision taken: PyInstaller (onedir) -> Inno Setup,
+per-user install, USA target, **shipped unsigned for now** (signing deferred —
+see "Adding code signing later").
+
+---
+
+## Build it (the exact steps)
+
+Prerequisites (one-time):
+
+- A clean PySide6-only venv (this repo's `.venv`). No global PySide6/PyQt — a
+  second Qt binding makes PyInstaller grab the wrong one or abort.
+- `pip install -r requirements.txt` plus the build tools: `pip install pyinstaller pillow`.
+- **Inno Setup 6** installed (https://jrsoftware.org/isdl.php) for the installer
+  step. It puts `ISCC.exe` at `C:\Program Files (x86)\Inno Setup 6\ISCC.exe`.
+
+Files that drive the build (all committed):
+
+- `assets/rapid-pdf.ico` — multi-size Qori app icon (regen: `python tools/make_icon.py`).
+- `packaging/version_info.txt` — exe version/publisher metadata.
+- `rapid-pdf.spec` — PyInstaller onedir spec (icon + version + bundles assets +
+  qtawesome fonts).
+- `rapid-pdf.iss` — Inno Setup script (per-user install, shortcuts, uninstaller).
+
+### 1. Freeze with PyInstaller (onedir)
+
+```
+.venv\Scripts\pyinstaller rapid-pdf.spec --noconfirm
+```
+
+Output: `dist\rapid-pdf\rapid-pdf.exe` (a folder with the exe + all DLLs/plugins).
+Smoke it before packaging:
+
+```
+dist\rapid-pdf\rapid-pdf.exe
+```
+
+Confirm: window opens themed, a PDF opens, annotate/save works, light/dark toggle
+(Ctrl+D) works, no console window appears.
+
+### 2. Wrap with Inno Setup
+
+```
+"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" rapid-pdf.iss
+```
+
+Output: `installer_output\rapid-pdf-setup-1.0.0.exe`. Double-click to install
+(per-user, no UAC), launch from the Start menu, then test uninstall via Add/Remove
+Programs.
+
+### Bumping the version
+
+Keep three places in sync: `filevers`/`prodvers` + the strings in
+`packaging/version_info.txt`, and `#define AppVersion` in `rapid-pdf.iss`. The
+`AppId` GUID in the .iss must stay FIXED across versions (it's how Windows tracks
+upgrades/uninstall).
+
+### Adding code signing later (currently OFF)
+
+Unsigned today, so users get one SmartScreen "More info -> Run anyway" click.
+That's fine for personal use. To remove it when showcasing:
+
+1. Get a cert. Cheapest sane route is **Azure Trusted Signing** (~$10/mo) IF
+   eligibility works (individuals: US/CA only — Lucas in Indonesia likely needs a
+   qualifying org; else fall back to an OV cert from a CA). Details in the
+   research section below.
+2. Sign the **app exe** first: `signtool sign /fd SHA256 /tr <timestamp-url> /td SHA256 dist\rapid-pdf\rapid-pdf.exe` (Azure Trusted Signing uses its own dlib via `signtool` — see its docs).
+3. Sign the **setup exe**: in the Inno Setup IDE, Tools -> Configure Sign Tools,
+   add one named `signtool`, then uncomment `SignTool=signtool` in `rapid-pdf.iss`
+   (see the commented block at the bottom) and recompile. Sign BOTH the app exe
+   and the generated `setup.exe`.
+4. Re-test SmartScreen. Even signed, reputation warms up over the first downloads.
 
 ---
 
