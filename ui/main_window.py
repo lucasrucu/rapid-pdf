@@ -265,6 +265,10 @@ class MainWindow(QMainWindow):
         self._dirty = False
         self._canvas.set_document(self._doc)
         self._page_panel.set_document(self._doc)
+        # Closing the doc must also clear the Organizer (it holds its own page
+        # grid and isn't refreshed by the canvas/panel updates above). With no
+        # doc open this empties the grid and disables its buttons.
+        self._organizer.set_document(self._doc, None)
         self._current_page = 0
         self._update_status()
 
@@ -544,6 +548,9 @@ class MainWindow(QMainWindow):
                 self._dirty = False
                 self._canvas.set_document(self._doc)
                 self._page_panel.set_document(self._doc)
+                # Also clear the Organizer grid (see close_pdf) so it doesn't
+                # keep showing the closed document's pages.
+                self._organizer.set_document(self._doc, None)
                 self._current_page = 0
                 self._update_status()
             event.ignore()   # keep the app running
