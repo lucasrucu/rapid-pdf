@@ -202,6 +202,23 @@ class PDFDocument:
     # Editable annotation model (embedded JSON) — for save/reopen round-trip
     # ------------------------------------------------------------------
 
+    def _model_embed_names(self) -> list[str]:
+        """Every embedded entry that holds a rapid-pdf model.
+
+        On a malformed/garbage-collected name tree, embfile_add can append a digit
+        on a name collision (e.g. 'rapid_pdf_model.json2'), leaving a stale second
+        copy that embfile_del(MODEL_EMBED_NAME) never removes. Matching the base
+        name as a PREFIX catches every such copy so writes can purge them all and
+        reads can ignore the stale ones.
+        """
+        if not self.doc:
+            return []
+        try:
+            return [n for n in self.doc.embfile_names()
+                    if n == MODEL_EMBED_NAME or n.startswith(MODEL_EMBED_NAME)]
+        except Exception:
+            return []
+
     def write_annotation_model(self, model: dict):
         """Embed the editable annotation model as a JSON file inside the PDF.
 
@@ -212,26 +229,42 @@ class PDFDocument:
             return
         try:
             data = json.dumps(model).encode("utf-8")
-            # Replace any previous copy (embfile_upd is unreliable for raw bytes
-            # in this PyMuPDF build, so delete + add).
-            if MODEL_EMBED_NAME in set(self.doc.embfile_names()):
-                self.doc.embfile_del(MODEL_EMBED_NAME)
+            # Purge EVERY previous copy, not just the exact base name. A prior
+            # save could have left a suffixed duplicate ('…json2'); if even one
+            # stale copy survived, read_annotation_model could pick it and silently
+            # restore an OLD set of annotations (e.g. only pages 0-1), so newer
+            # pages' markup would vanish on reopen. (embfile_upd is unreliable for
+            # raw bytes in this PyMuPDF build, so delete + add.)
+            for name in self._model_embed_names():
+                try:
+                    self.doc.embfile_del(name)
+                except Exception:
+                    pass
             self.doc.embfile_add(MODEL_EMBED_NAME, data)
         except Exception as e:
             print(f"Embed model error: {e}")
 
     def read_annotation_model(self) -> dict | None:
-        """Return the embedded editable annotation model, or None if absent."""
+        """Return the embedded editable annotation model, or None if absent.
+
+        If the file carries more than one copy (a stale duplicate from an older
+        save), pick the richest — the one describing the most annotations — so a
+        leftover earlier copy can never override the latest saved markup.
+        """
         if not self.doc:
             return None
-        try:
-            if MODEL_EMBED_NAME not in set(self.doc.embfile_names()):
-                return None
-            data = self.doc.embfile_get(MODEL_EMBED_NAME)
-            return json.loads(bytes(data).decode("utf-8"))
-        except Exception as e:
-            print(f"Read model error: {e}")
-            return None
+        best, best_count = None, -1
+        for name in self._model_embed_names():
+            try:
+                data = self.doc.embfile_get(name)
+                model = json.loads(bytes(data).decode("utf-8"))
+            except Exception as e:
+                print(f"Read model error ({name}): {e}")
+                continue
+            count = sum(len(v) for v in model.get("pages", {}).values())
+            if count > best_count:
+                best, best_count = model, count
+        return best
 
     def delete_tagged_annotations(self, page_num: int):
         """Strip rapid-pdf's baked annotations from a page.

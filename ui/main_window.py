@@ -56,6 +56,7 @@ class MainWindow(QMainWindow):
         self._doc = PDFDocument()
         self._current_page = 0
         self._org_render = None  # throwaway clone backing the Organizer's markup thumbnails
+        self._panel_render = None  # throwaway clone backing the left page panel's thumbnails
         self._dirty = False      # unsaved changes exist (annotations, page edits, merges)
         self._force_quit = False # Quit menu wants a real app quit, not "close PDF"
         self._update_title()
@@ -180,7 +181,7 @@ class MainWindow(QMainWindow):
         # A document is already open → append the chosen PDFs to the end.
         if self._doc.doc:
             added = self._append_pdfs(paths)
-            self._page_panel.refresh()
+            self._refresh_panel_thumbnails()
             self._update_status(
                 f"Appended {added} page(s) from {len(paths)} file(s)"
             )
@@ -199,6 +200,11 @@ class MainWindow(QMainWindow):
         if len(paths) == 1:
             # A single freshly opened file may carry an editable model to restore.
             self._load_saved_annotations()
+        # Always rebuild the panel thumbnails from a markup-baked clone after open.
+        # _load_saved_annotations already does this when it restores a model, but a
+        # file with baked markup and no model (or none to restore) still needs the
+        # panel re-rendered so it matches the page rather than the pre-strip doc.
+        self._refresh_panel_thumbnails()
         self._update_status(
             f"Combined {len(paths)} files" if len(paths) > 1 else ""
         )
@@ -261,10 +267,15 @@ class MainWindow(QMainWindow):
         if not self._maybe_save_before_close():
             return
         self._close_org_render()
+        self._close_panel_render()
         self._doc.close()
         self._dirty = False
         self._canvas.set_document(self._doc)
         self._page_panel.set_document(self._doc)
+        # Closing the doc must also clear the Organizer (it holds its own page
+        # grid and isn't refreshed by the canvas/panel updates above). With no
+        # doc open this empties the grid and disables its buttons.
+        self._organizer.set_document(self._doc, None)
         self._current_page = 0
         self._update_status()
 
@@ -279,6 +290,7 @@ class MainWindow(QMainWindow):
             self._dirty = False
             self._strip_baked_annotations()
             self._canvas.drop_baked_image_items()  # avoid re-baking images on the next save
+            self._refresh_panel_thumbnails()  # keep panel in sync with the saved page state
             self._update_status("Saved")
             return True
         QMessageBox.critical(self, "Save Error", "Could not save the PDF.")
@@ -295,6 +307,7 @@ class MainWindow(QMainWindow):
             self._dirty = False
             self._strip_baked_annotations()
             self._canvas.drop_baked_image_items()  # avoid re-baking images on the next save
+            self._refresh_panel_thumbnails()  # keep panel in sync with the saved page state
             self._update_status(f"Saved to {path}")
             return True
         QMessageBox.critical(self, "Save Error", "Could not save the PDF.")
@@ -326,7 +339,7 @@ class MainWindow(QMainWindow):
         # clear it so a later undo can't replay against stale page indices.
         # (Mirrors _on_pages_deleted — the Organizer delete path.)
         self._canvas.undo_stack.clear()
-        self._page_panel.refresh()
+        self._refresh_panel_thumbnails()
         new_page = min(self._current_page, self._doc.page_count() - 1)
         self._current_page = new_page
         self._canvas.set_page(new_page, immediate=True)
@@ -368,6 +381,37 @@ class MainWindow(QMainWindow):
                 pass
         self._org_render = None
 
+    def _refresh_panel_thumbnails(self):
+        """Rebuild the left page panel's thumbnails from a markup-baked clone so
+        they match the page + live overlays exactly.
+
+        The live document on its own can't be the panel's render source: drawn
+        markup lives as Qt overlay items (not in the doc until save), and on open
+        the doc still carries the previous save's BAKED markup right up until the
+        strip step — so a panel rendered straight from _doc shows squares the page
+        no longer has (and misses squares the page now shows). Baking the current
+        overlays into a throwaway clone keeps every thumbnail in sync."""
+        self._close_panel_render()
+        if not self._doc.doc:
+            self._page_panel.set_render_source(None)
+            return
+        dicts_by_page = {
+            pn: self._canvas.get_all_annotation_dicts(pn)
+            for pn in range(self._doc.page_count())
+        }
+        clone = self._doc.clone_with_annotations(dicts_by_page)
+        self._panel_render = PDFDocument()
+        self._panel_render.doc = clone
+        self._page_panel.set_render_source(self._panel_render)
+
+    def _close_panel_render(self):
+        if self._panel_render is not None and self._panel_render.doc is not None:
+            try:
+                self._panel_render.doc.close()
+            except Exception:
+                pass
+        self._panel_render = None
+
     def _on_organizer_page_activated(self, page_num: int):
         self._tabs.setCurrentIndex(0)
         self._on_page_selected(page_num)
@@ -380,7 +424,7 @@ class MainWindow(QMainWindow):
         # reference the old numbering, so undo would land items on the wrong page.
         # Structural page ops are incompatible with the item-level undo stack — clear it.
         self._canvas.undo_stack.clear()
-        self._page_panel.refresh()
+        self._refresh_panel_thumbnails()
         self._current_page = self._canvas._current_page
         self._page_panel.set_current_page(self._current_page)
         self._refresh_current_thumb()
@@ -394,7 +438,7 @@ class MainWindow(QMainWindow):
         # Page deletion is structurally irreversible — the undo stack holds references
         # to items on pages that no longer exist. Clear it to prevent corrupted undos.
         self._canvas.undo_stack.clear()
-        self._page_panel.refresh()
+        self._refresh_panel_thumbnails()
         if self._doc.doc:
             new_page = min(self._current_page, self._doc.page_count() - 1)
             self._current_page = new_page
@@ -443,6 +487,9 @@ class MainWindow(QMainWindow):
             self._doc.delete_tagged_annotations(pn)
         self._canvas.load_annotation_model(model)
         self._canvas.reload_current_page()
+        # (The caller, open_pdf, rebuilds the left-panel thumbnails from a clone
+        # with these restored overlays baked in — so pages that aren't the current
+        # one don't keep showing now-stripped squares, or miss restored ones.)
 
     def _on_page_selected(self, page_num: int):
         if page_num == self._current_page and self._doc.doc:
@@ -540,10 +587,14 @@ class MainWindow(QMainWindow):
         if self._doc.doc and not self._force_quit:
             if self._maybe_save_before_close():
                 self._close_org_render()
+                self._close_panel_render()
                 self._doc.close()
                 self._dirty = False
                 self._canvas.set_document(self._doc)
                 self._page_panel.set_document(self._doc)
+                # Also clear the Organizer grid (see close_pdf) so it doesn't
+                # keep showing the closed document's pages.
+                self._organizer.set_document(self._doc, None)
                 self._current_page = 0
                 self._update_status()
             event.ignore()   # keep the app running
@@ -554,5 +605,6 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self._close_org_render()
+        self._close_panel_render()
         self._doc.close()
         super().closeEvent(event)

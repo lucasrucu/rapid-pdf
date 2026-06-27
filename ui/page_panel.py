@@ -65,11 +65,20 @@ class PagePanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._doc = None
+        # Optional doc whose pages already have unsaved markup baked in. When set,
+        # thumbnails render from it so they match the page + live overlays exactly
+        # (the same trick the Organizer uses). Falls back to _doc when None.
+        self._render = None
         # Rows whose real thumbnail has been rendered (others show a placeholder).
         self._rendered: set[int] = set()
         self._placeholder_cache: dict[int, QPixmap] = {}
         self._setup_ui()
         self.setFixedWidth(130)
+
+    def _render_source(self):
+        """Doc to rasterise thumbnails from: the markup-baked clone if present,
+        else the live document."""
+        return self._render or self._doc
 
     def _placeholder_for(self, page_num: int) -> QPixmap:
         """A grey placeholder sized to the page's real aspect ratio, so a landscape
@@ -118,8 +127,19 @@ class PagePanel(QWidget):
         self._list.verticalScrollBar().valueChanged.connect(self._render_visible)
         layout.addWidget(self._list)
 
-    def set_document(self, doc):
+    def set_document(self, doc, render=None):
+        """doc = live document (drives page count + sizes). render = optional doc
+        whose pages already have unsaved markup baked in, used only for thumbnails
+        so they stay in sync with the page + live overlays."""
         self._doc = doc
+        self._render = render
+        self.refresh()
+
+    def set_render_source(self, render):
+        """Swap in a fresh markup-baked clone and re-render all thumbnails from it,
+        so the panel reflects the current page content (e.g. after open/strip or a
+        structural edit). Pass None to fall back to the live document."""
+        self._render = render
         self.refresh()
 
     def refresh(self):
@@ -152,7 +172,7 @@ class PagePanel(QWidget):
             item = self._list.item(i)
             if item is None or not self._list.visualItemRect(item).intersects(vp):
                 continue
-            thumb = self._doc.render_thumbnail(i, max_width=THUMB_W)
+            thumb = self._render_source().render_thumbnail(i, max_width=THUMB_W)
             item.setIcon(QIcon(thumb))
             self._rendered.add(i)
 
