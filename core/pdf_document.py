@@ -156,12 +156,19 @@ class PDFDocument:
                     # corrupt original if the process dies mid-copy.
                     os.replace(tmp_path, target)
                 except Exception as move_err:
-                    # Couldn't swap the new file in; salvage it so no work is lost.
+                    # Couldn't swap the new file in; salvage the new content so no
+                    # work is lost. Reopen from the .bak so the document stays live.
                     bak = target + ".bak"
                     try:
                         os.replace(tmp_path, bak)
-                    except Exception:
-                        pass
+                        self.doc = fitz.open(bak)
+                    except Exception as bak_err:
+                        print(f"Save recovery error: {bak_err}")
+                        # Last resort: try reopening the original (unchanged on disk).
+                        try:
+                            self.doc = fitz.open(target)
+                        except Exception:
+                            pass
                     raise RuntimeError(
                         f"Could not overwrite the original file.\n"
                         f"Your work was saved to: {bak}"
@@ -385,8 +392,16 @@ class PDFDocument:
             if rect is not None and derot is not None:
                 rect = fitz.Rect(rect) * derot
 
+            # Normalize the rect so matrix multiplication can't produce an inverted
+            # (negative-width/height) rect that crashes PyMuPDF's C layer.
+            if rect is not None:
+                rect = fitz.Rect(rect).normalize()
+
             try:
                 if ann_type == "highlight":
+                    if rect is None or rect.is_empty or rect.is_infinite:
+                        print(f"Annotation write skipped (highlight): degenerate rect {rect}")
+                        continue
                     annot = page.add_rect_annot(rect)
                     fill = color if color else (1.0, 1.0, 0.0)
                     annot.set_colors(fill=fill, stroke=fill)
@@ -398,6 +413,9 @@ class PDFDocument:
                     annot.update()
 
                 elif ann_type == "rect":
+                    if rect is None or rect.is_empty or rect.is_infinite:
+                        print(f"Annotation write skipped (rect): degenerate rect {rect}")
+                        continue
                     annot = page.add_rect_annot(rect)
                     stroke = ann.get("stroke_color") or color or (0.0, 0.0, 0.0)
                     fill = ann.get("fill_color")
@@ -436,6 +454,9 @@ class PDFDocument:
                     font_size = ann.get("font_size", 12)
                     color = ann.get("color", (0.0, 0.0, 0.0))
                     if rect and text:
+                        if rect.is_empty or rect.is_infinite:
+                            print(f"Annotation write skipped (text): degenerate rect {rect}")
+                            continue
                         annot = page.add_freetext_annot(
                             rect, text,
                             fontsize=font_size,
@@ -449,14 +470,22 @@ class PDFDocument:
 
                 elif ann_type == "image":
                     image_bytes = ann.get("image_bytes")
-                    if rect and image_bytes:
-                        # rotate=page.rotation counteracts the page's own rotation so
-                        # the image content appears upright in the rendered view. Without
-                        # this, a page rotated 90° would bake the image rotated 90° as
-                        # well, making it appear wrong after the save/auto-reload cycle.
-                        # The rect was already derotated above for rotated pages.
-                        page.insert_image(rect, stream=image_bytes,
-                                          rotate=page.rotation)
+                    if not image_bytes:
+                        print("Annotation write skipped (image): no image_bytes")
+                        continue
+                    if rect is None or rect.is_empty or rect.is_infinite:
+                        print(f"Annotation write skipped (image): degenerate rect {rect}")
+                        continue
+                    if rect.width < 1 or rect.height < 1:
+                        print(f"Annotation write skipped (image): rect too small {rect}")
+                        continue
+                    # rotate=page.rotation counteracts the page's own rotation so
+                    # the image content appears upright in the rendered view. Without
+                    # this, a page rotated 90° would bake the image rotated 90° as
+                    # well, making it appear wrong after the save/auto-reload cycle.
+                    # The rect was already derotated above for rotated pages.
+                    page.insert_image(rect, stream=image_bytes,
+                                      rotate=page.rotation)
 
             except Exception as e:
                 print(f"Annotation write error ({ann_type}): {e}")
