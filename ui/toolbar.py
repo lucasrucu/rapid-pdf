@@ -179,8 +179,15 @@ class ColorToolButton(QToolButton):
         return w
 
     def _choose_color(self, color: QColor):
+        was_none = self._is_none
         self.set_current_color(color)
         self._menu.close()
+        # If the border was cleared and the user picks a color, restore the width
+        # first so the canvas knows the border is no longer 0-width invisible.
+        if was_none and self._show_width:
+            if self._width <= 0:
+                self._width = 2.0
+            self.width_changed.emit(float(self._width))
         self.color_changed.emit(QColor(color))
 
     def _choose_width(self, w: float):
@@ -287,10 +294,10 @@ class ToolBar(QWidget):
         layout.addWidget(self._fill_btn)
 
         self._line_btn = ColorToolButton(
-            "Line", allow_none=True, none_label="No Line", show_width=True,
+            "Border", allow_none=True, none_label="No Border", show_width=True,
             recents_getter=lambda: self._recents,
         )
-        self._line_btn.setToolTip("Outline color and thickness for rectangles and lines")
+        self._line_btn.setToolTip("Border color and thickness for rectangles and lines")
         self._line_btn.set_current_color(PRESETS[0])
         self._line_btn.color_changed.connect(self._on_line_color)
         self._line_btn.width_changed.connect(self.line_width_changed)
@@ -465,7 +472,7 @@ class ToolBar(QWidget):
         if line_width is not None:
             self._line_btn.set_width(line_width)
             if line_width <= 0:
-                # A 0-width border IS "No Line" — show that, not a color chip.
+                # A 0-width border IS "No Border" — show that, not a color chip.
                 self._line_btn.set_none()
 
         fill = summary.get("fill") if summary else None

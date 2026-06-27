@@ -116,14 +116,17 @@ class AnnotationItem(QGraphicsRectItem, AnnotationBase):
     def _draw_handles(self, painter: QPainter):
         r = self.rect()
         cx, cy = r.center().x(), r.center().y()
-        hs = HANDLE_SIZE
+        # Keep handle size constant in screen pixels regardless of zoom level.
+        m11 = painter.worldTransform().m11()
+        hs = HANDLE_SIZE / m11 if m11 > 0 else HANDLE_SIZE
         corners = [
             (r.left(), r.top()), (cx, r.top()), (r.right(), r.top()),
             (r.right(), cy), (r.right(), r.bottom()), (cx, r.bottom()),
             (r.left(), r.bottom()), (r.left(), cy),
         ]
         painter.save()
-        painter.setPen(QPen(QColor(0, 120, 215), 1))
+        pen_w = 1.0 / m11 if m11 > 0 else 1.0
+        painter.setPen(QPen(QColor(0, 120, 215), pen_w))
         painter.setBrush(QBrush(QColor(255, 255, 255)))
         for x, y in corners:
             painter.drawRect(QRectF(x - hs / 2, y - hs / 2, hs, hs))
@@ -204,9 +207,7 @@ class RectAnnotationItem(AnnotationItem):
             self.setPen(QPen(pen_c, self._line_width))
         if self._fill:
             fill_c = QColor(self._fill)
-            # A borderless filled rect acts as a highlighter → honor opacity directly;
-            # a bordered rect keeps a lighter fill so the outline stays readable.
-            fill_c.setAlphaF(self._opacity if borderless else self._opacity * 0.4)
+            fill_c.setAlphaF(self._opacity)
             self.setBrush(QBrush(fill_c))
         else:
             self.setBrush(QBrush(Qt.BrushStyle.NoBrush))
@@ -1332,7 +1333,7 @@ class PDFCanvas(QGraphicsView):
             self.viewport().update()
 
     def _do_autoscroll(self):
-        if not self._drag_items:
+        if not self._drag_items and not self._drawing:
             self._autoscroll_timer.stop()
             return
         self.horizontalScrollBar().setValue(
@@ -1892,6 +1893,26 @@ class PDFCanvas(QGraphicsView):
                     )
                 self._temp_item.setRect(rect)
 
+            # Edge autoscroll while drawing: same logic as during drag
+            vp_pos = event.pos()
+            vp = self.viewport()
+            edge = 40
+            ax = ay = 0
+            if vp_pos.x() < edge:
+                ax = -max(2, int((edge - vp_pos.x()) * 0.3))
+            elif vp_pos.x() > vp.width() - edge:
+                ax = max(2, int((vp_pos.x() - (vp.width() - edge)) * 0.3))
+            if vp_pos.y() < edge:
+                ay = -max(2, int((edge - vp_pos.y()) * 0.3))
+            elif vp_pos.y() > vp.height() - edge:
+                ay = max(2, int((vp_pos.y() - (vp.height() - edge)) * 0.3))
+            self._autoscroll_dx, self._autoscroll_dy = ax, ay
+            if ax or ay:
+                if not self._autoscroll_timer.isActive():
+                    self._autoscroll_timer.start()
+            else:
+                self._autoscroll_timer.stop()
+
         # Update cursor for hover feedback
         if (self._tool == "select" and not self._drawing and not self._drag_items
                 and not self._resize_item and self._rubber_item is None):
@@ -2000,6 +2021,7 @@ class PDFCanvas(QGraphicsView):
                 self._temp_item = None
                 self._drawing = False
                 self._draw_start = None
+                self._autoscroll_timer.stop()
 
         event.accept()
 
