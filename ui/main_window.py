@@ -83,6 +83,9 @@ class MainWindow(QMainWindow):
         self._canvas = PDFCanvas()
         self._canvas.annotation_changed.connect(self._on_annotation_changed)
         self._canvas.page_changed.connect(self._on_canvas_page_changed)
+        # Keep the title/modified indicator in sync whenever the undo stack crosses
+        # the clean boundary (e.g. Ctrl+Z back to saved state clears the * marker).
+        self._canvas.undo_stack.cleanChanged.connect(self._on_clean_changed)
         editor_layout.addWidget(self._canvas, stretch=1)
 
         self._toolbar = ToolBar()
@@ -292,6 +295,7 @@ class MainWindow(QMainWindow):
         self._flush_annotations()
         if self._doc.save():
             self._dirty = False
+            self._canvas.undo_stack.setClean()   # Ctrl+Z back here won't prompt to save
             self._strip_baked_annotations()
             self._canvas.drop_baked_image_items()  # avoid re-baking images on the next save
             self._refresh_panel_thumbnails()  # keep panel in sync with the saved page state
@@ -309,6 +313,7 @@ class MainWindow(QMainWindow):
         self._flush_annotations()
         if self._doc.save(path):  # save() adopts `path` as the new canonical path
             self._dirty = False
+            self._canvas.undo_stack.setClean()   # Ctrl+Z back here won't prompt to save
             self._strip_baked_annotations()
             self._canvas.drop_baked_image_items()  # avoid re-baking images on the next save
             self._refresh_panel_thumbnails()  # keep panel in sync with the saved page state
@@ -514,7 +519,10 @@ class MainWindow(QMainWindow):
 
     def _on_annotation_changed(self):
         # Keep the left page panel's thumbnail of the current page in sync with edits.
-        self._mark_dirty()
+        # Derive dirty from the undo stack so that undoing back to the saved state clears
+        # the modified flag automatically (via the cleanChanged signal connection).
+        self._dirty = not self._canvas.undo_stack.isClean()
+        self._update_title()
         self._refresh_current_thumb()
 
     def _refresh_current_thumb(self):
@@ -548,6 +556,15 @@ class MainWindow(QMainWindow):
         name = os.path.basename(self._doc.path) if self._doc.path else "Untitled"
         self.setWindowModified(self._dirty)
         self.setWindowTitle(f"Rapid PDF — {name}[*]")
+
+    def _on_clean_changed(self, clean: bool):
+        """Fired by QUndoStack when the stack crosses the clean boundary.
+
+        `clean=True` means we've undone back to the last-saved state;
+        `clean=False` means we've moved away from it.  Sync _dirty and the title.
+        """
+        self._dirty = not clean
+        self._update_title()
 
     def _mark_dirty(self):
         self._dirty = True
