@@ -11,3 +11,4 @@ build/
 *.spec
 _err.txt
 _out.txt
+_testfiles/

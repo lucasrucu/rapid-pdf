@@ -1512,8 +1512,14 @@ class PDFCanvas(QGraphicsView):
 
         try:
             page.add_redact_annot(fitz_rect, fill=None)
+            # IMAGE_PIXELS, not IMAGE_REMOVE: REMOVE deletes every image that
+            # *overlaps* the redaction rect, so lifting one small legend on a
+            # Visio/automation page also wipes the full-page background raster the
+            # drawing is printed as — the whole page goes blank. PIXELS only blanks
+            # the pixels under the rect, so the lifted image disappears while the
+            # background (and any other overlapping image) stays intact.
             page.apply_redactions(
-                images=fitz.PDF_REDACT_IMAGE_REMOVE,
+                images=fitz.PDF_REDACT_IMAGE_PIXELS,
                 text=fitz.PDF_REDACT_TEXT_NONE,
                 graphics=fitz.PDF_REDACT_LINE_ART_NONE,
             )
