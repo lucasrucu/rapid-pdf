@@ -726,6 +726,13 @@ class PDFCanvas(QGraphicsView):
         self._settle_timer.setSingleShot(True)
         self._settle_timer.timeout.connect(self._end_active_render)
 
+        # Fires while a drag is active and the cursor is near a viewport edge
+        self._autoscroll_timer = QTimer(self)
+        self._autoscroll_timer.setInterval(16)
+        self._autoscroll_timer.timeout.connect(self._do_autoscroll)
+        self._autoscroll_dx = 0
+        self._autoscroll_dy = 0
+
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         # Our custom paint() methods manage their own painter state, so Qt needn't
@@ -947,11 +954,18 @@ class PDFCanvas(QGraphicsView):
         if not self._clipboard_items or not self._doc:
             return
         offset = 12.0
+        view_rect = self.mapToScene(self.viewport().rect()).boundingRect()
         pasted = []
         for src in self._clipboard_items:
             clone = src.clone()
             clone.page_num = self._current_page
             clone.setPos(clone.pos() + QPointF(offset, offset))
+            # If the pasted item lands off-screen, center it in the current view
+            item_scene_rect = clone.mapToScene(clone.boundingRect()).boundingRect()
+            if not view_rect.intersects(item_scene_rect):
+                scene_center = clone.mapToScene(clone.boundingRect().center())
+                shift = view_rect.center() - scene_center
+                clone.setPos(clone.pos() + shift)
             self._attach_item(clone)
             pasted.append(clone)
         self._scene.clearSelection()
@@ -1316,6 +1330,15 @@ class PDFCanvas(QGraphicsView):
             self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
             self._smooth_on = True
             self.viewport().update()
+
+    def _do_autoscroll(self):
+        if not self._drag_items:
+            self._autoscroll_timer.stop()
+            return
+        self.horizontalScrollBar().setValue(
+            self.horizontalScrollBar().value() + self._autoscroll_dx)
+        self.verticalScrollBar().setValue(
+            self.verticalScrollBar().value() + self._autoscroll_dy)
 
     def _mark_interacting(self):
         """Drop to fast (nearest-neighbour) scaling during motion; a short idle
@@ -1787,6 +1810,26 @@ class PDFCanvas(QGraphicsView):
                 self._drag_total = total
                 self._drag_moved = True
 
+            # Edge autoscroll: activate when cursor is within 40px of a viewport edge
+            vp_pos = event.pos()
+            vp = self.viewport()
+            edge = 40
+            ax = ay = 0
+            if vp_pos.x() < edge:
+                ax = -max(2, int((edge - vp_pos.x()) * 0.3))
+            elif vp_pos.x() > vp.width() - edge:
+                ax = max(2, int((vp_pos.x() - (vp.width() - edge)) * 0.3))
+            if vp_pos.y() < edge:
+                ay = -max(2, int((edge - vp_pos.y()) * 0.3))
+            elif vp_pos.y() > vp.height() - edge:
+                ay = max(2, int((vp_pos.y() - (vp.height() - edge)) * 0.3))
+            self._autoscroll_dx, self._autoscroll_dy = ax, ay
+            if ax or ay:
+                if not self._autoscroll_timer.isActive():
+                    self._autoscroll_timer.start()
+            else:
+                self._autoscroll_timer.stop()
+
         elif self._press_empty_pos is not None:
             moved = (scene_pos - self._press_empty_pos).manhattanLength()
             if self._lift_candidate is not None:
@@ -1899,6 +1942,7 @@ class PDFCanvas(QGraphicsView):
                     self.annotation_changed.emit()
                 elif self._drag_moved:
                     self.annotation_changed.emit()  # lifted image moved (not undoable)
+                self._autoscroll_timer.stop()
                 self._drag_items = []
                 self._drag_start = None
                 self._drag_moved = False
