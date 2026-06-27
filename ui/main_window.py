@@ -5,7 +5,6 @@ from PySide6.QtWidgets import (
     QFileDialog, QMessageBox, QStatusBar, QApplication,
 )
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
-from PySide6.QtCore import Qt
 
 from core.pdf_document import PDFDocument
 from ui.canvas import PDFCanvas

@@ -3,7 +3,7 @@ from PySide6.QtWidgets import (
     QStyledItemDelegate, QStyle,
 )
 from PySide6.QtCore import Signal, Qt, QSize, QTimer, QRect
-from PySide6.QtGui import QIcon, QPixmap, QColor, QPainter
+from PySide6.QtGui import QIcon, QPixmap, QColor
 
 
 THUMB_W = 100
