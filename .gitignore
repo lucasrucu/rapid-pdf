@@ -8,7 +8,15 @@ test_out.pdf
 smoke_test.py
 dist/
 build/
+installer_output/
+_shots/
+# PyInstaller generates *.spec, but rapid-pdf.spec is a committed, hand-tuned
+# build file (see docs/build.md). Ignore generated specs, keep ours.
 *.spec
+!rapid-pdf.spec
 _err.txt
 _out.txt
 _testfiles/
+# throwaway perf/invalidation probes (kept locally, numbers live in docs/report)
+_perf_probe.py
+_invalidation_test.py

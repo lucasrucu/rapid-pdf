@@ -4,55 +4,22 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QTabWidget,
     QFileDialog, QMessageBox, QStatusBar, QApplication,
 )
-from PySide6.QtGui import QAction, QKeySequence, QShortcut
-from PySide6.QtCore import Qt
+from PySide6.QtGui import QAction, QKeySequence, QShortcut, QIcon
 
 from core.pdf_document import PDFDocument
+from core.resources import app_icon_path
 from ui.canvas import PDFCanvas
 from ui.toolbar import ToolBar
 from ui.page_panel import PagePanel
 from ui.organizer import PageOrganizer
-
-_APP_STYLE = """
-QMainWindow, QWidget { background-color: #1a1a1a; color: #d4d4d4; }
-QMenuBar { background-color: #252525; color: #d4d4d4; border-bottom: 1px solid #333; }
-QMenuBar::item:selected { background-color: #0078d4; color: #fff; }
-QMenu { background-color: #252525; color: #d4d4d4; border: 1px solid #444; }
-QMenu::item:selected { background-color: #0078d4; color: #fff; }
-QStatusBar { background-color: #1a1a1a; color: #666; border-top: 1px solid #2a2a2a; }
-QTabWidget::pane { border: none; background-color: #1a1a1a; }
-QTabBar::tab {
-    background-color: #252525;
-    color: #888;
-    border: 1px solid #333;
-    border-bottom: none;
-    padding: 5px 18px;
-    min-width: 80px;
-}
-QTabBar::tab:selected { background-color: #1a1a1a; color: #e0e0e0; border-top: 2px solid #0078d4; }
-QTabBar::tab:hover:!selected { background-color: #2e2e2e; color: #bbb; }
-QScrollBar:vertical {
-    background: #1e1e1e; width: 10px; margin: 0;
-}
-QScrollBar::handle:vertical {
-    background: #3a3a3a; border-radius: 5px; min-height: 20px;
-}
-QScrollBar::handle:vertical:hover { background: #555; }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-QScrollBar:horizontal {
-    background: #1e1e1e; height: 10px; margin: 0;
-}
-QScrollBar::handle:horizontal {
-    background: #3a3a3a; border-radius: 5px; min-width: 20px;
-}
-QScrollBar::handle:horizontal:hover { background: #555; }
-QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
-"""
+from ui.theme import ThemeManager, apply_mica, themed_icon
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, theme: ThemeManager | None = None):
         super().__init__()
+        # Theme: use the passed-in manager, or stand one up (e.g. tests/smoke).
+        self._theme = theme or ThemeManager(QApplication.instance())
         self._doc = PDFDocument()
         self._current_page = 0
         self._org_render = None  # throwaway clone backing the Organizer's markup thumbnails
@@ -61,10 +28,32 @@ class MainWindow(QMainWindow):
         self._force_quit = False # Quit menu wants a real app quit, not "close PDF"
         self._update_title()
         self.setMinimumSize(1100, 720)
-        self.setStyleSheet(_APP_STYLE)
+        icon_path = app_icon_path()
+        if icon_path:
+            self.setWindowIcon(QIcon(icon_path))
         self._setup_ui()
         self._setup_menu()
         self._setup_shortcuts()
+        # Code-drawn surfaces (the canvas page backdrop) follow the theme too.
+        self._apply_theme_surfaces(self._theme.palette)
+        self._theme.theme_changed.connect(self._apply_theme_surfaces)
+        # Optional Win11 Mica backdrop (silent no-op elsewhere).
+        apply_mica(self, self._theme.is_dark)
+
+    def _apply_theme_surfaces(self, palette):
+        """Re-tint the bits QSS can't reach: the canvas page backdrop, the thumbnail
+        delegates, the toggle action's icon/label, and the Mica header on a switch."""
+        self._canvas.set_backdrop_color(palette.canvas)
+        self._page_panel.apply_palette(palette)
+        self._organizer.apply_palette(palette)
+        self._toolbar.apply_palette(palette)
+        if hasattr(self, "_theme_action"):
+            dark = self._theme.is_dark
+            self._theme_action.setText("Light Mode" if dark else "Dark Mode")
+            self._theme_action.setIcon(
+                themed_icon("mdi6.weather-sunny" if dark else "mdi6.weather-night",
+                            palette.text))
+        apply_mica(self, self._theme.is_dark)
 
     # ------------------------------------------------------------------
     # UI setup
@@ -153,6 +142,21 @@ class MainWindow(QMainWindow):
 
         pm = mb.addMenu("Page")
         self._add_action(pm, "Delete Current Page", self.delete_current_page)
+
+        vm = mb.addMenu("View")
+        self._theme_action = QAction("Dark Mode", self)
+        self._theme_action.setShortcut("Ctrl+D")
+        self._theme_action.triggered.connect(self._toggle_theme)
+        vm.addAction(self._theme_action)
+        # Set the initial label/icon to match the current mode.
+        dark = self._theme.is_dark
+        self._theme_action.setText("Light Mode" if dark else "Dark Mode")
+        self._theme_action.setIcon(
+            themed_icon("mdi6.weather-sunny" if dark else "mdi6.weather-night",
+                        self._theme.palette.text))
+
+    def _toggle_theme(self):
+        self._theme.toggle()
 
     def _add_action(self, menu, label: str, slot, shortcut=None):
         action = QAction(label, self)

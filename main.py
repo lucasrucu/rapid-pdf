@@ -1,17 +1,26 @@
 import sys
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import Qt
+from PySide6.QtGui import QIcon
+
 from ui.main_window import MainWindow
+from ui.theme import apply_theme
+from core.resources import app_icon_path
 
 
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Rapid PDF")
     app.setOrganizationName("Lucas")
-    app.setStyle("Fusion")
 
-    # Open file passed as CLI argument
-    window = MainWindow()
+    icon_path = app_icon_path()
+    if icon_path:
+        app.setWindowIcon(QIcon(icon_path))
+
+    # Qori theme (Sovereign light by default, dark toggle available). Sets the
+    # Fusion style + palette + global QSS; returns the manager for the window.
+    theme = apply_theme(app)
+
+    window = MainWindow(theme=theme)
     if len(sys.argv) > 1:
         window._doc.open(sys.argv[1])
         window._canvas.set_document(window._doc)

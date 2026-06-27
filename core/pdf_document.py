@@ -3,6 +3,7 @@ import json
 import os
 import re
 import tempfile
+from collections import OrderedDict
 from PySide6.QtGui import QPixmap, QImage
 
 
@@ -11,16 +12,74 @@ RAPID_PDF_TAG = "rapid-pdf"
 # document saved by rapid-pdf reopens with its objects still movable/editable.
 MODEL_EMBED_NAME = "rapid_pdf_model.json"
 
+# How many rendered page pixmaps to keep in the LRU cache. A1 drawings rasterise
+# to large QPixmaps (a 2384x1684pt page at zoom 1.5 is ~3576x2526 px ≈ 36 MB of
+# 32-bit pixels). Keep this small so memory stays bounded on big documents while
+# still covering the realistic hot pattern: lift + reload + a couple of
+# page-switch round-trips all hit the same page+zoom.
+RENDER_CACHE_MAX = 6
+
 
 class PDFDocument:
     def __init__(self):
         self.doc: fitz.Document | None = None
         self.path: str | None = None
+        # LRU cache of rendered page pixmaps keyed by (page_num, zoom_key).
+        # A cache hit makes a repeated render_page of the same page+zoom free
+        # (the lift re-render, reload-after-strip, organizer/page round-trips).
+        # MUST be invalidated whenever a page's content changes — a stale pixmap
+        # showing a lifted-out image still present, or old baked markup, is a
+        # correctness regression worse than slowness. See invalidate_* below and
+        # the call sites in canvas/main_window.
+        self._render_cache: "OrderedDict[tuple, QPixmap]" = OrderedDict()
+
+    # ------------------------------------------------------------------
+    # Rendered-page pixmap cache
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _zoom_key(zoom: float) -> float:
+        # Round so tiny float drift on zoom doesn't defeat the cache, while
+        # genuinely different zoom levels still key separately.
+        return round(float(zoom), 4)
+
+    def render_page_cached(self, page_num: int, zoom: float = 1.5) -> QPixmap:
+        """render_page with an LRU pixmap cache keyed by (page_num, zoom).
+
+        Returns the SAME QPixmap instance for repeated calls — callers must treat
+        it as read-only (copy() before cropping; setPixmap shares it, which is
+        fine). Any mutation of the page's content must call invalidate_render_page
+        (single page) or invalidate_render_cache (whole doc) first.
+        """
+        key = (page_num, self._zoom_key(zoom))
+        pix = self._render_cache.get(key)
+        if pix is not None:
+            self._render_cache.move_to_end(key)   # mark most-recently-used
+            return pix
+        pix = self.render_page(page_num, zoom)
+        # Don't cache an empty/failed render (e.g. doc closed); a later valid
+        # render must not be shadowed by a cached blank.
+        if not pix.isNull():
+            self._render_cache[key] = pix
+            self._render_cache.move_to_end(key)
+            while len(self._render_cache) > RENDER_CACHE_MAX:
+                self._render_cache.popitem(last=False)   # evict least-recently-used
+        return pix
+
+    def invalidate_render_page(self, page_num: int):
+        """Drop every cached zoom-level for one page (its content changed)."""
+        for key in [k for k in self._render_cache if k[0] == page_num]:
+            del self._render_cache[key]
+
+    def invalidate_render_cache(self):
+        """Drop the whole cache (doc reopened/saved, pages reordered/deleted)."""
+        self._render_cache.clear()
 
     def open(self, path: str) -> bool:
         try:
             if self.doc:
                 self.doc.close()
+            self.invalidate_render_cache()   # new document — no stale pixmaps
             self.doc = fitz.open(path)
             self.path = path
             return True
@@ -33,6 +92,7 @@ class PDFDocument:
             self.doc.close()
         self.doc = None
         self.path = None
+        self.invalidate_render_cache()
 
     def page_count(self) -> int:
         return len(self.doc) if self.doc else 0
@@ -72,6 +132,10 @@ class PDFDocument:
         target = path or self.path
         # An untitled (merged) doc has no current path → it's never an in-place save.
         is_same = self.path is not None and os.path.abspath(target) == os.path.abspath(self.path)
+        # A save bakes markup/redactions into page content and (in-place) reopens
+        # the document. Every cached page pixmap is now stale (would still show
+        # pre-bake content); drop them all.
+        self.invalidate_render_cache()
         try:
             if is_same:
                 dir_path = os.path.dirname(os.path.abspath(target))
@@ -146,12 +210,16 @@ class PDFDocument:
             new, n = pat.subn(b'', raw)
             if n >= 1:
                 self.doc.update_stream(sx, new)
+                # This page's content changed (image placement gone). Drop its
+                # cached pixmap so a reload can't show the still-present image.
+                self.invalidate_render_page(page_num)
                 return True
         return False
 
     def move_page(self, from_idx: int, to_idx: int):
         if self.doc:
             self.doc.move_page(from_idx, to_idx)
+            self.invalidate_render_cache()   # page indices shifted
 
     def reorder(self, new_order: list):
         """Reorder pages so that new page i is the page currently at new_order[i].
@@ -161,6 +229,7 @@ class PDFDocument:
         """
         if self.doc and sorted(new_order) == list(range(len(self.doc))):
             self.doc.select(list(new_order))
+            self.invalidate_render_cache()   # page indices changed
 
     def clone_with_annotations(self, dicts_by_page: dict):
         """Return a throwaway fitz.Document copy with the given markup baked in.
@@ -189,6 +258,7 @@ class PDFDocument:
     def delete_page(self, page_num: int):
         if self.doc and 0 <= page_num < len(self.doc):
             self.doc.delete_page(page_num)
+            self.invalidate_render_cache()   # pages after this one renumbered
 
     def insert_pdf(self, src_path: str, from_page: int = 0,
                    to_page: int = -1, start_at: int = -1):
@@ -197,6 +267,7 @@ class PDFDocument:
         src = fitz.open(src_path)
         self.doc.insert_pdf(src, from_page=from_page, to_page=to_page, start_at=start_at)
         src.close()
+        self.invalidate_render_cache()   # page set/indices changed
 
     # ------------------------------------------------------------------
     # Editable annotation model (embedded JSON) — for save/reopen round-trip
@@ -278,6 +349,8 @@ class PDFDocument:
         for a in list(page.annots()):
             if a.info.get("title") == RAPID_PDF_TAG:
                 page.delete_annot(a)
+        # Baked markup just stripped from this page → its cached render is stale.
+        self.invalidate_render_page(page_num)
 
     def write_annotations(self, page_num: int, annotations: list):
         """Replace all rapid-pdf-tagged annotations on this page with the given list.
@@ -293,6 +366,9 @@ class PDFDocument:
         # For rotated pages, annotation rects/points are in visible (rendered) space
         # but fitz expects native PDF user space. Derotation converts between the two.
         derot = page.derotation_matrix if page.rotation != 0 else None
+
+        # Page content is about to change (markup rewritten) → drop its cache.
+        self.invalidate_render_page(page_num)
 
         # Remove only our tagged annotations
         to_delete = [a for a in page.annots() if a.info.get("title") == RAPID_PDF_TAG]
