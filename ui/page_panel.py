@@ -8,8 +8,8 @@ from PySide6.QtGui import QIcon, QPixmap, QColor
 
 THUMB_W = 100
 THUMB_H = 130
-ITEM_W = 118
-ITEM_H = 155
+ITEM_W = 122
+ITEM_H = 170
 _TEXT_H = 18
 # Render thumbnails this many pixels above/below the viewport so they're ready
 # just before they scroll into view.
@@ -28,19 +28,33 @@ class _PageDelegate(QStyledItemDelegate):
     text_color = QColor("#7A7264")
     sel_text_color = QColor("#2A2010")
 
+    # Even inset of the selection/hover backing inside the cell (all four sides),
+    # so the rounded accent wraps the whole thumbnail evenly instead of bleeding
+    # to the cell edges. Gap between the thumbnail and its page-number label.
+    _PAD = 4
+    _LABEL_GAP = 4
+
     def paint(self, painter, option, index):
         painter.save()
+        painter.setRenderHint(painter.RenderHint.Antialiasing, True)
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        # Backing rect: evenly inset from the cell on all four sides → equal
+        # padding around the thumbnail in every direction.
+        backing = option.rect.adjusted(self._PAD, self._PAD, -self._PAD, -self._PAD)
         if selected:
-            painter.fillRect(option.rect, self.sel_color)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(self.sel_color)
+            painter.drawRoundedRect(backing, 8, 8)
         elif option.state & QStyle.StateFlag.State_MouseOver:
-            painter.fillRect(option.rect, self.hover_color)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(self.hover_color)
+            painter.drawRoundedRect(backing, 8, 8)
 
-        inner = option.rect.adjusted(6, 6, -6, -6)
+        inner = backing.adjusted(4, 4, -4, -4)
         icon = index.data(Qt.ItemDataRole.DecorationRole)
         if icon is not None:
             thumb_area = QRect(inner.x(), inner.y(), inner.width(),
-                               max(1, inner.height() - _TEXT_H))
+                               max(1, inner.height() - _TEXT_H - self._LABEL_GAP))
             pm = icon.pixmap(thumb_area.size())
             painter.drawPixmap(
                 thumb_area.x() + (thumb_area.width() - pm.width()) // 2,

@@ -9,8 +9,8 @@ from PySide6.QtGui import QIcon, QColor, QPixmap
 
 THUMB_W = 160
 THUMB_H = 210
-ITEM_W = 184
-ITEM_H = 244
+ITEM_W = 192
+ITEM_H = 262
 
 # Render thumbnails this many pixels above/below the viewport so they're ready
 # just before they scroll into view (mirrors the page-panel lazy strategy).
@@ -37,6 +37,11 @@ class _ThumbDelegate(QStyledItemDelegate):
     PageOrganizer.apply_palette) so the grid follows light/dark.
     """
     _TEXT_H = 22
+    # Even inset of the selection/hover backing (all four sides) so the accent
+    # wraps the whole cell evenly, and a gap so the page-number label doesn't
+    # touch the thumbnail above it.
+    _PAD = 5
+    _LABEL_GAP = 6
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -47,17 +52,23 @@ class _ThumbDelegate(QStyledItemDelegate):
 
     def paint(self, painter, option, index):
         painter.save()
+        painter.setRenderHint(painter.RenderHint.Antialiasing, True)
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        backing = option.rect.adjusted(self._PAD, self._PAD, -self._PAD, -self._PAD)
         if selected:
-            painter.fillRect(option.rect, self.sel_color)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(self.sel_color)
+            painter.drawRoundedRect(backing, 8, 8)
         elif option.state & QStyle.StateFlag.State_MouseOver:
-            painter.fillRect(option.rect, self.hover_color)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(self.hover_color)
+            painter.drawRoundedRect(backing, 8, 8)
 
-        inner = option.rect.adjusted(6, 6, -6, -6)
+        inner = backing.adjusted(5, 5, -5, -5)
         icon = index.data(Qt.ItemDataRole.DecorationRole)
         if icon is not None:
             area = QRect(inner.x(), inner.y(), inner.width(),
-                         max(1, inner.height() - self._TEXT_H))
+                         max(1, inner.height() - self._TEXT_H - self._LABEL_GAP))
             pm = icon.pixmap(area.size())
             painter.drawPixmap(
                 area.x() + (area.width() - pm.width()) // 2,
@@ -166,7 +177,7 @@ class PageOrganizer(QWidget):
         self._list.setDefaultDropAction(Qt.DropAction.MoveAction)
         self._list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self._list.setDropIndicatorShown(True)
-        self._list.setSpacing(4)
+        self._list.setSpacing(8)
         self._list.setUniformItemSizes(True)
         self._delegate = _ThumbDelegate(self._list)
         self._list.setItemDelegate(self._delegate)
