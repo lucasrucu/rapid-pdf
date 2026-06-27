@@ -1743,6 +1743,22 @@ class PDFCanvas(QGraphicsView):
                 if "t" in h: t += total.y()
                 if "b" in h: b += total.y()
 
+                # Shift: lock aspect ratio on corner drags
+                if (event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+                        and h in {"tl", "tr", "br", "bl"}
+                        and orig.width() > 0 and orig.height() > 0):
+                    aspect = orig.width() / orig.height()
+                    new_w = r - l
+                    new_h = b - t
+                    if abs(new_w / orig.width() - 1) >= abs(new_h / orig.height() - 1):
+                        constrained_h = new_w / aspect
+                        if "t" in h: t = b - constrained_h
+                        else: b = t + constrained_h
+                    else:
+                        constrained_w = new_h * aspect
+                        if "l" in h: l = r - constrained_w
+                        else: r = l + constrained_w
+
                 if r - l < 8:
                     if "l" in h: l = r - 8
                     else: r = l + 8
