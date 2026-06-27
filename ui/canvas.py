@@ -1358,7 +1358,12 @@ class PDFCanvas(QGraphicsView):
         return self._embedded_images
 
     def _load_page(self, page_num: int):
-        pixmap = self._doc.render_page(page_num, self._zoom)
+        # Cached render: page switches that land back on a page+zoom already shown
+        # (back/forth navigation, reload-after-strip, organizer round-trips) reuse
+        # the rasterised pixmap instead of re-rendering an A1 page (~120ms each).
+        # The cache self-invalidates on any content change (lift, save, strip,
+        # reorder, delete) inside PDFDocument, so a stale page can't render.
+        pixmap = self._doc.render_page_cached(page_num, self._zoom)
         if self._bg_item is None:
             self._bg_item = self._scene.addPixmap(pixmap)
             self._bg_item.setZValue(-1)
@@ -1542,8 +1547,13 @@ class PDFCanvas(QGraphicsView):
             print(f"Lift image removal failed: {e}")
             return None
 
-        # Background now renders without the lifted image.
-        self._bg_item.setPixmap(self._doc.render_page(page_num, self._zoom))
+        # Background now renders without the lifted image. The placement removal
+        # above invalidated this page's cache, so render_page_cached MISSES here
+        # (correct — content changed) and re-renders once, then stores the new
+        # pixmap. The mid-drag cost is the single unavoidable re-render; what the
+        # cache buys is that the NEXT reload of this page (drop_baked_image_items
+        # after save, a page-switch back) is free instead of another ~120ms raster.
+        self._bg_item.setPixmap(self._doc.render_page_cached(page_num, self._zoom))
         self._bg_item.update()   # invalidate item cache so the redacted image clears
 
         # pr is already in pixel/scene space (computed above via pdf_to_px).
@@ -1551,8 +1561,18 @@ class PDFCanvas(QGraphicsView):
         item = ImageAnnotationItem(pixmap, image_bytes, rect, page_num)
         self._scene.addItem(item)
         self._page_annotations.setdefault(page_num, []).append(item)
-        self._embedded_images = self._compute_embedded_images(page_num)
-        self._embedded_images_page = page_num
+        # We know exactly which xref was just removed; drop it from the existing
+        # scan instead of a full get_images + get_image_rects rescan of the page.
+        # (get_images would no longer report this xref anyway — so the rescan was
+        # pure cost.) A page with many embedded rasters rescanned mid-gesture is
+        # avoidable lag; this keeps the post-lift bookkeeping O(images-removed).
+        if self._embedded_images is not None and self._embedded_images_page == page_num:
+            self._embedded_images = [
+                (xr, r) for (xr, r) in self._embedded_images if xr != xref
+            ]
+        else:
+            self._embedded_images = self._compute_embedded_images(page_num)
+            self._embedded_images_page = page_num
         self._scene.clearSelection()
         item.setSelected(True)
         self.annotation_changed.emit()

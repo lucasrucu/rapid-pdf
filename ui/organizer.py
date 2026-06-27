@@ -4,15 +4,26 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QLabel, QFileDialog, QMessageBox,
     QStyledItemDelegate, QStyle,
 )
-from PySide6.QtCore import Signal, Qt, QSize, QRect
-from PySide6.QtGui import QIcon, QColor
+from PySide6.QtCore import Signal, Qt, QSize, QRect, QTimer
+from PySide6.QtGui import QIcon, QColor, QPixmap
 
 THUMB_W = 160
 THUMB_H = 210
 ITEM_W = 184
 ITEM_H = 244
 
-_PAGE_ID = Qt.ItemDataRole.UserRole  # stores each item's source page index
+# Render thumbnails this many pixels above/below the viewport so they're ready
+# just before they scroll into view (mirrors the page-panel lazy strategy).
+PREFETCH_PX = 240
+
+_PAGE_ID = Qt.ItemDataRole.UserRole       # each item's source page index (retagged on edits)
+# The page index in the RENDER doc (markup-baked clone) this item's thumbnail
+# comes from. Set once at refresh and NEVER retagged — a drag reorders only the
+# live doc, not the clone, so the lazy renderer must keep pulling each thumbnail
+# from its original clone page or a scrolled-in placeholder would show the wrong
+# page after a reorder.
+_SRC_ID = Qt.ItemDataRole.UserRole + 1
+_RENDERED = Qt.ItemDataRole.UserRole + 2  # bool: real thumbnail rendered (vs placeholder)
 
 
 class _ThumbDelegate(QStyledItemDelegate):
@@ -191,7 +202,11 @@ class PageOrganizer(QWidget):
         self._list.reordered.connect(self._on_reordered)
         self._list.reorder_invalid.connect(self.needs_rebuild)
         self._list.itemDoubleClicked.connect(self._on_item_activated)
+        # Smooth pixel scrolling + render thumbnails lazily as cells scroll in.
+        self._list.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
+        self._list.verticalScrollBar().valueChanged.connect(self._render_visible)
         layout.addWidget(self._list)
+        self._placeholder_cache: dict[int, QPixmap] = {}
 
     def set_document(self, doc, render=None):
         """doc = live document (edited in place). render = optional doc whose pages
@@ -200,20 +215,74 @@ class PageOrganizer(QWidget):
         self._render = render
         self.refresh()
 
+    def _render_source(self):
+        """Doc to rasterise thumbnails from: the markup-baked clone if present,
+        else the live document (same source the page panel uses)."""
+        return self._render or self._doc
+
+    def _placeholder_for(self, page_num: int) -> QPixmap:
+        """A grey placeholder sized to the page's real aspect ratio, so a landscape
+        drawing's cell doesn't visibly change shape when its thumbnail renders.
+        Page size is read without rasterising, so this stays cheap on big docs."""
+        h = THUMB_H
+        src = self._render_source()
+        if src:
+            w_pt, h_pt = src.get_page_size(page_num)
+            if w_pt > 0 and h_pt > 0:
+                h = max(1, min(THUMB_H, round(THUMB_W * h_pt / w_pt)))
+        pm = self._placeholder_cache.get(h)
+        if pm is None:
+            pm = QPixmap(THUMB_W, h)
+            pm.fill(QColor(60, 60, 60))
+            self._placeholder_cache[h] = pm
+        return pm
+
     def refresh(self):
-        src = self._render or self._doc
+        """Populate cells with placeholders immediately; real page thumbnails are
+        rendered lazily, only for cells actually in (or near) the viewport.
+
+        Eager all-page rendering blocked the Organizer open for ~3ms/page (an
+        ~300ms freeze on a 100-page doc); lazy rendering makes the open near-
+        instant and only pays for what's on screen."""
+        src = self._render_source()
         self._list.blockSignals(True)
         self._list.clear()
         if src and src.doc:
             for i in range(src.page_count()):
-                thumb = src.render_thumbnail(i, max_width=THUMB_W)
-                item = QListWidgetItem(QIcon(thumb), f"Page {i + 1}")
+                item = QListWidgetItem(QIcon(self._placeholder_for(i)), f"Page {i + 1}")
                 item.setSizeHint(QSize(ITEM_W, ITEM_H))
                 item.setData(_PAGE_ID, i)
+                item.setData(_SRC_ID, i)        # clone page this thumbnail comes from
+                item.setData(_RENDERED, False)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom)
                 self._list.addItem(item)
         self._list.blockSignals(False)
+        # Render what's visible now, and again once the grid has laid out.
+        self._render_visible()
+        QTimer.singleShot(0, self._render_visible)
         self._update_buttons()
+
+    def _render_visible(self):
+        """Rasterise real thumbnails for any placeholder cells in (or near) view.
+
+        Each thumbnail is pulled from its _SRC_ID page in the render doc, NOT its
+        current row: a drag reorders only the live doc, so a cell scrolled into
+        view after a reorder must still render its original clone page."""
+        src = self._render_source()
+        if not src or not src.doc:
+            return
+        vp = self._list.viewport().rect().adjusted(0, -PREFETCH_PX, 0, PREFETCH_PX)
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if item is None or item.data(_RENDERED):
+                continue
+            if not self._list.visualItemRect(item).intersects(vp):
+                continue
+            src_page = item.data(_SRC_ID)
+            if src_page is None or src_page >= src.page_count():
+                continue
+            item.setIcon(QIcon(src.render_thumbnail(src_page, max_width=THUMB_W)))
+            item.setData(_RENDERED, True)
 
     def _update_buttons(self):
         has_doc = bool(self._doc and self._doc.doc)
