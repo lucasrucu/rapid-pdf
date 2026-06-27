@@ -1133,6 +1133,32 @@ class PDFCanvas(QGraphicsView):
         if self._doc and self._doc.page_count() > 0:
             self._load_page(self._current_page)
 
+    def drop_baked_image_items(self):
+        """After a save, image objects have been baked into the page content stream.
+        Drop their live overlays so a later save can't bake a second copy, then
+        re-render: the baked image still shows (from the content) and stays
+        re-liftable. Unlike shape/text markup, images aren't stripped-and-rebuilt
+        from the embedded model, so this is what keeps them from duplicating."""
+        removed = False
+        new_map: dict[int, list] = {}
+        for pnum, items in self._page_annotations.items():
+            kept = []
+            for item in items:
+                if isinstance(item, ImageAnnotationItem):
+                    if item.scene():
+                        self._scene.removeItem(item)
+                    removed = True
+                else:
+                    kept.append(item)
+            new_map[pnum] = kept
+        self._page_annotations = new_map
+        if removed and self._doc and self._doc.page_count() > 0:
+            # A pasted-image Add command could otherwise redo a dropped item back
+            # in (and re-bake a duplicate); clearing avoids that. Only fires when
+            # an image was actually dropped, so shape/text-only sessions keep undo.
+            self.undo_stack.clear()
+            self._load_page(self._current_page)
+
     def get_render_zoom(self) -> float:
         return self._zoom
 
@@ -1419,15 +1445,28 @@ class PDFCanvas(QGraphicsView):
         Smallest-area wins so a small image on top of a full-page background is the one
         you grab (a scanned page that is one big image still lifts as a whole — by design).
         """
-        if self._zoom <= 0 or not self._doc:
+        if self._zoom <= 0 or not self._doc or not self._doc.doc:
             return None
-        px, py = scene_pos.x() / self._zoom, scene_pos.y() / self._zoom
+        page = self._doc.doc[self._current_page]
+        # get_image_rects() returns rects in the page's UNROTATED user space, but
+        # scene_pos is in rendered/displayed pixels. page.rotation_matrix is the
+        # mapping from unrotated user space to the rendered (visible, post-rotation)
+        # image for EVERY page — rot=0 included. We previously used
+        # transformation_matrix (a pure y-flip) on rot=0 pages, which double-flipped
+        # these rects vertically and put the hit region on the OPPOSITE side of the
+        # image from where it draws. Verified against ground truth (pixels that change
+        # when an image's placement is removed): rotation_matrix matches the true draw
+        # rect on all pages (rot=0 and rot=270); transformation_matrix never does.
+        disp = page.rotation_matrix
+        pdf_to_px = disp * fitz.Matrix(self._zoom, self._zoom)
         pw, ph = self._doc.get_page_size(self._current_page)
-        page_area = pw * ph
+        page_area = (pw * self._zoom) * (ph * self._zoom)
         best, best_area = None, None
         for xref, r in self._ensure_embedded_images():
-            if r.x0 <= px <= r.x1 and r.y0 <= py <= r.y1:
-                area = r.width * r.height
+            dr = fitz.Rect(r) * pdf_to_px
+            dr.normalize()
+            if dr.x0 <= scene_pos.x() <= dr.x1 and dr.y0 <= scene_pos.y() <= dr.y1:
+                area = dr.width * dr.height
                 # Skip a near-full-page raster (a whole drawing scanned as one
                 # image): it's the page background, not a liftable element — and
                 # lifting it was the cause of the "page turns into a flipped copy" bug.
@@ -1454,9 +1493,14 @@ class PDFCanvas(QGraphicsView):
         # often place an image with a vertically-flipped matrix; re-inserting the raw
         # extracted bytes un-flipped is what made a lifted raster look rotated 180°.
         # Cropping the render sidesteps the placement transform entirely.
-        # fitz_rect is in PDF user space; convert to pixel coords via the page's
-        # rendering transform so the crop is correct even for rotated pages.
-        pdf_to_px = page.transformation_matrix * fitz.Matrix(z, z)
+        # fitz_rect is in the page's unrotated user space; convert to pixel coords
+        # via page.rotation_matrix, which maps unrotated user space to the rendered
+        # (visible) image for every page — rot=0 and rotated alike. Using
+        # transformation_matrix (a y-flip) here mis-placed the crop vertically on
+        # rot=0 pages, mirroring the lifted cutout to the opposite side. Must match
+        # the same mapping _embedded_image_at uses for the hit-test.
+        disp = page.rotation_matrix
+        pdf_to_px = disp * fitz.Matrix(z, z)
         pr = fitz.Rect(fitz_rect) * pdf_to_px
         src = QRect(round(pr.x0), round(pr.y0),
                     max(1, round(pr.width)), max(1, round(pr.height)))
@@ -1480,14 +1524,22 @@ class PDFCanvas(QGraphicsView):
         image_bytes = bytes(buf.data())
 
         try:
-            page.add_redact_annot(fitz_rect, fill=None)
-            page.apply_redactions(
-                images=fitz.PDF_REDACT_IMAGE_REMOVE,
-                text=fitz.PDF_REDACT_TEXT_NONE,
-                graphics=fitz.PDF_REDACT_LINE_ART_NONE,
-            )
+            # Preferred: drop the image's single content-stream placement operator.
+            # That removes the image while leaving the background behind it intact —
+            # no white hole where it sat (the way a real editor moves an object).
+            if not self._doc.remove_image_placement(page_num, xref):
+                # Fallback for images that aren't a tight `cm /Name Do` placement:
+                # redact PIXELS (blanks only the pixels under the rect, so it never
+                # wipes the whole-page background like IMAGE_REMOVE would — but it can
+                # leave a hole where the image was).
+                page.add_redact_annot(fitz_rect, fill=None)
+                page.apply_redactions(
+                    images=fitz.PDF_REDACT_IMAGE_PIXELS,
+                    text=fitz.PDF_REDACT_TEXT_NONE,
+                    graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+                )
         except Exception as e:
-            print(f"Lift redaction failed: {e}")
+            print(f"Lift image removal failed: {e}")
             return None
 
         # Background now renders without the lifted image.
@@ -1601,10 +1653,11 @@ class PDFCanvas(QGraphicsView):
                     self._drag_applied = QPointF(0, 0)
                 else:
                     # No annotation here. Empty space begins a marquee on first move.
-                    # If the press is over a (sub-page) embedded image, a DRAG lifts it
-                    # into a movable object — but a plain click or double-click never
-                    # does. (Lifting on press previously fired on the first half of a
-                    # double-click and turned the whole page into a flipped copy.)
+                    # If the press is over a (sub-page) embedded image, either a
+                    # plain click or a drag lifts it into a movable object (handled
+                    # on release / on drag-threshold). The near-full-page guard in
+                    # _embedded_image_at skips a whole-page scan, so lifting can't
+                    # turn the page into a flipped copy.
                     self._press_empty_pos = scene_pos
                     self._press_additive = additive
                     self._lift_candidate = self._embedded_image_at(scene_pos)
@@ -1795,10 +1848,9 @@ class PDFCanvas(QGraphicsView):
             elif self._embedded_image_at(scene_pos) is not None:
                 # Hovering a liftable embedded image — including images placed by
                 # other apps (e.g. pasted in Acrobat's Edit PDF). An open-hand
-                # cursor signals "drag to grab": without it the image looks
-                # unselectable, because a plain click never lifts — only a drag
-                # past the threshold does. The cursor is also a live detector:
-                # if it appears over a third-party image, detection is working.
+                # cursor signals it's grabbable: click or drag lifts it into a
+                # movable object. The cursor is also a live detector — if it
+                # appears over a third-party image, detection is working.
                 self.setCursor(Qt.CursorShape.OpenHandCursor)
             else:
                 self.setCursor(Qt.CursorShape.ArrowCursor)
@@ -1855,9 +1907,17 @@ class PDFCanvas(QGraphicsView):
                 self._lift_candidate = None
 
             elif self._press_empty_pos is not None:
-                # A plain click on empty space — clear selection (unless additive).
-                # No drag happened, so a candidate image is never lifted.
-                if not self._press_additive:
+                # A plain click (no drag). On an embedded image, grab it — lift
+                # into a movable object (already selected) so images placed by
+                # other apps are reachable with a click, not just an obscure drag.
+                # _embedded_image_at's near-full-page guard keeps a whole-page
+                # scan from being lifted, so this can't flip the page.
+                # (Note: a lift isn't on the undo stack — same as the drag path —
+                # but it's non-destructive: the image just becomes a movable copy.)
+                # A Shift (additive) click never lifts: it preserves the selection.
+                if self._lift_candidate is not None and not self._press_additive:
+                    self._lift_embedded_image(*self._lift_candidate)
+                elif not self._press_additive:
                     self._scene.clearSelection()
                 self._press_empty_pos = None
                 self._lift_candidate = None
@@ -1901,7 +1961,7 @@ class PDFCanvas(QGraphicsView):
                         lambda it: (it.setPlainText(text), setattr(it, "text", text)),
                         "Edit text",
                     )
-            elif isinstance(item, AnnotationItem):
+            elif isinstance(item, AnnotationItem) and not isinstance(item, ImageAnnotationItem):
                 text, ok = QInputDialog.getText(
                     self, "Text", "Text inside shape:", text=item.text
                 )
