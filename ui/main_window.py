@@ -2,7 +2,7 @@ import os
 import fitz
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QTabWidget,
-    QFileDialog, QMessageBox, QStatusBar, QApplication,
+    QFileDialog, QMessageBox, QStatusBar, QApplication, QPushButton,
 )
 from PySide6.QtGui import QAction, QKeySequence, QShortcut, QIcon
 
@@ -114,6 +114,15 @@ class MainWindow(QMainWindow):
         self._status = QStatusBar()
         self.setStatusBar(self._status)
         self._status.showMessage("Open a PDF to start  (Ctrl+O)")
+
+        self._fit_btn = QPushButton("Fit")
+        self._fit_btn.setCheckable(True)
+        self._fit_btn.setFixedWidth(40)
+        self._fit_btn.setFlat(True)
+        self._fit_btn.setToolTip("Fit page to view (toggle)")
+        self._fit_btn.toggled.connect(self._on_fit_toggled)
+        self._canvas.fit_mode_broken.connect(self._on_fit_mode_broken)
+        self._status.addPermanentWidget(self._fit_btn)
 
     def _setup_menu(self):
         mb = self.menuBar()
@@ -539,6 +548,15 @@ class MainWindow(QMainWindow):
             self._status.showMessage(f"{base}  {extra}".strip())
         else:
             self._status.showMessage(extra or "Open a PDF to start  (Ctrl+O)")
+
+    def _on_fit_toggled(self, checked: bool):
+        self._canvas.set_fit_mode(checked)
+
+    def _on_fit_mode_broken(self):
+        # User zoomed manually — turn the button off without re-triggering the signal.
+        self._fit_btn.blockSignals(True)
+        self._fit_btn.setChecked(False)
+        self._fit_btn.blockSignals(False)
 
     # ------------------------------------------------------------------
     # Unsaved-changes (dirty) + untitled (merged) state

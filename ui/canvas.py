@@ -77,7 +77,9 @@ class AnnotationItem(QGraphicsRectItem, AnnotationBase):
         self.update()
 
     def boundingRect(self) -> QRectF:
-        extra = HANDLE_SIZE + 2
+        # Expand generously so zoom-scaled handles (which grow in scene coords when
+        # zoomed out) are never clipped. HANDLE_SIZE * 3 covers zoom down to ~0.33x.
+        extra = HANDLE_SIZE * 3
         return super().boundingRect().adjusted(-extra, -extra, extra, extra)
 
     def scene_rect(self) -> QRectF:
@@ -319,7 +321,7 @@ class LineAnnotationItem(QGraphicsLineItem, AnnotationBase):
         self._apply_style()
 
     def boundingRect(self) -> QRectF:
-        extra = HANDLE_SIZE + 2
+        extra = HANDLE_SIZE * 3
         return super().boundingRect().adjusted(-extra, -extra, extra, extra)
 
     def _apply_style(self):
@@ -370,9 +372,11 @@ class LineAnnotationItem(QGraphicsLineItem, AnnotationBase):
         option.state = saved
         if self.isSelected():
             ln = self.line()
-            hs = HANDLE_SIZE
+            m11 = painter.worldTransform().m11()
+            hs = HANDLE_SIZE / m11 if m11 > 0 else HANDLE_SIZE
             painter.save()
-            painter.setPen(QPen(QColor(0, 120, 215), 1))
+            pen_w = 1.0 / m11 if m11 > 0 else 1.0
+            painter.setPen(QPen(QColor(0, 120, 215), pen_w))
             painter.setBrush(QBrush(QColor(255, 255, 255)))
             for pt in [ln.p1(), ln.p2()]:
                 painter.drawRect(QRectF(pt.x() - hs / 2, pt.y() - hs / 2, hs, hs))
@@ -418,7 +422,7 @@ class TextAnnotationItem(QGraphicsTextItem, AnnotationBase):
         self.update()
 
     def boundingRect(self) -> QRectF:
-        extra = HANDLE_SIZE + 2
+        extra = HANDLE_SIZE * 3
         return QGraphicsTextItem.boundingRect(self).adjusted(-extra, -extra, extra, extra)
 
     def paint(self, painter: QPainter, option, widget=None):
@@ -428,12 +432,14 @@ class TextAnnotationItem(QGraphicsTextItem, AnnotationBase):
         option.state = saved
         if self.isSelected():
             br = QGraphicsTextItem.boundingRect(self)
-            hs = HANDLE_SIZE
+            m11 = painter.worldTransform().m11()
+            hs = HANDLE_SIZE / m11 if m11 > 0 else HANDLE_SIZE
+            pen_w = 1.0 / m11 if m11 > 0 else 1.0
             painter.save()
-            painter.setPen(QPen(QColor(0, 120, 215), 1, Qt.PenStyle.DashLine))
+            painter.setPen(QPen(QColor(0, 120, 215), pen_w, Qt.PenStyle.DashLine))
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(br.adjusted(1, 1, -1, -1))
-            painter.setPen(QPen(QColor(0, 120, 215), 1))
+            painter.drawRect(br.adjusted(pen_w, pen_w, -pen_w, -pen_w))
+            painter.setPen(QPen(QColor(0, 120, 215), pen_w))
             painter.setBrush(QBrush(QColor(255, 255, 255)))
             for x, y in [
                 (br.left(), br.top()), (br.right(), br.top()),
@@ -633,6 +639,7 @@ class PDFCanvas(QGraphicsView):
     annotation_changed = Signal()
     selection_changed = Signal(dict)
     page_changed = Signal(int)   # canvas-initiated page turn (continuous scroll)
+    fit_mode_broken = Signal()   # emitted when the user zooms manually while fit is active
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -726,6 +733,9 @@ class PDFCanvas(QGraphicsView):
         self._settle_timer = QTimer(self)
         self._settle_timer.setSingleShot(True)
         self._settle_timer.timeout.connect(self._end_active_render)
+
+        # Fit-to-view mode: when True the page is kept fitted on page load/resize
+        self._fit_mode = False
 
         # Fires while a drag is active and the cursor is near a viewport edge
         self._autoscroll_timer = QTimer(self)
@@ -842,6 +852,40 @@ class PDFCanvas(QGraphicsView):
             "text":   Qt.CursorShape.IBeamCursor,
         }
         self.setCursor(_cursors.get(tool, Qt.CursorShape.CrossCursor))
+
+    # ------------------------------------------------------------------
+    # Fit-to-view
+    # ------------------------------------------------------------------
+
+    def fit_page(self):
+        """Zoom so the current page fills the viewport with modest padding."""
+        sr = self._scene.sceneRect()
+        if sr.width() <= 0 or sr.height() <= 0:
+            return
+        vp = self.viewport()
+        vw, vh = vp.width(), vp.height()
+        if vw <= 0 or vh <= 0:
+            return
+        # 5% padding on each side (90% of viewport used for the page)
+        scale = min(vw / sr.width(), vh / sr.height()) * 0.90
+        self.resetTransform()
+        self.scale(scale, scale)
+        self.centerOn(sr.center())
+
+    def set_fit_mode(self, enabled: bool):
+        """Enable or disable fit-to-view mode. When enabled, immediately fits the page."""
+        self._fit_mode = enabled
+        if enabled:
+            self.fit_page()
+
+    def _apply_fit_if_active(self):
+        """Called after page load or resize — re-fits if fit mode is on."""
+        if self._fit_mode:
+            self.fit_page()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply_fit_if_active()
 
     def _apply_style_change(self, items, fn, text: str):
         """Apply fn to each item and record one undoable StyleCommand."""
@@ -1257,9 +1301,14 @@ class PDFCanvas(QGraphicsView):
         bottom = max(bl.y(), item.mapToScene(r.bottomRight()).y())
         return left, top, right, bottom, (left + right) / 2, (top + bottom) / 2
 
+    def _handle_size_scene(self) -> float:
+        """Handle size in scene coordinates: constant in screen pixels at any zoom."""
+        m11 = self.transform().m11()
+        return HANDLE_SIZE / m11 if m11 > 0 else HANDLE_SIZE
+
     def _get_handles_for_item(self, item: AnnotationItem) -> dict[str, QRectF]:
         l, t, r, b, cx, cy = self._rect_corners_in_scene(item)
-        hs = HANDLE_SIZE
+        hs = self._handle_size_scene()
 
         def h(x, y): return QRectF(x - hs / 2, y - hs / 2, hs, hs)
 
@@ -1271,7 +1320,7 @@ class PDFCanvas(QGraphicsView):
         }
 
     def _get_line_handles(self, item: LineAnnotationItem) -> dict[str, QRectF]:
-        hs = HANDLE_SIZE
+        hs = self._handle_size_scene()
         ln = item.line()
         p1s = item.mapToScene(ln.p1())
         p2s = item.mapToScene(ln.p2())
@@ -1390,6 +1439,7 @@ class PDFCanvas(QGraphicsView):
             item.setVisible(True)
 
         self._apply_pending_scroll()
+        self._apply_fit_if_active()
 
     def _apply_pending_scroll(self):
         """Position a continuous-scroll page turn at the top/bottom of the new page.
@@ -2049,6 +2099,31 @@ class PDFCanvas(QGraphicsView):
                     )
         event.accept()
 
+    def _min_zoom_scale(self) -> float:
+        """Minimum view scale: page fills the viewport with a 10% buffer.
+
+        Returns 0 (no limit) when no page is loaded or the scene rect is empty.
+        """
+        sr = self._scene.sceneRect()
+        if sr.width() <= 0 or sr.height() <= 0:
+            return 0.0
+        vp = self.viewport()
+        vw, vh = vp.width(), vp.height()
+        if vw <= 0 or vh <= 0:
+            return 0.0
+        return min(vw / sr.width(), vh / sr.height()) * 0.9
+
+    def _clamp_zoom_to_min(self):
+        """If the current view scale is below the minimum, zoom back up to it."""
+        min_scale = self._min_zoom_scale()
+        if min_scale <= 0:
+            return
+        current = self.transform().m11()
+        if current < min_scale:
+            # Reset to exactly the minimum scale, keeping anchor at centre.
+            self.resetTransform()
+            self.scale(min_scale, min_scale)
+
     def wheelEvent(self, event):
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             factor = 1.15 if event.angleDelta().y() > 0 else 1.0 / 1.15
@@ -2060,6 +2135,10 @@ class PDFCanvas(QGraphicsView):
             after = self.mapToScene(cursor_pos)
             delta = after - before
             self.translate(delta.x(), delta.y())
+            self._clamp_zoom_to_min()
+            if self._fit_mode:
+                self._fit_mode = False
+                self.fit_mode_broken.emit()
             self._mark_interacting()   # fast scaling while zooming, crisp on settle
             event.accept()
         else:
