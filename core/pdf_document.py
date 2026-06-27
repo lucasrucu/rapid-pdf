@@ -450,8 +450,13 @@ class PDFDocument:
                 elif ann_type == "image":
                     image_bytes = ann.get("image_bytes")
                     if rect and image_bytes:
-                        page.insert_image(rect, stream=image_bytes)
-                        # Note: rect was already derotated above for rotated pages.
+                        # rotate=page.rotation counteracts the page's own rotation so
+                        # the image content appears upright in the rendered view. Without
+                        # this, a page rotated 90° would bake the image rotated 90° as
+                        # well, making it appear wrong after the save/auto-reload cycle.
+                        # The rect was already derotated above for rotated pages.
+                        page.insert_image(rect, stream=image_bytes,
+                                          rotate=page.rotation)
 
             except Exception as e:
                 print(f"Annotation write error ({ann_type}): {e}")
