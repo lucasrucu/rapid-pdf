@@ -1159,36 +1159,6 @@ class PDFCanvas(QGraphicsView):
             self.undo_stack.clear()
             self._load_page(self._current_page)
 
-    def get_render_zoom(self) -> float:
-        return self._zoom
-
-    def remap_page_annotations(self, from_page: int, to_page: int):
-        if from_page == to_page:
-            return
-        new_map: dict[int, list] = {}
-        for pnum, items in self._page_annotations.items():
-            if pnum == from_page:
-                new_pnum = to_page
-            elif from_page < to_page and from_page < pnum <= to_page:
-                new_pnum = pnum - 1
-            elif from_page > to_page and to_page <= pnum < from_page:
-                new_pnum = pnum + 1
-            else:
-                new_pnum = pnum
-            for item in items:
-                item.page_num = new_pnum
-            if new_pnum in new_map:
-                new_map[new_pnum].extend(items)
-            else:
-                new_map[new_pnum] = items
-        self._page_annotations = new_map
-        if self._current_page == from_page:
-            self._current_page = to_page
-        elif from_page < to_page and from_page < self._current_page <= to_page:
-            self._current_page -= 1
-        elif from_page > to_page and to_page <= self._current_page < from_page:
-            self._current_page += 1
-
     def reorder_pages(self, new_order: list):
         """Apply a full page permutation: new page i holds old page new_order[i]."""
         new_map: dict[int, list] = {}
