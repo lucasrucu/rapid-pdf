@@ -5,7 +5,7 @@ buttons (`#2d2d2d`), hard 1px `#444` borders, a 3px radius, and a flat `#0078d4`
 blue for the active state. The app already uses a hand-rolled dark QSS theme, so
 the look is fully ours to change. This doc lays out the realistic options for a
 more professional, "glassy / clear-type" feel and recommends one. **The
-direction is a decision waiting on Lucas** — see the prototype before choosing.
+direction is a decision waiting on Lucas** (see the prototype before choosing).
 
 To see the proposed look next to the current one:
 
@@ -25,7 +25,7 @@ the active tool (QSS itself can't draw shadows on `QPushButton`).
 - **Can do:** gradients, rounded corners, per-state colors (hover/checked/
   pressed), accent system, a real glow on the active tool via a coloured drop
   shadow. Full control, no new dependencies, no risk to existing behaviour.
-- **Can't do:** Qt QSS has **no transitions or animations** — hover/checked is an
+- **Can't do:** Qt QSS has **no transitions or animations**. Hover/checked is an
   instant state swap, never a fade. No CSS `box-shadow` on widgets (drop shadows
   must come from `QGraphicsDropShadowEffect` in code). No true blur.
 - **Effort:** Low. Mostly editing the QSS strings in `ui/toolbar.py` and
@@ -35,7 +35,7 @@ the active tool (QSS itself can't draw shadows on `QPushButton`).
 ### 2. Theme libraries
 
 - **pyqtdarktheme (PyQtDarkTheme):** last release Dec 2022, pins
-  `python <3.12` — **won't install** on this app's Python 3.12. Effectively
+  `python <3.12`, so it **won't install** on this app's Python 3.12. Effectively
   abandoned. Skip.
 - **pyqtdarktheme-fork:** installs on 3.12 but inactive (no release in ~12
   months). Usable but no momentum.
@@ -62,7 +62,7 @@ title bar with rounded corners.
 
 - **Can do:** a real Mica/acrylic backdrop on Win11, a custom title bar, rounded
   window corners. This is the genuine "modern Windows app" frame.
-- **Can't do — important honesty:** the blur samples the **desktop/wallpaper
+- **Can't do, important honesty:** the blur samples the **desktop/wallpaper
   behind the window**, not the app's own content. It is not a frosted-glass pane
   floating over the PDF. Behaviour varies by Windows build; acrylic can stutter
   while dragging; the effect needs a translucent window background to show
@@ -81,7 +81,7 @@ inner glow, animated states via `QPropertyAnimation` (which **does** give the
 fades QSS can't).
 
 - **Can do:** anything pixel-level, including smooth animated hover/press.
-- **Can't do:** come for free — every control becomes hand-maintained code.
+- **Can't do:** come for free. Every control becomes hand-maintained code.
 - **Effort:** High.
 - **Verdict:** Overkill for a PDF tool. Reserve for one or two hero controls
   (e.g. an animated active-tool indicator) if we want polish later, not a
@@ -96,7 +96,7 @@ SVGs.
 
 - **Can do:** an instant professional lift; icons read faster than text in a tool
   rail. `qtawesome` icons are font glyphs, so they recolour per state for free.
-- **Can't do:** fix layout/colour on their own — pair with option 1.
+- **Can't do:** fix layout/colour on their own. Pair with option 1.
 - **Effort:** Low (`qtawesome`) to trivial (a few bundled SVGs).
 - **Verdict:** Adopt alongside option 1. The prototype fakes icons with QPainter
   so it runs dependency-free; the real app would use `qtawesome`.
@@ -134,7 +134,7 @@ Win11 backdrop and falls back silently if unavailable.
 
 ### Dependency implications if adopted in the real app
 
-- `qtawesome` — for real icons (maintained, pip-installable).
-- `pywinstyles` *(optional)* — only if we ship the Mica/acrylic layer; Win11 for
+- `qtawesome`: for real icons (maintained, pip-installable).
+- `pywinstyles` *(optional)*: only if we ship the Mica/acrylic layer; Win11 for
   the full effect.
 - The QSS + drop-shadow work itself needs **no new dependencies**.

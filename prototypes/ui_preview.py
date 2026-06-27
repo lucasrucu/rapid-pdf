@@ -1,5 +1,5 @@
 """
-rapid-pdf UI preview — a standalone proof-of-concept for the proposed restyle.
+rapid-pdf UI preview: a standalone proof-of-concept for the proposed restyle.
 
 WHAT THIS IS
 ------------
@@ -15,7 +15,7 @@ pick a direction before any real-app change happens.
 WHAT IT DEMONSTRATES (and how it maps to the real toolbar)
 ----------------------------------------------------------
 Left column  = the CURRENT look (flat #2d2d2d buttons, hard 1px #444 borders,
-               3px radius, flat #0078d4 checked state — the "Windows XP" feel).
+               3px radius, flat #0078d4 checked state, the "Windows XP" feel).
 Right column = the PROPOSED look. Same widgets, restyled:
   - Tool buttons (Select / Rectangle / Line / Text)  -> ui/toolbar.py _tool_btns
       Icon + label, taller hit target, soft vertical gradient, 8px radius,
@@ -54,7 +54,7 @@ from PySide6.QtWidgets import (
 MICA = False
 
 # ---------------------------------------------------------------------------
-# Palette — extends the app's existing tokens with an accent + surface ramp.
+# Palette: extends the app's existing tokens with an accent + surface ramp.
 # ---------------------------------------------------------------------------
 BG          = "#16181d"   # window base (slightly cooler than the current #1a1a1a)
 SURFACE     = "#1f2228"   # panel / toolbar surface
@@ -74,7 +74,7 @@ PRESETS = [
 
 
 # ---------------------------------------------------------------------------
-# Icons — drawn with QPainter so the prototype needs no icon files / fonts.
+# Icons: drawn with QPainter so the prototype needs no icon files / fonts.
 # In the real app these would be qtawesome / Lucide SVGs (see docs/ui.md).
 # ---------------------------------------------------------------------------
 def _icon(kind: str, color: str = TEXT, size: int = 18) -> QIcon:
@@ -120,7 +120,7 @@ def _swatch(color: str, size: int = 16) -> QPixmap:
 
 def _shadow(widget: QWidget, blur: int = 22, alpha: int = 150, dy: int = 4,
             color: QColor | None = None) -> None:
-    """Soft drop shadow — the one thing flat QSS can't express on its own."""
+    """Soft drop shadow: the one thing flat QSS can't express on its own."""
     eff = QGraphicsDropShadowEffect(widget)
     eff.setBlurRadius(blur)
     eff.setOffset(0, dy)
@@ -342,7 +342,7 @@ def _labeled(title: str, col: QWidget) -> QWidget:
 class Preview(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("rapid-pdf — UI direction preview")
+        self.setWindowTitle("rapid-pdf UI direction preview")
         self.setMinimumSize(620, 520)
         self.setStyleSheet(f"QWidget {{ background-color: {BG}; color: {TEXT}; }}")
 
@@ -350,7 +350,7 @@ class Preview(QWidget):
         root.setContentsMargins(28, 24, 28, 24)
         root.setSpacing(18)
 
-        title = QLabel("rapid-pdf toolbar — current vs proposed")
+        title = QLabel("rapid-pdf toolbar: current vs proposed")
         title.setStyleSheet(f"color:{TEXT}; font-size:16px; font-weight:700;")
         root.addWidget(title)
 
