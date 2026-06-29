@@ -308,6 +308,9 @@ class MainWindow(QMainWindow):
             self._strip_baked_annotations()
             self._canvas.drop_baked_image_items()  # avoid re-baking images on the next save
             self._refresh_panel_thumbnails()  # keep panel in sync with the saved page state
+            # Rebuilding the panel resets its selection to row 0; restore the row to the
+            # page actually being viewed so the thumbnail highlight stays put after save.
+            self._page_panel.set_current_page(self._current_page)
             self._update_status("Saved")
             return True
         QMessageBox.critical(self, "Save Error", "Could not save the PDF.")
@@ -326,6 +329,9 @@ class MainWindow(QMainWindow):
             self._strip_baked_annotations()
             self._canvas.drop_baked_image_items()  # avoid re-baking images on the next save
             self._refresh_panel_thumbnails()  # keep panel in sync with the saved page state
+            # Rebuilding the panel resets its selection to row 0; restore the row to the
+            # page actually being viewed so the thumbnail highlight stays put after save.
+            self._page_panel.set_current_page(self._current_page)
             self._update_status(f"Saved to {path}")
             return True
         QMessageBox.critical(self, "Save Error", "Could not save the PDF.")
