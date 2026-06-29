@@ -20,10 +20,10 @@ const geistMono = localFont({
 
 export const metadata: Metadata = {
   metadataBase: new URL("https://rapidpdf.qori.land"),
-  title: `${SITE.name} — ${SITE.tagline}`,
+  title: `${SITE.name}: ${SITE.tagline}`,
   description: SITE.description,
   openGraph: {
-    title: `${SITE.name} — ${SITE.tagline}`,
+    title: `${SITE.name}: ${SITE.tagline}`,
     description: SITE.description,
     url: "https://rapidpdf.qori.land",
     siteName: SITE.name,

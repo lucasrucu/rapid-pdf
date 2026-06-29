@@ -83,7 +83,7 @@
 }
 
 @layer base {
-  /* Sovereign theme — the Qori design system default (light, warm cream + amber). */
+  /* Sovereign theme: the Qori design system default (light, warm cream + amber). */
   :root {
     --background: 48 33% 97%;
     --foreground: 25 20% 12%;

@@ -1,4 +1,4 @@
-/* Qori lockup — same geometry as the umbrella mark across every Qori property.
+/* Qori lockup: same geometry as the umbrella mark across every Qori property.
    Solid amber tile + dark glyph. rapid-pdf uses a file glyph; the tile and
    wordmark style stay identical to the hub, financial dashboard, etc. */
 
