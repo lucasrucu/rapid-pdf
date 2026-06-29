@@ -1,0 +1,50 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+}
+
+@layer base {
+  /* Sovereign theme — the Qori design system default (light, warm cream + amber). */
+  :root {
+    --background: 48 33% 97%;
+    --foreground: 25 20% 12%;
+    --card: 45 25% 99%;
+    --card-foreground: 25 20% 12%;
+    --popover: 45 25% 99%;
+    --popover-foreground: 25 20% 12%;
+    --primary: 43 97% 48%;
+    --primary-foreground: 25 60% 8%;
+    --secondary: 44 50% 93%;
+    --secondary-foreground: 25 20% 18%;
+    --muted: 42 18% 93%;
+    --muted-foreground: 30 12% 46%;
+    --accent: 44 65% 90%;
+    --accent-foreground: 25 20% 12%;
+    --destructive: 0 72% 48%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 38 18% 87%;
+    --input: 38 18% 87%;
+    --ring: 43 97% 48%;
+    --positive: 142 55% 32%;
+    --negative: 0 72% 48%;
+    --radius: 0.625rem;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+  }
+
+  html {
+    @apply font-sans;
+    scroll-behavior: smooth;
+  }
+}

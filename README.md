@@ -73,6 +73,20 @@ Full annotated tree: [File structure](docs/file-structure.md).
 
 [Python](https://www.python.org/) 3.11+ · [PySide6](https://doc.qt.io/qtforpython/) (Qt6) · [PyMuPDF](https://pymupdf.readthedocs.io/) (fitz)
 
+## Install
+
+Download the latest **rapid-pdf-setup** from the [Releases page](https://github.com/lucasrucu/rapid-pdf/releases/latest) and run it. It's a per-user install (no admin prompt), adds a Start-menu entry and an optional desktop shortcut, and registers an uninstaller in Add/Remove Programs. Prefer no install? Grab the portable zip from the same release, unzip it anywhere, and run `rapid-pdf.exe`.
+
+The installer is currently unsigned, so Windows SmartScreen may show a "Windows protected your PC" prompt on first run. Click **More info -> Run anyway**. Code signing is on the roadmap (see `docs/build.md`).
+
+## Updating
+
+GitHub Releases is the single source of truth for versions. The strategy rolls out in stages:
+
+- **Now:** download the newest release and reinstall over the top. The installer keeps a stable app id, so it upgrades in place and your shortcuts stay put.
+- **Near-future:** an in-app update check. On launch the app queries the GitHub Releases API, compares the latest tag against its own version using semver, and acts by bump type: a patch or minor offers a one-click "update available" prompt, a major shows the release notes and requires explicit confirmation before updating.
+- **Later:** a full background auto-updater (for example PyUpdater), still backed only by GitHub Releases, so there's no server to run. It downloads and stages the new version, then applies it on the next restart.
+
 ## Documentation
 
 - [Architecture](docs/architecture.md): modules, coordinate system, save lifecycle, image-lift pipeline.
