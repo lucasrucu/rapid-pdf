@@ -1,9 +1,9 @@
 "use client";
 
-import Image from "next/image";
 import { useState } from "react";
-import { ArrowRight, Download, Monitor, Moon, Sun } from "lucide-react";
+import { Download, Monitor, Moon, Sun } from "lucide-react";
 
+import { AppWindow } from "@/components/AppWindow";
 import { Eyebrow } from "@/components/Eyebrow";
 import { GitHubIcon } from "@/components/BrandIcons";
 import { LINKS, SITE } from "@/lib/site";
@@ -63,7 +63,7 @@ export function Hero() {
 
         {/* Interactive product shot: toggle the app theme to preview both looks. */}
         <div className="mx-auto mt-14 max-w-4xl">
-          <div className="mb-3 flex items-center justify-center gap-1 text-sm">
+          <div className="mb-4 flex items-center justify-center gap-1 text-sm">
             <span className="mr-1 text-muted-foreground">Preview theme</span>
             <div className="inline-flex rounded-md border border-border bg-card p-0.5">
               <button
@@ -93,15 +93,19 @@ export function Hero() {
             </div>
           </div>
 
-          <div className="overflow-hidden rounded-xl border border-border bg-card shadow-sm ring-4 ring-primary/10">
-            <Image
+          {/* Brand backdrop: soft amber glow + cream gradient behind the window. */}
+          <div className="relative rounded-2xl bg-gradient-to-b from-accent/50 to-secondary/30 p-3 sm:p-6">
+            <div
+              aria-hidden="true"
+              className="pointer-events-none absolute inset-x-8 -top-6 h-24 rounded-full bg-primary/20 blur-3xl"
+            />
+            <AppWindow
               key={shot.src}
               src={shot.src}
               alt={shot.alt}
-              width={1500}
-              height={952}
+              title="Rapid PDF · Editor"
               priority
-              className="h-auto w-full animate-in fade-in duration-300"
+              className="animate-in fade-in duration-300"
             />
           </div>
         </div>

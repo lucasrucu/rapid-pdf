@@ -8,6 +8,80 @@
   }
 }
 
+/* Organizer drag-to-reorder demo (pure CSS, looping). One card lifts, travels
+   two slots to the right, and drops while the two it passes shuffle left. */
+@layer components {
+  .od-mover {
+    animation: od-move 5s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+    transform-origin: center;
+    position: relative;
+    z-index: 10;
+    will-change: transform;
+  }
+
+  .od-shift {
+    animation: od-shift 5s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+    will-change: transform;
+  }
+
+  .od-cursorhint {
+    animation: od-pulse 5s ease-in-out infinite;
+  }
+
+  /* card width 68px + gap; one slot ≈ 84px (mobile) / 92px (sm). */
+  @keyframes od-move {
+    0%,
+    12% {
+      transform: translateX(0) translateY(0) rotate(0deg) scale(1);
+      box-shadow: none;
+    }
+    24% {
+      transform: translateX(0) translateY(-8px) rotate(-2deg) scale(1.04);
+    }
+    62% {
+      transform: translateX(168px) translateY(-8px) rotate(-2deg) scale(1.04);
+    }
+    78%,
+    100% {
+      transform: translateX(168px) translateY(0) rotate(0deg) scale(1);
+    }
+  }
+
+  @keyframes od-shift {
+    0%,
+    24% {
+      transform: translateX(0);
+    }
+    62%,
+    100% {
+      transform: translateX(-84px);
+    }
+  }
+
+  @keyframes od-pulse {
+    0%,
+    20%,
+    80%,
+    100% {
+      opacity: 0.35;
+      transform: scale(1);
+    }
+    30%,
+    70% {
+      opacity: 1;
+      transform: scale(1.4);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .od-mover,
+    .od-shift,
+    .od-cursorhint {
+      animation: none;
+    }
+  }
+}
+
 @layer base {
   /* Sovereign theme — the Qori design system default (light, warm cream + amber). */
   :root {
