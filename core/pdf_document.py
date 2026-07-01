@@ -104,15 +104,23 @@ class PDFDocument:
         r = self.doc[page_num].bound()
         return (r.width, r.height)
 
-    def render_page(self, page_num: int, zoom: float = 1.5) -> QPixmap:
-        if not self.doc or page_num >= len(self.doc):
-            return QPixmap()
-        page = self.doc[page_num]
+    @staticmethod
+    def _render_page_at_zoom(page, zoom: float) -> QPixmap:
+        """Rasterise a fitz page at the given uniform zoom into an opaque QPixmap.
+
+        Shared by render_page (fixed zoom) and render_thumbnail (zoom derived
+        from a target width) so the fitz→QImage→QPixmap conversion lives once.
+        """
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat, alpha=False)
         img = QImage(bytes(pix.samples), pix.width, pix.height, pix.stride,
                      QImage.Format.Format_RGB888)
         return QPixmap.fromImage(img)
+
+    def render_page(self, page_num: int, zoom: float = 1.5) -> QPixmap:
+        if not self.doc or page_num >= len(self.doc):
+            return QPixmap()
+        return self._render_page_at_zoom(self.doc[page_num], zoom)
 
     def render_thumbnail(self, page_num: int, max_width: int = 110) -> QPixmap:
         if not self.doc or page_num >= len(self.doc):
@@ -120,11 +128,7 @@ class PDFDocument:
         page = self.doc[page_num]
         # page.bound() gives the visible (post-rotation) dimensions; page.rect does not.
         zoom = max_width / page.bound().width
-        mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        img = QImage(bytes(pix.samples), pix.width, pix.height, pix.stride,
-                     QImage.Format.Format_RGB888)
-        return QPixmap.fromImage(img)
+        return self._render_page_at_zoom(page, zoom)
 
     def save(self, path: str | None = None) -> bool:
         if not self.doc or not (self.path or path):
@@ -136,11 +140,14 @@ class PDFDocument:
         # the document. Every cached page pixmap is now stale (would still show
         # pre-bake content); drop them all.
         self.invalidate_render_cache()
+        tmp_path = None
         try:
             if is_same:
                 dir_path = os.path.dirname(os.path.abspath(target))
                 with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False, dir=dir_path) as tf:
                     tmp_path = tf.name
+                # If this write raises, the outer except cleans up tmp_path (the
+                # doc is still open and untouched, so the save simply fails safely).
                 self.doc.save(tmp_path, garbage=4, deflate=True)
                 # PyMuPDF can't write over its own open file, so close before the
                 # swap. Drop the handle to None immediately: if anything below
@@ -182,6 +189,14 @@ class PDFDocument:
             return True
         except Exception as e:
             print(f"Save error: {e}")
+            # If the temp file was written but never renamed into place (the swap
+            # succeeds by renaming it away, and the .bak path renames it too), it's
+            # orphaned next to the target — clean it up so failed saves don't litter.
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
             return False
 
     # ------------------------------------------------------------------
