@@ -1381,6 +1381,28 @@ class PDFCanvas(QGraphicsView):
             self._smooth_on = True
             self.viewport().update()
 
+    def _update_edge_autoscroll(self, vp_pos):
+        """Start/adjust/stop edge autoscroll based on cursor proximity to a viewport
+        edge (within 40px). Shared by the drag-move and draw paths in mouseMoveEvent,
+        which need byte-identical behaviour."""
+        vp = self.viewport()
+        edge = 40
+        ax = ay = 0
+        if vp_pos.x() < edge:
+            ax = -max(2, int((edge - vp_pos.x()) * 0.3))
+        elif vp_pos.x() > vp.width() - edge:
+            ax = max(2, int((vp_pos.x() - (vp.width() - edge)) * 0.3))
+        if vp_pos.y() < edge:
+            ay = -max(2, int((edge - vp_pos.y()) * 0.3))
+        elif vp_pos.y() > vp.height() - edge:
+            ay = max(2, int((vp_pos.y() - (vp.height() - edge)) * 0.3))
+        self._autoscroll_dx, self._autoscroll_dy = ax, ay
+        if ax or ay:
+            if not self._autoscroll_timer.isActive():
+                self._autoscroll_timer.start()
+        else:
+            self._autoscroll_timer.stop()
+
     def _do_autoscroll(self):
         if not self._drag_items and not self._drawing:
             self._autoscroll_timer.stop()
@@ -1862,24 +1884,7 @@ class PDFCanvas(QGraphicsView):
                 self._drag_moved = True
 
             # Edge autoscroll: activate when cursor is within 40px of a viewport edge
-            vp_pos = event.pos()
-            vp = self.viewport()
-            edge = 40
-            ax = ay = 0
-            if vp_pos.x() < edge:
-                ax = -max(2, int((edge - vp_pos.x()) * 0.3))
-            elif vp_pos.x() > vp.width() - edge:
-                ax = max(2, int((vp_pos.x() - (vp.width() - edge)) * 0.3))
-            if vp_pos.y() < edge:
-                ay = -max(2, int((edge - vp_pos.y()) * 0.3))
-            elif vp_pos.y() > vp.height() - edge:
-                ay = max(2, int((vp_pos.y() - (vp.height() - edge)) * 0.3))
-            self._autoscroll_dx, self._autoscroll_dy = ax, ay
-            if ax or ay:
-                if not self._autoscroll_timer.isActive():
-                    self._autoscroll_timer.start()
-            else:
-                self._autoscroll_timer.stop()
+            self._update_edge_autoscroll(event.pos())
 
         elif self._press_empty_pos is not None:
             moved = (scene_pos - self._press_empty_pos).manhattanLength()
@@ -1944,24 +1949,7 @@ class PDFCanvas(QGraphicsView):
                 self._temp_item.setRect(rect)
 
             # Edge autoscroll while drawing: same logic as during drag
-            vp_pos = event.pos()
-            vp = self.viewport()
-            edge = 40
-            ax = ay = 0
-            if vp_pos.x() < edge:
-                ax = -max(2, int((edge - vp_pos.x()) * 0.3))
-            elif vp_pos.x() > vp.width() - edge:
-                ax = max(2, int((vp_pos.x() - (vp.width() - edge)) * 0.3))
-            if vp_pos.y() < edge:
-                ay = -max(2, int((edge - vp_pos.y()) * 0.3))
-            elif vp_pos.y() > vp.height() - edge:
-                ay = max(2, int((vp_pos.y() - (vp.height() - edge)) * 0.3))
-            self._autoscroll_dx, self._autoscroll_dy = ax, ay
-            if ax or ay:
-                if not self._autoscroll_timer.isActive():
-                    self._autoscroll_timer.start()
-            else:
-                self._autoscroll_timer.stop()
+            self._update_edge_autoscroll(event.pos())
 
         # Update cursor for hover feedback
         if (self._tool == "select" and not self._drawing and not self._drag_items
