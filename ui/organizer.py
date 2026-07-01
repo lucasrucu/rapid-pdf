@@ -2,10 +2,10 @@ import fitz as _fitz
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QListWidget, QListWidgetItem, QLabel, QFileDialog, QMessageBox,
-    QStyledItemDelegate, QStyle,
+    QStyledItemDelegate, QStyle, QStyleOptionViewItem,
 )
-from PySide6.QtCore import Signal, Qt, QSize, QRect, QTimer
-from PySide6.QtGui import QIcon, QColor, QPixmap
+from PySide6.QtCore import Signal, Qt, QSize, QRect, QTimer, QPoint
+from PySide6.QtGui import QIcon, QColor, QPixmap, QPainter, QDrag
 
 THUMB_W = 160
 THUMB_H = 210
@@ -42,6 +42,11 @@ class _ThumbDelegate(QStyledItemDelegate):
     # touch the thumbnail above it.
     _PAD = 5
     _LABEL_GAP = 6
+    # Purely cosmetic horizontal nudge applied to the cells flanking the
+    # current drop line during a drag, so the insertion point reads as "pages
+    # sliding apart to make room" instead of just a thin indicator line. Does
+    # not touch layout/geometry — only where this delegate paints each cell.
+    _NUDGE_PX = 10
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -54,7 +59,18 @@ class _ThumbDelegate(QStyledItemDelegate):
         painter.save()
         painter.setRenderHint(painter.RenderHint.Antialiasing, True)
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
-        backing = option.rect.adjusted(self._PAD, self._PAD, -self._PAD, -self._PAD)
+        rect = option.rect
+        drag_row = getattr(self.parent(), "drag_target_row", lambda: None)()
+        if drag_row is not None:
+            row = index.row()
+            # Only nudge within the same visual row (a wrap boundary means the
+            # "before" cell is the last item of the previous row, which reads
+            # fine without a matching shift on the far side of the wrap).
+            if row == drag_row - 1:
+                rect = rect.translated(-self._NUDGE_PX, 0)
+            elif row == drag_row:
+                rect = rect.translated(self._NUDGE_PX, 0)
+        backing = rect.adjusted(self._PAD, self._PAD, -self._PAD, -self._PAD)
         if selected:
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(self.sel_color)
@@ -89,20 +105,183 @@ class _ThumbDelegate(QStyledItemDelegate):
 
 
 class _DragList(QListWidget):
-    """Thumbnail grid that reorders via Qt's NATIVE InternalMove.
+    """Thumbnail grid that reorders via a MANUAL internal move.
 
-    Native handling means Qt owns drag acceptance and the between-items drop
-    indicator (so there is no "can't place here" cursor), and ListMode layout
-    means the view re-flows items with no leftover gaps. After each drop we read
-    the new order back from each item's _PAGE_ID role and report it.
+    Qt's native InternalMove drop handling only reliably supports moving a
+    single contiguous block of rows: for a non-contiguous multi-selection it
+    resolves each moved row's new position from a mime-encoded row list that
+    goes stale mid-drop (rows shift as earlier ones are removed), which can
+    hand a native takeItem/removeRow an out-of-range index and crash the
+    process outright (a C++-side assert/segfault, not a catchable Python
+    exception — this is a long-standing Qt issue, not specific to this app).
+    So the drop is handled entirely by hand instead of delegating to
+    super().dropEvent(): take every selected item out (descending row order,
+    so each takeItem() never invalidates a later index), figure out where the
+    drop point landed among what's left, and reinsert the whole taken batch
+    together at that spot. This sidesteps Qt's native multi-row math and, as a
+    side effect, gives the desired UX: non-contiguous selections always land
+    as one merged block wherever the user drops them.
     """
     reordered = Signal(list)       # new order as a list of original page indices
     reorder_invalid = Signal()     # drop left the list in an unexpected state
 
+    # Fanned-stack drag pixmap tuning: how far each card behind the top one
+    # peeks out (purely cosmetic, mirrors a hand of playing cards).
+    _STACK_OFFSET_PX = 6
+    _STACK_MAX_CARDS = 5   # cap the visible fan so a 40-page selection doesn't
+                           # draw 40 layered thumbnails under the cursor
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._drag_row = None  # current drop-target row while a drag is over the grid, else None
+
+    def drag_target_row(self):
+        """Row the drop indicator currently points at, or None when not dragging.
+        Read by the delegate to nudge the cells on either side of that row."""
+        return self._drag_row
+
+    def startDrag(self, supportedActions):
+        """Replace Qt's default multi-item drag rendering (every selected item
+        painted near its own original position, which reads as the whole grid
+        smearing across the screen) with a single fanned card-stack pixmap that
+        follows the cursor as one unit.
+
+        This only changes what's painted under the cursor during the drag —
+        the actual reorder on drop is unaffected (still handled by dropEvent's
+        manual take/reinsert, which already merges the selection into one block
+        wherever it lands)."""
+        rows = sorted({self.row(i) for i in self.selectedItems()})
+        if len(rows) <= 1:
+            super().startDrag(supportedActions)
+            return
+
+        mime = self.model().mimeData([self.model().index(r, 0) for r in rows])
+        if mime is None:
+            super().startDrag(supportedActions)
+            return
+
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        pixmap, hotspot = self._stack_pixmap(rows)
+        drag.setPixmap(pixmap)
+        drag.setHotSpot(hotspot)
+        drag.exec(supportedActions, Qt.DropAction.MoveAction)
+
+    def _stack_pixmap(self, rows):
+        """Build a fanned card-stack pixmap from the selected rows' thumbnails:
+        a handful of cards peeking out behind a full-opacity top card, plus a
+        badge showing the total selection count. Returns (pixmap, hotspot) where
+        hotspot keeps the top card under the cursor at the same spot it was
+        grabbed, so the drag doesn't visually "jump"."""
+        shown = rows[:self._STACK_MAX_CARDS]
+        off = self._STACK_OFFSET_PX
+        extra = off * (len(shown) - 1)
+        cell_w, cell_h = self.gridSize().width(), self.gridSize().height()
+        badge_d = 26
+        # Extra margin at the top-right so the count badge (anchored to the
+        # fanned-out corner) has room without being clipped by the pixmap edge.
+        margin = badge_d // 2 + 2
+        canvas = QPixmap(cell_w + extra + margin, cell_h + extra + margin)
+        canvas.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(canvas)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        # Back-to-front so the top (first-selected) card paints last, fully
+        # opaque, on top of the fanned-out ones behind it. Cards are offset by
+        # `margin` on both axes so the top-right badge has clearance without
+        # needing negative coordinates.
+        for depth, row in reversed(list(enumerate(shown))):
+            item = self.item(row)
+            if item is None:
+                continue
+            opacity = 1.0 if depth == 0 else 0.55
+            painter.setOpacity(opacity)
+            option = QStyleOptionViewItem()
+            option.initFrom(self)
+            option.rect = QRect(depth * off, depth * off + margin, cell_w, cell_h)
+            option.state |= QStyle.StateFlag.State_Selected
+            self.itemDelegate().paint(painter, option, self.indexFromItem(item))
+        painter.setOpacity(1.0)
+        # Badge with the total selection count (not just the fanned subset),
+        # so a 20-page drag still reads as "20", not "5".
+        if len(rows) > 1:
+            bx = cell_w - badge_d // 2
+            by = 0
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(self._delegate_sel_color())
+            painter.drawEllipse(bx, by, badge_d, badge_d)
+            painter.setPen(Qt.GlobalColor.white)
+            font = painter.font()
+            font.setBold(True)
+            font.setPointSize(10)
+            painter.setFont(font)
+            painter.drawText(QRect(bx, by, badge_d, badge_d),
+                              Qt.AlignmentFlag.AlignCenter, str(len(rows)))
+        painter.end()
+        # Hotspot: the top card sits at (0, margin) in canvas space, so its
+        # centre is a stable, cursor-following anchor point.
+        return canvas, QPoint(cell_w // 2, margin + cell_h // 2)
+
+    def _delegate_sel_color(self):
+        delegate = self.itemDelegate()
+        color = getattr(delegate, "sel_color", None)
+        return color if color is not None else QColor("#F1AE04")
+
+    def dragMoveEvent(self, event):
+        super().dragMoveEvent(event)
+        pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        row = self._drop_row(pos)
+        if row != self._drag_row:
+            self._drag_row = row
+            self.viewport().update()
+
+    def dragLeaveEvent(self, event):
+        self._drag_row = None
+        self.viewport().update()
+        super().dragLeaveEvent(event)
+
     def dropEvent(self, event):
+        self._drag_row = None
         n = self.count()
-        super().dropEvent(event)   # native reorder: removes source, inserts at indicator
+        rows = sorted({self.row(i) for i in self.selectedItems()})
+        if not rows:
+            event.ignore()
+            return
+
+        # Where the user is dropping, expressed as an index into the list
+        # AFTER the dragged rows are removed from it (so it's directly usable
+        # as an insertion index with no further adjustment).
+        target = self._drop_row(event.position().toPoint() if hasattr(event, "position")
+                                 else event.pos())
+        removed_before_target = sum(1 for r in rows if r < target)
+        target -= removed_before_target
+
+        items = [self.takeItem(r) for r in reversed(rows)]
+        items.reverse()  # back to original relative order
+        target = max(0, min(target, self.count()))
+        for offset, item in enumerate(items):
+            self.insertItem(target + offset, item)
+
+        self.clearSelection()
+        for offset in range(len(items)):
+            self.item(target + offset).setSelected(True)
+
+        event.acceptProposedAction()
         self._emit_reorder(n)
+
+    def _drop_row(self, pos) -> int:
+        """Row index (pre-removal) the drop point resolves to: the row of the
+        item the point landed in/after, or count() if it's past the last item."""
+        item = self.itemAt(pos)
+        if item is None:
+            return self.count()
+        row = self.row(item)
+        rect = self.visualItemRect(item)
+        # Grid flows left-to-right with wrapping: "insert after" means the
+        # point is past the item's horizontal midpoint (mirrors the native
+        # drop-indicator's before/after split for a wrapped grid).
+        if pos.x() > rect.center().x():
+            row += 1
+        return row
 
     def _emit_reorder(self, expected_n: int):
         """Read the post-drop order from item ids and report it (or flag a bad drop)."""
@@ -177,7 +356,14 @@ class PageOrganizer(QWidget):
         self._list.setDefaultDropAction(Qt.DropAction.MoveAction)
         self._list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self._list.setDropIndicatorShown(True)
-        self._list.setSpacing(8)
+        # NOTE: don't combine setSpacing() with an explicit setGridSize() here —
+        # Qt's grid-mode layout adds spacing into the row/column pitch AND into
+        # the per-item rect it hands the delegate, and the two don't line up:
+        # the whole grid visibly shifts down/right by ~spacing, which clips the
+        # very first row against the viewport top (nothing above it to absorb
+        # the shift). All the visual gutter here comes from the delegate's own
+        # _PAD inset instead, so spacing stays 0.
+        self._list.setSpacing(0)
         self._list.setUniformItemSizes(True)
         self._delegate = _ThumbDelegate(self._list)
         self._list.setItemDelegate(self._delegate)
@@ -276,6 +462,30 @@ class PageOrganizer(QWidget):
                 continue
             item.setIcon(QIcon(src.render_thumbnail(src_page, max_width=THUMB_W)))
             item.setData(_RENDERED, True)
+
+    def thumb_width(self) -> int:
+        return THUMB_W
+
+    def update_page_thumbnail(self, page_num: int, pixmap: QPixmap):
+        """Patch one page's thumbnail in place (e.g. after a live canvas edit),
+        instead of rebuilding the whole grid from a fresh markup-baked clone.
+
+        Mirrors PagePanel.update_page_thumbnail — same cheap "grab what the
+        canvas already rendered" pixmap, no PyMuPDF re-render and no throwaway
+        fitz clone. This is what keeps the Organizer's thumbnails from lagging
+        behind the Editor tab, which was patching its own panel this way already.
+
+        Looks the row up by _PAGE_ID rather than assuming row == page_num, since
+        a completed drag reorders the live doc while a partial edit that arrives
+        mid-drag must still land on the item representing that logical page."""
+        if not pixmap or pixmap.isNull():
+            return
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if item is not None and item.data(_PAGE_ID) == page_num:
+                item.setIcon(QIcon(pixmap))
+                item.setData(_RENDERED, True)
+                return
 
     def _update_buttons(self):
         has_doc = bool(self._doc and self._doc.doc)
