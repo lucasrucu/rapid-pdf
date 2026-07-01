@@ -38,7 +38,7 @@ const FEATURES = [
   {
     icon: Zap,
     title: "Instant, always",
-    body: "No OCR, no form-field scanning on open. Even a large A1 engineering drawing loads and edits without the wait.",
+    body: "Nothing scans on open, so even a large A1 engineering drawing loads and edits without the wait. Need searchable scans? Run Enhance for Search whenever you choose.",
   },
 ];
 

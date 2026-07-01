@@ -14,7 +14,7 @@ export const LINKS = {
 
 export const SITE = {
   name: "Rapid PDF",
-  tagline: "Fast PDF page management and markup. No OCR. No wait.",
+  tagline: "Fast PDF page management and markup. OCR on demand. No wait.",
   description:
     "A focused Windows desktop PDF editor. Reorder, combine, and delete pages, then drop highlights, rectangles, and lines, all instantly. Open an A1 engineering drawing and work without the Acrobat lag.",
   version: "1.1.0",
