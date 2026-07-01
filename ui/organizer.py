@@ -2,10 +2,10 @@ import fitz as _fitz
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QListWidget, QListWidgetItem, QLabel, QFileDialog, QMessageBox,
-    QStyledItemDelegate, QStyle,
+    QStyledItemDelegate, QStyle, QStyleOptionViewItem,
 )
-from PySide6.QtCore import Signal, Qt, QSize, QRect, QTimer
-from PySide6.QtGui import QIcon, QColor, QPixmap
+from PySide6.QtCore import Signal, Qt, QSize, QRect, QTimer, QPoint
+from PySide6.QtGui import QIcon, QColor, QPixmap, QPainter, QDrag
 
 THUMB_W = 160
 THUMB_H = 210
@@ -125,6 +125,12 @@ class _DragList(QListWidget):
     reordered = Signal(list)       # new order as a list of original page indices
     reorder_invalid = Signal()     # drop left the list in an unexpected state
 
+    # Fanned-stack drag pixmap tuning: how far each card behind the top one
+    # peeks out (purely cosmetic, mirrors a hand of playing cards).
+    _STACK_OFFSET_PX = 6
+    _STACK_MAX_CARDS = 5   # cap the visible fan so a 40-page selection doesn't
+                           # draw 40 layered thumbnails under the cursor
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._drag_row = None  # current drop-target row while a drag is over the grid, else None
@@ -133,6 +139,92 @@ class _DragList(QListWidget):
         """Row the drop indicator currently points at, or None when not dragging.
         Read by the delegate to nudge the cells on either side of that row."""
         return self._drag_row
+
+    def startDrag(self, supportedActions):
+        """Replace Qt's default multi-item drag rendering (every selected item
+        painted near its own original position, which reads as the whole grid
+        smearing across the screen) with a single fanned card-stack pixmap that
+        follows the cursor as one unit.
+
+        This only changes what's painted under the cursor during the drag —
+        the actual reorder on drop is unaffected (still handled by dropEvent's
+        manual take/reinsert, which already merges the selection into one block
+        wherever it lands)."""
+        rows = sorted({self.row(i) for i in self.selectedItems()})
+        if len(rows) <= 1:
+            super().startDrag(supportedActions)
+            return
+
+        mime = self.model().mimeData([self.model().index(r, 0) for r in rows])
+        if mime is None:
+            super().startDrag(supportedActions)
+            return
+
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        pixmap, hotspot = self._stack_pixmap(rows)
+        drag.setPixmap(pixmap)
+        drag.setHotSpot(hotspot)
+        drag.exec(supportedActions, Qt.DropAction.MoveAction)
+
+    def _stack_pixmap(self, rows):
+        """Build a fanned card-stack pixmap from the selected rows' thumbnails:
+        a handful of cards peeking out behind a full-opacity top card, plus a
+        badge showing the total selection count. Returns (pixmap, hotspot) where
+        hotspot keeps the top card under the cursor at the same spot it was
+        grabbed, so the drag doesn't visually "jump"."""
+        shown = rows[:self._STACK_MAX_CARDS]
+        off = self._STACK_OFFSET_PX
+        extra = off * (len(shown) - 1)
+        cell_w, cell_h = self.gridSize().width(), self.gridSize().height()
+        badge_d = 26
+        # Extra margin at the top-right so the count badge (anchored to the
+        # fanned-out corner) has room without being clipped by the pixmap edge.
+        margin = badge_d // 2 + 2
+        canvas = QPixmap(cell_w + extra + margin, cell_h + extra + margin)
+        canvas.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(canvas)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        # Back-to-front so the top (first-selected) card paints last, fully
+        # opaque, on top of the fanned-out ones behind it. Cards are offset by
+        # `margin` on both axes so the top-right badge has clearance without
+        # needing negative coordinates.
+        for depth, row in reversed(list(enumerate(shown))):
+            item = self.item(row)
+            if item is None:
+                continue
+            opacity = 1.0 if depth == 0 else 0.55
+            painter.setOpacity(opacity)
+            option = QStyleOptionViewItem()
+            option.initFrom(self)
+            option.rect = QRect(depth * off, depth * off + margin, cell_w, cell_h)
+            option.state |= QStyle.StateFlag.State_Selected
+            self.itemDelegate().paint(painter, option, self.indexFromItem(item))
+        painter.setOpacity(1.0)
+        # Badge with the total selection count (not just the fanned subset),
+        # so a 20-page drag still reads as "20", not "5".
+        if len(rows) > 1:
+            bx = cell_w - badge_d // 2
+            by = 0
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(self._delegate_sel_color())
+            painter.drawEllipse(bx, by, badge_d, badge_d)
+            painter.setPen(Qt.GlobalColor.white)
+            font = painter.font()
+            font.setBold(True)
+            font.setPointSize(10)
+            painter.setFont(font)
+            painter.drawText(QRect(bx, by, badge_d, badge_d),
+                              Qt.AlignmentFlag.AlignCenter, str(len(rows)))
+        painter.end()
+        # Hotspot: the top card sits at (0, margin) in canvas space, so its
+        # centre is a stable, cursor-following anchor point.
+        return canvas, QPoint(cell_w // 2, margin + cell_h // 2)
+
+    def _delegate_sel_color(self):
+        delegate = self.itemDelegate()
+        color = getattr(delegate, "sel_color", None)
+        return color if color is not None else QColor("#F1AE04")
 
     def dragMoveEvent(self, event):
         super().dragMoveEvent(event)
