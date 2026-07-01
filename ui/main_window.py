@@ -8,6 +8,7 @@ from PySide6.QtGui import QAction, QKeySequence, QShortcut, QIcon
 
 from core.pdf_document import PDFDocument
 from core.resources import app_icon_path
+from core.ocr_worker import run_ocr_enhance
 from ui.canvas import PDFCanvas
 from ui.toolbar import ToolBar
 from ui.page_panel import PagePanel
@@ -26,6 +27,8 @@ class MainWindow(QMainWindow):
         self._panel_render = None  # throwaway clone backing the left page panel's thumbnails
         self._dirty = False      # unsaved changes exist (annotations, page edits, merges)
         self._force_quit = False # Quit menu wants a real app quit, not "close PDF"
+        self._ocr_thread = None  # active OCR QThread, or None when idle
+        self._ocr_worker = None  # keep a ref alive alongside the thread
         self._update_title()
         self.setMinimumSize(1100, 720)
         icon_path = app_icon_path()
@@ -133,6 +136,8 @@ class MainWindow(QMainWindow):
         fm.addSeparator()
         self._add_action(fm, "Save", self.save_pdf, QKeySequence.StandardKey.Save)
         self._add_action(fm, "Save As…", self.save_pdf_as, "Ctrl+Shift+S")
+        fm.addSeparator()
+        self._add_action(fm, "Enhance for Search (OCR)…", self.enhance_for_search)
         fm.addSeparator()
         self._add_action(fm, "Quit", self._quit_app, QKeySequence.StandardKey.Quit)
 
@@ -336,6 +341,57 @@ class MainWindow(QMainWindow):
             return True
         QMessageBox.critical(self, "Save Error", "Could not save the PDF.")
         return False
+
+    def enhance_for_search(self):
+        """Run OCR once, on demand, over every page that doesn't already have
+        an extractable text layer — so scanned/image-only pages become
+        searchable. Runs on a background thread with a progress dialog; the
+        normal editing UI stays responsive and untouched while it runs.
+        """
+        if not self._doc.doc:
+            QMessageBox.warning(self, "No PDF", "Open a PDF first.")
+            return
+        if self._ocr_thread is not None:
+            QMessageBox.information(self, "OCR In Progress", "Already enhancing this document.")
+            return
+
+        # Bake current edits into the live doc first (same as a normal save)
+        # so OCR runs against the up-to-date page content, not stale markup.
+        self._flush_annotations()
+
+        self._status.showMessage("Enhancing for search (OCR)…")
+        self._ocr_thread, self._ocr_worker = run_ocr_enhance(
+            self, self._doc, self._on_ocr_finished
+        )
+
+    def _on_ocr_finished(self, ocred_count: int, cancelled: bool):
+        self._ocr_thread = None
+        self._ocr_worker = None
+        # OCR rewrote page content streams directly on the live document —
+        # every cached render is stale and the panel/current page must be
+        # redrawn from the new (now-searchable) page content.
+        self._doc.invalidate_render_cache()
+        self._canvas.reload_current_page()
+        self._refresh_panel_thumbnails()
+        self._page_panel.set_current_page(self._current_page)
+
+        if cancelled:
+            self._update_status(f"OCR cancelled — {ocred_count} page(s) enhanced before stopping")
+        elif ocred_count == 0:
+            self._update_status("OCR: no pages needed enhancing (already searchable)")
+        else:
+            self._update_status(f"OCR: enhanced {ocred_count} page(s) for search")
+
+        if ocred_count:
+            self._mark_dirty()
+            reply = QMessageBox.question(
+                self, "Save Now?",
+                f"Enhanced {ocred_count} page(s) for search. Save now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.save_pdf()
 
     def _delete_key(self):
         """Delete (keypad) routes by active tab: pages in the Organizer, else
