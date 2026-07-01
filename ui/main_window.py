@@ -300,6 +300,23 @@ class MainWindow(QMainWindow):
         self._current_page = 0
         self._update_status()
 
+    def _after_successful_save(self, status: str):
+        """Shared post-save bookkeeping for both Save and Save As.
+
+        Both paths do the identical work once the write succeeds: clear the
+        dirty/clean state, strip the baked markup back out of the live doc,
+        drop baked image overlays, and re-sync the panel to the saved page.
+        """
+        self._dirty = False
+        self._canvas.undo_stack.setClean()   # Ctrl+Z back here won't prompt to save
+        self._strip_baked_annotations()
+        self._canvas.drop_baked_image_items()  # avoid re-baking images on the next save
+        self._refresh_panel_thumbnails()  # keep panel in sync with the saved page state
+        # Rebuilding the panel resets its selection to row 0; restore the row to the
+        # page actually being viewed so the thumbnail highlight stays put after save.
+        self._page_panel.set_current_page(self._current_page)
+        self._update_status(status)
+
     def save_pdf(self) -> bool:
         if not self._doc.doc:
             return False
@@ -308,15 +325,7 @@ class MainWindow(QMainWindow):
             return self.save_pdf_as()
         self._flush_annotations()
         if self._doc.save():
-            self._dirty = False
-            self._canvas.undo_stack.setClean()   # Ctrl+Z back here won't prompt to save
-            self._strip_baked_annotations()
-            self._canvas.drop_baked_image_items()  # avoid re-baking images on the next save
-            self._refresh_panel_thumbnails()  # keep panel in sync with the saved page state
-            # Rebuilding the panel resets its selection to row 0; restore the row to the
-            # page actually being viewed so the thumbnail highlight stays put after save.
-            self._page_panel.set_current_page(self._current_page)
-            self._update_status("Saved")
+            self._after_successful_save("Saved")
             return True
         QMessageBox.critical(self, "Save Error", "Could not save the PDF.")
         return False
@@ -329,15 +338,7 @@ class MainWindow(QMainWindow):
             return False
         self._flush_annotations()
         if self._doc.save(path):  # save() adopts `path` as the new canonical path
-            self._dirty = False
-            self._canvas.undo_stack.setClean()   # Ctrl+Z back here won't prompt to save
-            self._strip_baked_annotations()
-            self._canvas.drop_baked_image_items()  # avoid re-baking images on the next save
-            self._refresh_panel_thumbnails()  # keep panel in sync with the saved page state
-            # Rebuilding the panel resets its selection to row 0; restore the row to the
-            # page actually being viewed so the thumbnail highlight stays put after save.
-            self._page_panel.set_current_page(self._current_page)
-            self._update_status(f"Saved to {path}")
+            self._after_successful_save(f"Saved to {path}")
             return True
         QMessageBox.critical(self, "Save Error", "Could not save the PDF.")
         return False
@@ -434,6 +435,22 @@ class MainWindow(QMainWindow):
         if index == 1:  # Organizer tab — (re)load a fresh, current snapshot of the pages
             self._refresh_organizer()
 
+    def _make_markup_baked_render(self) -> PDFDocument:
+        """A throwaway PDFDocument whose pages carry the current unsaved overlays
+        baked in, for rendering thumbnails without mutating the live document.
+
+        Shared by the Organizer and the left page panel — both need a clone with
+        the same per-page markup baked in; only what they do with it differs.
+        Caller owns the returned render and must close it (see _close_* helpers).
+        """
+        dicts_by_page = {
+            pn: self._canvas.get_all_annotation_dicts(pn)
+            for pn in range(self._doc.page_count())
+        }
+        render = PDFDocument()
+        render.doc = self._doc.clone_with_annotations(dicts_by_page)
+        return render
+
     def _refresh_organizer(self):
         """Load the Organizer with current pages, baking unsaved markup into the
         thumbnails via a throwaway clone (so the live document isn't mutated)."""
@@ -443,13 +460,7 @@ class MainWindow(QMainWindow):
             return
         self._status.showMessage("Loading organizer…")
         QApplication.processEvents()
-        dicts_by_page = {
-            pn: self._canvas.get_all_annotation_dicts(pn)
-            for pn in range(self._doc.page_count())
-        }
-        clone = self._doc.clone_with_annotations(dicts_by_page)
-        self._org_render = PDFDocument()
-        self._org_render.doc = clone
+        self._org_render = self._make_markup_baked_render()
         self._organizer.set_document(self._doc, self._org_render)
         self._update_status()
 
@@ -475,13 +486,7 @@ class MainWindow(QMainWindow):
         if not self._doc.doc:
             self._page_panel.set_render_source(None)
             return
-        dicts_by_page = {
-            pn: self._canvas.get_all_annotation_dicts(pn)
-            for pn in range(self._doc.page_count())
-        }
-        clone = self._doc.clone_with_annotations(dicts_by_page)
-        self._panel_render = PDFDocument()
-        self._panel_render.doc = clone
+        self._panel_render = self._make_markup_baked_render()
         self._page_panel.set_render_source(self._panel_render)
 
     def _close_panel_render(self):

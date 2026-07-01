@@ -5,6 +5,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Signal, Qt, QSize, QTimer, QRect
 from PySide6.QtGui import QIcon, QPixmap, QColor
 
+from ui.thumbnails import aspect_ratio_placeholder
+
 
 THUMB_W = 100
 THUMB_H = 130
@@ -102,19 +104,11 @@ class PagePanel(QWidget):
 
     def _placeholder_for(self, page_num: int) -> QPixmap:
         """A grey placeholder sized to the page's real aspect ratio, so a landscape
-        drawing's thumbnail doesn't visibly change shape when it renders. Page size
-        is read without rasterising, so this stays cheap even for big documents."""
-        h = THUMB_H
-        if self._doc:
-            w_pt, h_pt = self._doc.get_page_size(page_num)
-            if w_pt > 0 and h_pt > 0:
-                h = max(1, min(THUMB_H, round(THUMB_W * h_pt / w_pt)))
-        pm = self._placeholder_cache.get(h)
-        if pm is None:
-            pm = QPixmap(THUMB_W, h)
-            pm.fill(self._placeholder_color)
-            self._placeholder_cache[h] = pm
-        return pm
+        drawing's thumbnail doesn't visibly change shape when it renders."""
+        return aspect_ratio_placeholder(
+            self._doc, page_num, THUMB_W, THUMB_H,
+            self._placeholder_color, self._placeholder_cache,
+        )
 
     def apply_palette(self, palette):
         """Theme the delegate (selection/hover/label) and placeholder fill, then
