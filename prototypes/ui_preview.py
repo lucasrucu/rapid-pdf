@@ -44,10 +44,10 @@ from __future__ import annotations
 import sys
 
 from PySide6.QtCore import Qt, QSize
-from PySide6.QtGui import QColor, QPainter, QPen, QPixmap, QIcon, QLinearGradient, QBrush
+from PySide6.QtGui import QColor, QPainter, QPen, QPixmap, QIcon
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QPushButton, QLabel, QFrame, QGraphicsDropShadowEffect, QSizePolicy,
+    QPushButton, QLabel, QGraphicsDropShadowEffect, QSizePolicy,
 )
 
 # Flip to True AND `pip install pywinstyles` to preview real Win11 Mica/acrylic.

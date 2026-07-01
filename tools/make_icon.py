@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 import sys
 
-from PySide6.QtCore import Qt, QRectF, QPointF
+from PySide6.QtCore import Qt, QRectF
 from PySide6.QtGui import (
     QGuiApplication, QPixmap, QPainter, QColor, QBrush, QPen, QFont,
     QPainterPath, QLinearGradient,
@@ -107,7 +107,6 @@ def main() -> int:
         import io
         imgs = []
         for pm in pixmaps:
-            buf = io.BytesIO()
             pm.save_to_png = None  # noqa
             ba = _qpixmap_to_png_bytes(pm)
             imgs.append(Image.open(io.BytesIO(ba)).convert("RGBA"))

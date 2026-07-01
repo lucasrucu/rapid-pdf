@@ -416,7 +416,6 @@ def apply_mica(window: QWidget, dark: bool) -> bool:
     non-Win11 / when pywinstyles isn't installed, so it's safe to always call."""
     try:
         import pywinstyles
-        style = "dark" if dark else "light"
         pywinstyles.apply_style(window, "mica")
         pywinstyles.change_header_color(window, "#1A1814" if dark else "#FAF7F0")
         try:
