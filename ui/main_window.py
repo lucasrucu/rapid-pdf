@@ -545,6 +545,13 @@ class MainWindow(QMainWindow):
             return
         thumb = self._canvas.grab_current_thumbnail(self._page_panel.thumb_width())
         self._page_panel.update_page_thumbnail(self._current_page, thumb)
+        # Patch the Organizer's thumbnail too, the same cheap way, so it doesn't
+        # lag behind the Editor tab until the next full tab-change rebuild (which
+        # re-clones the whole document via _refresh_organizer — much heavier).
+        # Grabbed at the organizer's own (larger) thumb width rather than reusing
+        # the panel's pixmap, so it isn't an upscaled/blurry copy.
+        org_thumb = self._canvas.grab_current_thumbnail(self._organizer.thumb_width())
+        self._organizer.update_page_thumbnail(self._current_page, org_thumb)
 
     def _update_status(self, extra: str = ""):
         self._update_title()

@@ -371,6 +371,30 @@ class PageOrganizer(QWidget):
             item.setIcon(QIcon(src.render_thumbnail(src_page, max_width=THUMB_W)))
             item.setData(_RENDERED, True)
 
+    def thumb_width(self) -> int:
+        return THUMB_W
+
+    def update_page_thumbnail(self, page_num: int, pixmap: QPixmap):
+        """Patch one page's thumbnail in place (e.g. after a live canvas edit),
+        instead of rebuilding the whole grid from a fresh markup-baked clone.
+
+        Mirrors PagePanel.update_page_thumbnail — same cheap "grab what the
+        canvas already rendered" pixmap, no PyMuPDF re-render and no throwaway
+        fitz clone. This is what keeps the Organizer's thumbnails from lagging
+        behind the Editor tab, which was patching its own panel this way already.
+
+        Looks the row up by _PAGE_ID rather than assuming row == page_num, since
+        a completed drag reorders the live doc while a partial edit that arrives
+        mid-drag must still land on the item representing that logical page."""
+        if not pixmap or pixmap.isNull():
+            return
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if item is not None and item.data(_PAGE_ID) == page_num:
+                item.setIcon(QIcon(pixmap))
+                item.setData(_RENDERED, True)
+                return
+
     def _update_buttons(self):
         has_doc = bool(self._doc and self._doc.doc)
         self._add_btn.setEnabled(has_doc)
