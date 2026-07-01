@@ -3,7 +3,7 @@
 ; setup wizard, Start-menu + optional desktop shortcut, uninstaller, app icon.
 ;
 ; Build:  "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" rapid-pdf.iss
-; Output: installer_output\rapid-pdf-setup-1.0.0.exe
+; Output: installer_output\rapid-pdf-setup-{#AppVersion}.exe
 ;
 ; Per-user install (PrivilegesRequired=lowest) -> installs to %LocalAppData%,
 ; NO UAC prompt. Smoother for a personal/showcase tool. Switch to a per-machine
@@ -11,7 +11,7 @@
 ; DefaultDirName to {autopf}.
 
 #define AppName "Rapid PDF"
-#define AppVersion "1.0.0"
+#define AppVersion "1.1.0"
 #define AppPublisher "Lucas Ruiz"
 #define AppExeName "rapid-pdf.exe"
 ; Stable GUID for upgrades/uninstall — keep this fixed across versions.

@@ -52,7 +52,7 @@ Confirm: window opens themed, a PDF opens, annotate/save works, light/dark toggl
 "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" rapid-pdf.iss
 ```
 
-Output: `installer_output\rapid-pdf-setup-1.0.0.exe`. Double-click to install
+Output: `installer_output\rapid-pdf-setup-<version>.exe` (e.g. `rapid-pdf-setup-1.1.0.exe`). Double-click to install
 (per-user, no UAC), launch from the Start menu, then test uninstall via Add/Remove
 Programs.
 
