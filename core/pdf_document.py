@@ -184,6 +184,66 @@ class PDFDocument:
             print(f"Save error: {e}")
             return False
 
+    # ------------------------------------------------------------------
+    # OCR ("Enhance for Search") — on-demand, explicit only
+    # ------------------------------------------------------------------
+
+    def page_has_text(self, page_num: int) -> bool:
+        """True if this page already carries an extractable text layer.
+
+        Used to skip pages that don't need OCR — most pages in a normal
+        editing session already have real text, so this keeps a full-document
+        OCR pass fast and avoids garbling/duplicating existing text.
+        """
+        if not self.doc or page_num >= len(self.doc):
+            return False
+        try:
+            return bool(self.doc[page_num].get_text().strip())
+        except Exception:
+            return False
+
+    def ocr_page(self, page_num: int, language: str = "eng", dpi: int = 150) -> bool:
+        """Replace this page's content with an OCR'd version carrying an
+        invisible, searchable text layer, via PyMuPDF/mupdf's built-in OCR
+        backend — no separate Tesseract install or tessdata files are
+        required for English at runtime (confirmed empirically on this
+        PyMuPDF build: page.get_pixmap(...).pdfocr_tobytes(tessdata=None)
+        finds its own bundled language data).
+
+        Only meant to be called on pages that fail page_has_text() (i.e.
+        scanned/image-only pages) — this rasterizes the page, so running it
+        on a page that already has real vector text/graphics would destroy
+        that content, not just add a text layer alongside it.
+
+        Note: fitz.Page.get_textpage_ocr() alone does NOT persist a text
+        layer into the saved file — it only returns an in-memory TextPage
+        for immediate extraction. Producing bytes via Pixmap.pdfocr_tobytes()
+        and splicing that in as the new page is what actually survives
+        doc.save() and a later reopen (verified by testing).
+
+        Returns True on success.
+        """
+        if not self.doc or page_num >= len(self.doc):
+            return False
+        page = self.doc[page_num]
+        try:
+            pix = page.get_pixmap(dpi=dpi)
+            ocr_bytes = pix.pdfocr_tobytes(compress=True, language=language, tessdata=None)
+            ocr_src = fitz.open("pdf", ocr_bytes)
+            try:
+                # Insert the OCR'd replacement right after the original, then
+                # drop the original — keeps this page's position in the
+                # document unchanged.
+                self.doc.insert_pdf(ocr_src, from_page=0, to_page=0, start_at=page_num + 1)
+            finally:
+                ocr_src.close()
+            self.doc.delete_page(page_num)
+            self.invalidate_render_page(page_num)
+            return True
+        except Exception as e:
+            print(f"OCR error (page {page_num}): {e}")
+            return False
+
     def remove_image_placement(self, page_num: int, xref: int) -> bool:
         """Remove the single content-stream draw of `xref` on this page, non-destructively.
 
