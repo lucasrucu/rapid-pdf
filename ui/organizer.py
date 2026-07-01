@@ -136,6 +136,13 @@ class _DragList(QListWidget):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._drag_row = None  # current drop-target row while a drag is over the grid, else None
+        # Edge autoscroll while dragging pages near the top/bottom of the viewport
+        # (mirrors the editor canvas: a timer nudges the scrollbar so a drag can
+        # reach pages that are currently off-screen).
+        self._autoscroll_timer = QTimer(self)
+        self._autoscroll_timer.setInterval(16)
+        self._autoscroll_timer.timeout.connect(self._do_autoscroll)
+        self._autoscroll_dy = 0
 
     def drag_target_row(self):
         """Row the drop indicator currently points at, or None when not dragging.
@@ -231,17 +238,42 @@ class _DragList(QListWidget):
     def dragMoveEvent(self, event):
         super().dragMoveEvent(event)
         pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        self._update_edge_autoscroll(pos)
         row = self._drop_row(pos)
         if row != self._drag_row:
             self._drag_row = row
             self.viewport().update()
 
+    def _update_edge_autoscroll(self, vp_pos):
+        """Start/adjust/stop vertical autoscroll based on cursor proximity to the
+        top/bottom viewport edge (within 40px). The grid only scrolls vertically,
+        so unlike the editor canvas this handles the y-axis only."""
+        edge = 40
+        h = self.viewport().height()
+        ay = 0
+        if vp_pos.y() < edge:
+            ay = -max(2, int((edge - vp_pos.y()) * 0.3))
+        elif vp_pos.y() > h - edge:
+            ay = max(2, int((vp_pos.y() - (h - edge)) * 0.3))
+        self._autoscroll_dy = ay
+        if ay:
+            if not self._autoscroll_timer.isActive():
+                self._autoscroll_timer.start()
+        else:
+            self._autoscroll_timer.stop()
+
+    def _do_autoscroll(self):
+        bar = self.verticalScrollBar()
+        bar.setValue(bar.value() + self._autoscroll_dy)
+
     def dragLeaveEvent(self, event):
+        self._autoscroll_timer.stop()
         self._drag_row = None
         self.viewport().update()
         super().dragLeaveEvent(event)
 
     def dropEvent(self, event):
+        self._autoscroll_timer.stop()
         self._drag_row = None
         n = self.count()
         rows = sorted({self.row(i) for i in self.selectedItems()})
