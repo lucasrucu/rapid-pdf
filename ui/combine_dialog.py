@@ -14,8 +14,8 @@ card painting) so combining feels identical to organizing.
 import os
 
 import fitz
-from PySide6.QtCore import Qt, QSize, QRect
-from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
+from PySide6.QtCore import Qt, QSize, QRect, QEvent
+from PySide6.QtGui import QColor, QGuiApplication, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QDialog, QHBoxLayout, QVBoxLayout, QLabel, QListWidget, QListWidgetItem,
     QMessageBox, QPushButton,
@@ -30,6 +30,11 @@ _PAYLOAD = Qt.ItemDataRole.UserRole + 10
 
 _NAME_MAX = 20   # characters of the file name shown on a card label
 
+# Card zoom bounds/step (Ctrl+wheel, Ctrl+Plus/Minus). The chosen zoom is
+# remembered for the rest of the app session, not persisted to disk.
+_ZOOM_MIN, _ZOOM_MAX, _ZOOM_STEP = 0.5, 2.2, 1.15
+_session_state = {"zoom": 1.0}
+
 
 class CombineDialog(QDialog):
     """Staging area for combining PDFs. Call merged_document() after exec()
@@ -39,7 +44,13 @@ class CombineDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Combine PDFs")
         self.setModal(True)
-        self.resize(760, 560)
+        # Combining is a whole-screen activity: open near-maximized (the
+        # dialog stays freely resizable, min size keeps the controls usable).
+        self.setMinimumSize(640, 480)
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        avail = screen.availableGeometry()
+        self.resize(int(avail.width() * 0.92), int(avail.height() * 0.92))
+        self._zoom = float(_session_state["zoom"])
 
         self._merged: fitz.Document | None = None
         self._sources: list[dict] = []   # {path, name, short, pd (PDFDocument)}
@@ -79,7 +90,8 @@ class CombineDialog(QDialog):
         self._expand_btn.clicked.connect(self._expand_selected)
         bar.addWidget(self._expand_btn)
         bar.addStretch()
-        hint = QLabel("Drag to reorder  ·  Double-click a file card to expand its pages")
+        hint = QLabel("Drag to reorder  ·  Double-click a file card to expand its pages"
+                      "  ·  Ctrl+wheel or Ctrl+/- to zoom")
         hint.setStyleSheet("font-size: 10px;")
         bar.addWidget(hint)
         layout.addLayout(bar)
@@ -91,8 +103,9 @@ class CombineDialog(QDialog):
         self._list.setWrapping(True)
         self._list.setResizeMode(QListWidget.ResizeMode.Adjust)
         self._list.setMovement(QListWidget.Movement.Static)
-        self._list.setIconSize(QSize(THUMB_W, THUMB_H))
-        self._list.setGridSize(QSize(ITEM_W, ITEM_H))
+        tw, th, iw, ih = self._sizes()
+        self._list.setIconSize(QSize(tw, th))
+        self._list.setGridSize(QSize(iw, ih))
         self._list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
         self._list.setDefaultDropAction(Qt.DropAction.MoveAction)
         self._list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
@@ -123,6 +136,16 @@ class CombineDialog(QDialog):
         buttons.addWidget(self._combine_btn)
         layout.addLayout(buttons)
 
+        # Card zoom: Ctrl+wheel on the grid, plus keyboard shortcuts.
+        self._list.viewport().installEventFilter(self)
+        for keys, delta in ((QKeySequence.StandardKey.ZoomIn, +1),
+                            (QKeySequence.StandardKey.ZoomOut, -1)):
+            sc = QShortcut(keys, self)
+            sc.activated.connect(lambda d=delta: self._zoom_step(d))
+        for keys, delta in (("Ctrl+=", +1), ("+", +1), ("-", -1)):
+            sc = QShortcut(QKeySequence(keys), self)
+            sc.activated.connect(lambda d=delta: self._zoom_step(d))
+
     def _populate(self):
         for src_idx in range(len(self._sources)):
             self._list.addItem(self._make_unit_item(src_idx))
@@ -132,12 +155,19 @@ class CombineDialog(QDialog):
     # Cards
     # ------------------------------------------------------------------
 
+    def _sizes(self) -> tuple[int, int, int, int]:
+        """(thumb_w, thumb_h, item_w, item_h) at the current zoom."""
+        f = self._zoom
+        return (max(40, int(THUMB_W * f)), max(52, int(THUMB_H * f)),
+                max(56, int(ITEM_W * f)), max(76, int(ITEM_H * f)))
+
     def _make_unit_item(self, src_idx: int) -> QListWidgetItem:
         src = self._sources[src_idx]
         count = src["pd"].page_count()
+        _, _, iw, ih = self._sizes()
         item = QListWidgetItem(QIcon(self._unit_pixmap(src_idx)),
                                f"{src['short']}  ({count} pg)")
-        item.setSizeHint(QSize(ITEM_W, ITEM_H))
+        item.setSizeHint(QSize(iw, ih))
         item.setData(_PAYLOAD, ("unit", src_idx))
         item.setToolTip(f"{src['name']}: {count} page(s). "
                         f"Double-click to expand into pages.")
@@ -145,9 +175,10 @@ class CombineDialog(QDialog):
 
     def _make_page_item(self, src_idx: int, page_idx: int) -> QListWidgetItem:
         src = self._sources[src_idx]
-        thumb = src["pd"].render_thumbnail(page_idx, max_width=THUMB_W)
+        tw, _, iw, ih = self._sizes()
+        thumb = src["pd"].render_thumbnail(page_idx, max_width=tw)
         item = QListWidgetItem(QIcon(thumb), f"{src['short']}  p.{page_idx + 1}")
-        item.setSizeHint(QSize(ITEM_W, ITEM_H))
+        item.setSizeHint(QSize(iw, ih))
         item.setData(_PAYLOAD, ("page", src_idx, page_idx))
         item.setToolTip(f"{src['name']}, page {page_idx + 1}")
         return item
@@ -157,14 +188,15 @@ class CombineDialog(QDialog):
         of offset sheets peeking out behind it, so a file unit reads
         differently from a single page."""
         src = self._sources[src_idx]
-        front = src["pd"].render_thumbnail(0, max_width=THUMB_W - 14)
-        canvas = QPixmap(THUMB_W, THUMB_H)
+        tw, th, _, _ = self._sizes()
+        front = src["pd"].render_thumbnail(0, max_width=tw - 14)
+        canvas = QPixmap(tw, th)
         canvas.fill(Qt.GlobalColor.transparent)
         p = QPainter(canvas)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         fw, fh = front.width(), front.height()
-        x = (THUMB_W - fw - 12) // 2
-        y = max(0, (THUMB_H - fh - 12) // 2)
+        x = (tw - fw - 12) // 2
+        y = max(0, (th - fh - 12) // 2)
         # Back sheets (plain pages), then the front thumbnail on top.
         p.setPen(QColor(0, 0, 0, 60))
         for off in (12, 6):
@@ -175,6 +207,43 @@ class CombineDialog(QDialog):
         p.drawRect(QRect(x, y, fw, fh))
         p.end()
         return canvas
+
+    # ------------------------------------------------------------------
+    # Zoom (Ctrl+wheel, Ctrl+Plus/Minus, bare +/-)
+    # ------------------------------------------------------------------
+
+    def eventFilter(self, obj, event):
+        if (obj is self._list.viewport()
+                and event.type() == QEvent.Type.Wheel
+                and event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            self._zoom_step(1 if event.angleDelta().y() > 0 else -1)
+            return True   # eaten: don't also scroll the grid
+        return super().eventFilter(obj, event)
+
+    def _zoom_step(self, direction: int):
+        factor = self._zoom * (_ZOOM_STEP if direction > 0 else 1 / _ZOOM_STEP)
+        self._set_zoom(factor)
+
+    def _set_zoom(self, factor: float):
+        factor = max(_ZOOM_MIN, min(_ZOOM_MAX, factor))
+        if abs(factor - self._zoom) < 1e-3:
+            return
+        self._zoom = factor
+        _session_state["zoom"] = factor   # remembered for this app session
+        tw, th, iw, ih = self._sizes()
+        self._list.setIconSize(QSize(tw, th))
+        self._list.setGridSize(QSize(iw, ih))
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            payload = item.data(_PAYLOAD)
+            item.setSizeHint(QSize(iw, ih))
+            if payload[0] == "unit":
+                item.setIcon(QIcon(self._unit_pixmap(payload[1])))
+            else:
+                thumb = self._sources[payload[1]]["pd"].render_thumbnail(
+                    payload[2], max_width=tw)
+                item.setIcon(QIcon(thumb))
+        self._list.viewport().update()
 
     def _retag(self):
         """Keep _PAGE_ID (the drag machinery's identity role) equal to the

@@ -4,7 +4,12 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QTabWidget,
     QFileDialog, QMessageBox, QStatusBar, QApplication, QPushButton,
 )
+from PySide6.QtCore import QSettings, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QShortcut, QIcon
+
+# Debounce for search-as-you-type: long enough that fast typing doesn't
+# re-scan the document per keystroke, short enough to feel live.
+SEARCH_DEBOUNCE_MS = 220
 
 from core.pdf_document import PDFDocument
 from core.resources import app_icon_path
@@ -35,6 +40,10 @@ class MainWindow(QMainWindow):
         self._search_hits: list = []   # [(page_num, fitz.Rect), ...]
         self._search_index = -1
         self._search_term = None       # term the hits were computed for
+        self._search_timer = QTimer(self)   # search-as-you-type debounce
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(SEARCH_DEBOUNCE_MS)
+        self._search_timer.timeout.connect(self._run_live_search)
         self._update_title()
         self.setMinimumSize(1100, 720)
         icon_path = app_icon_path()
@@ -186,6 +195,17 @@ class MainWindow(QMainWindow):
         self._add_action(pm, "Delete Current Page", self.delete_current_page)
 
         vm = mb.addMenu("View")
+        # Side page panel show/hide, remembered across runs.
+        self._panel_action = QAction("Show Page Panel", self)
+        self._panel_action.setCheckable(True)
+        self._panel_action.setShortcut("Ctrl+B")
+        self._panel_action.toggled.connect(self._on_panel_toggled)
+        vm.addAction(self._panel_action)
+        panel_visible = QSettings("Lucas", "Rapid PDF").value(
+            "ui/page_panel_visible", True, type=bool)
+        self._panel_action.setChecked(panel_visible)
+        self._page_panel.setVisible(panel_visible)   # setChecked(False) fires no toggle
+        vm.addSeparator()
         self._theme_action = QAction("Dark Mode", self)
         self._theme_action.setShortcut("Ctrl+D")
         self._theme_action.triggered.connect(self._toggle_theme)
@@ -199,6 +219,10 @@ class MainWindow(QMainWindow):
 
     def _toggle_theme(self):
         self._theme.toggle()
+
+    def _on_panel_toggled(self, checked: bool):
+        self._page_panel.setVisible(checked)
+        QSettings("Lucas", "Rapid PDF").setValue("ui/page_panel_visible", checked)
 
     def _add_action(self, menu, label: str, slot, shortcut=None):
         action = QAction(label, self)
@@ -515,13 +539,42 @@ class MainWindow(QMainWindow):
         self._search_bar.open_and_focus()
 
     def _on_search_term_changed(self, term: str):
-        # Invalidate cached hits; the search itself runs on Enter/arrows so
-        # typing in a big document doesn't re-scan every page per keystroke.
+        # Invalidate cached hits on every edit. Search-as-you-type kicks in
+        # from the SECOND character (debounced); a single character would
+        # light up half the document, so it only searches on Enter.
         self._search_term = None
-        if not term:
-            self._search_hits = []
-            self._search_index = -1
-            self._search_bar.set_count_text("")
+        term = term.strip()
+        if len(term) >= 2:
+            self._search_timer.start()   # restart: debounce while typing
+            return
+        self._search_timer.stop()
+        self._search_hits = []
+        self._search_index = -1
+        self._search_bar.set_count_text("")
+        self._canvas.clear_search_hits()
+
+    def _run_live_search(self):
+        """Debounce landing: search the typed term and jump to the first hit
+        at or after the current page (same landing rule as Enter)."""
+        if not self._doc.doc or not self._search_bar.isVisible():
+            return
+        term = self._search_bar.term().strip()
+        if len(term) < 2 or term == self._search_term:
+            return
+        self._compute_hits(term)
+        if not self._search_hits:
+            return
+        start = next((i for i, (pn, _) in enumerate(self._search_hits)
+                      if pn >= self._current_page), 0)
+        self._search_index = start
+        self._goto_current_hit()
+
+    def _compute_hits(self, term: str):
+        self._search_hits = self._doc.search_text(term)
+        self._search_term = term
+        self._search_index = -1
+        if not self._search_hits:
+            self._search_bar.set_count_text("No matches")
             self._canvas.clear_search_hits()
 
     def _search_step(self, delta: int):
@@ -530,13 +583,10 @@ class MainWindow(QMainWindow):
         term = self._search_bar.term().strip()
         if not term:
             return
+        self._search_timer.stop()   # Enter beats a pending live search
         if term != self._search_term:
-            self._search_hits = self._doc.search_text(term)
-            self._search_term = term
-            self._search_index = -1
+            self._compute_hits(term)
         if not self._search_hits:
-            self._search_bar.set_count_text("No matches")
-            self._canvas.clear_search_hits()
             return
         n = len(self._search_hits)
         if self._search_index < 0:
@@ -546,6 +596,11 @@ class MainWindow(QMainWindow):
             self._search_index = start if delta >= 0 else (start - 1) % n
         else:
             self._search_index = (self._search_index + delta) % n
+        self._goto_current_hit()
+
+    def _goto_current_hit(self):
+        """Update the counter and bring the active hit into view."""
+        n = len(self._search_hits)
         self._search_bar.set_count_text(f"{self._search_index + 1} of {n} matches")
         page, _ = self._search_hits[self._search_index]
         if page != self._current_page:
@@ -573,6 +628,7 @@ class MainWindow(QMainWindow):
         self._apply_search_highlights()
 
     def _on_search_closed(self):
+        self._search_timer.stop()
         self._search_hits = []
         self._search_index = -1
         self._search_term = None
