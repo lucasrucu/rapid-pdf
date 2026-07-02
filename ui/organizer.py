@@ -150,23 +150,41 @@ class _DragList(QListWidget):
         return self._drag_row
 
     def startDrag(self, supportedActions):
-        """Replace Qt's default multi-item drag rendering (every selected item
-        painted near its own original position, which reads as the whole grid
-        smearing across the screen) with a single fanned card-stack pixmap that
-        follows the cursor as one unit.
+        """Run EVERY drag (single- and multi-item) through our own QDrag, never
+        Qt's native QAbstractItemView.startDrag.
 
-        This only changes what's painted under the cursor during the drag —
-        the actual reorder on drop is unaffected (still handled by dropEvent's
-        manual take/reinsert, which already merges the selection into one block
-        wherever it lands)."""
+        This does two jobs at once:
+
+        1. Visuals: a single fanned card-stack pixmap follows the cursor as one
+           unit, instead of Qt's default rendering (every selected item painted
+           near its own original position, which reads as the whole grid
+           smearing across the screen).
+
+        2. Correctness (the disappearing-card bug): the native startDrag has a
+           post-drop step (qabstractitemview.cpp, Qt 6.11) that runs when
+           drag->exec() reports a MoveAction and the view's own base dropEvent
+           didn't perform the move:
+
+               if (drag->exec(...) == Qt::MoveAction && !d->dropEventMoved) {
+                   if (dragDropMode() != InternalMove || drag->target() == viewport())
+                       d->clearOrRemove();
+               }
+
+           Our dropEvent below replaces the base implementation entirely (it
+           must, see the class docstring), so dropEventMoved is never set and
+           Qt "cleans up" by removeRows()-ing the current selection, which our
+           dropEvent just re-pointed at the moved cards. Net effect: the card
+           the user dragged was moved by us, then deleted by Qt. Owning the
+           whole drag means nothing runs after exec(): drops our dropEvent
+           handled are already done, and drops it never saw (outside the grid,
+           on another widget, on the desktop) are a strict no-op, so the card
+           snaps back where it was."""
         rows = sorted({self.row(i) for i in self.selectedItems()})
-        if len(rows) <= 1:
-            super().startDrag(supportedActions)
+        if not rows:
             return
 
         mime = self.model().mimeData([self.model().index(r, 0) for r in rows])
         if mime is None:
-            super().startDrag(supportedActions)
             return
 
         drag = QDrag(self)
@@ -175,6 +193,7 @@ class _DragList(QListWidget):
         drag.setPixmap(pixmap)
         drag.setHotSpot(hotspot)
         drag.exec(supportedActions, Qt.DropAction.MoveAction)
+        # Deliberately nothing here: never remove/clear items after a drag.
 
     def _stack_pixmap(self, rows):
         """Build a fanned card-stack pixmap from the selected rows' thumbnails:
@@ -275,6 +294,12 @@ class _DragList(QListWidget):
     def dropEvent(self, event):
         self._autoscroll_timer.stop()
         self._drag_row = None
+        # Internal reorder only: a drop that didn't start in this grid has no
+        # rows of ours to move. Ignoring (not accepting) also means the source
+        # sees a failed drop, so nothing anywhere gets removed.
+        if event.source() is not self:
+            event.ignore()
+            return
         n = self.count()
         rows = sorted({self.row(i) for i in self.selectedItems()})
         if not rows:

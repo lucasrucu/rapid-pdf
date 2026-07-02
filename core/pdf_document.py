@@ -6,6 +6,20 @@ import tempfile
 from collections import OrderedDict
 from PySide6.QtGui import QPixmap, QImage
 
+from core.resources import bundled_tessdata_dir
+
+
+def _resolve_tessdata() -> str | None:
+    """Language data folder for the OCR engine embedded in PyMuPDF.
+
+    Precedence: an explicit TESSDATA_PREFIX (the user knows best, e.g. for
+    extra languages) > the bundled assets/tessdata folder (ships with the
+    app, so OCR works on machines with no Tesseract install) > None, which
+    lets PyMuPDF hunt for an installed Tesseract-OCR like before."""
+    if os.environ.get("TESSDATA_PREFIX"):
+        return None   # pdfocr_tobytes reads the env var itself
+    return bundled_tessdata_dir()
+
 
 RAPID_PDF_TAG = "rapid-pdf"
 # Name of the embedded file that carries the editable annotation model, so a
@@ -74,6 +88,16 @@ class PDFDocument:
     def invalidate_render_cache(self):
         """Drop the whole cache (doc reopened/saved, pages reordered/deleted)."""
         self._render_cache.clear()
+
+    def adopt(self, fitz_doc):
+        """Take ownership of an in-memory fitz document (e.g. the Combine
+        dialog's merged output). The document has no path yet, so the first
+        save is forced through Save As; nothing touches disk until then."""
+        if self.doc:
+            self.doc.close()
+        self.invalidate_render_cache()
+        self.doc = fitz_doc
+        self.path = None
 
     def open(self, path: str) -> bool:
         try:
@@ -219,11 +243,8 @@ class PDFDocument:
 
     def ocr_page(self, page_num: int, language: str = "eng", dpi: int = 150) -> bool:
         """Replace this page's content with an OCR'd version carrying an
-        invisible, searchable text layer, via PyMuPDF/mupdf's built-in OCR
-        backend — no separate Tesseract install or tessdata files are
-        required for English at runtime (confirmed empirically on this
-        PyMuPDF build: page.get_pixmap(...).pdfocr_tobytes(tessdata=None)
-        finds its own bundled language data).
+        invisible, searchable text layer, via the Tesseract engine compiled
+        into PyMuPDF (no tesseract.exe needed at runtime).
 
         Only meant to be called on pages that fail page_has_text() (i.e.
         scanned/image-only pages) — this rasterizes the page, so running it
@@ -236,28 +257,67 @@ class PDFDocument:
         and splicing that in as the new page is what actually survives
         doc.save() and a later reopen (verified by testing).
 
-        Returns True on success.
+        Dependency note: the OCR ENGINE is embedded in PyMuPDF, but the
+        LANGUAGE DATA is not. _resolve_tessdata() supplies it: a user-set
+        TESSDATA_PREFIX first, then the bundled assets/tessdata (ships in
+        the installer, so OCR works on machines without Tesseract), then
+        PyMuPDF's own hunt for an installed Tesseract-OCR. Only if all
+        three come up empty does this raise RuntimeError("No tessdata
+        specified and Tesseract is not installed"). Callers must surface
+        errors to the user instead of swallowing them.
+
+        Returns True on success; raises on OCR failure so the caller can
+        report the real reason (the old behavior of returning False buried
+        the missing-tessdata error).
         """
         if not self.doc or page_num >= len(self.doc):
             return False
         page = self.doc[page_num]
+        pix = page.get_pixmap(dpi=dpi)
+        ocr_bytes = pix.pdfocr_tobytes(compress=True, language=language,
+                                       tessdata=_resolve_tessdata())
+        ocr_src = fitz.open("pdf", ocr_bytes)
         try:
-            pix = page.get_pixmap(dpi=dpi)
-            ocr_bytes = pix.pdfocr_tobytes(compress=True, language=language, tessdata=None)
-            ocr_src = fitz.open("pdf", ocr_bytes)
+            # Insert the OCR'd replacement right after the original, then
+            # drop the original, which keeps this page's position in the
+            # document unchanged.
+            self.doc.insert_pdf(ocr_src, from_page=0, to_page=0, start_at=page_num + 1)
+        finally:
+            ocr_src.close()
+        self.doc.delete_page(page_num)
+        self.invalidate_render_page(page_num)
+        return True
+
+    def page_char_count(self, page_num: int) -> int:
+        """Number of extractable text characters on the page (0 = no text
+        layer). Used to verify, in-app, that an OCR pass actually produced
+        searchable text."""
+        if not self.doc or page_num >= len(self.doc):
+            return 0
+        try:
+            return len(self.doc[page_num].get_text().strip())
+        except Exception:
+            return 0
+
+    def text_layer_report(self) -> list[int]:
+        """Per-page character counts for the whole document, index = page."""
+        return [self.page_char_count(pn) for pn in range(self.page_count())]
+
+    def search_text(self, needle: str) -> list[tuple[int, "fitz.Rect"]]:
+        """Find every occurrence of `needle` (case-insensitive, as PyMuPDF
+        does) across the document. Returns [(page_num, rect), ...] in page
+        order; rects are in the page's displayed coordinate space, the same
+        space render_page rasterises (so scene coords = rect * zoom)."""
+        hits: list[tuple[int, fitz.Rect]] = []
+        if not self.doc or not needle:
+            return hits
+        for pn in range(len(self.doc)):
             try:
-                # Insert the OCR'd replacement right after the original, then
-                # drop the original — keeps this page's position in the
-                # document unchanged.
-                self.doc.insert_pdf(ocr_src, from_page=0, to_page=0, start_at=page_num + 1)
-            finally:
-                ocr_src.close()
-            self.doc.delete_page(page_num)
-            self.invalidate_render_page(page_num)
-            return True
-        except Exception as e:
-            print(f"OCR error (page {page_num}): {e}")
-            return False
+                for r in self.doc[pn].search_for(needle):
+                    hits.append((pn, r))
+            except Exception as e:
+                print(f"Search error (page {pn}): {e}")
+        return hits
 
     def remove_image_placement(self, page_num: int, xref: int) -> bool:
         """Remove the single content-stream draw of `xref` on this page, non-destructively.

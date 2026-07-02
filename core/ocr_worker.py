@@ -2,22 +2,39 @@
 
 Runs PDFDocument.ocr_page() for every page that lacks a text layer, on a
 QThread so the UI never blocks. Only pages that page_has_text() reports as
-empty are touched — a document that's already fully searchable finishes near
-instantly with nothing to do.
+empty are touched, so a document that's already fully searchable finishes
+near instantly with nothing to do.
+
+Threading model (the part that bit us in v1.1.0): signals from the worker
+must land in slots of a QObject that LIVES ON THE UI THREAD. Connecting a
+cross-thread signal to a plain Python closure does not queue to the main
+thread, not even with an explicit QueuedConnection. PySide6 has no receiver
+QObject to resolve a thread from, so the closure executes on the emitting
+(worker) thread. That meant:
+  - dialog.setValue()/setLabelText() ran on the worker thread (GUI calls off
+    the GUI thread, which crashes or misbehaves depending on the machine),
+  - QTimer.singleShot(0, dialog.close) scheduled its timer on the WORKER
+    thread's event loop, and the very next line (thread.quit()) stopped that
+    loop, so the timer never fired and the progress dialog never closed.
+    That is the "stuck at page N of N" hang seen in the field.
+_OcrUiController below is a real QObject parented to the UI; its slots are
+therefore delivered on the UI thread via Qt's normal auto-queued mechanism.
 """
 
-from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
 
 
 class OCRWorker(QObject):
     """Runs on a QThread. Talks back to the UI thread only via signals."""
 
-    # (pages_done, pages_total) — emitted after each page is checked/OCR'd.
+    # (page_index_0_based, pages_total), emitted when a page STARTS being
+    # checked/OCR'd, so the dialog shows the page currently in progress.
     progress = Signal(int, int)
     # Emitted once, at the end, with the count of pages actually OCR'd.
     finished = Signal(int)
-    # Emitted if something raised while OCR-ing a specific page (non-fatal —
-    # the worker keeps going with the remaining pages).
+    # Emitted if OCR failed on a specific page (non-fatal, the worker keeps
+    # going with the remaining pages). Carries the error text so the UI can
+    # surface a real reason (e.g. Tesseract language data missing).
     page_error = Signal(int, str)
 
     def __init__(self, doc, language: str = "eng", dpi: int = 150):
@@ -38,26 +55,76 @@ class OCRWorker(QObject):
         for page_num in range(total):
             if self._cancelled:
                 break
+            self.progress.emit(page_num, total)
             if not self._doc.page_has_text(page_num):
                 try:
                     if self._doc.ocr_page(page_num, language=self._language, dpi=self._dpi):
                         ocred += 1
                 except Exception as e:
                     self.page_error.emit(page_num, str(e))
-            self.progress.emit(page_num + 1, total)
         self.finished.emit(ocred)
+
+
+class _OcrUiController(QObject):
+    """Lives on the UI thread; every slot below is delivered there because
+    cross-thread signal connections to a QObject's methods auto-queue."""
+
+    def __init__(self, dialog, worker, thread, on_done, parent=None):
+        super().__init__(parent)
+        self._dialog = dialog
+        self._worker = worker
+        self._thread = thread
+        self._on_done = on_done
+        self._ocred = 0
+        self._cancelled = False
+        self._finishing = False   # guards the canceled-on-close feedback loop
+        self._errors: list[tuple[int, str]] = []
+
+    @Slot(int, int)
+    def on_progress(self, page_num: int, total: int):
+        self._dialog.setMaximum(max(total, 1))
+        self._dialog.setValue(page_num)
+        self._dialog.setLabelText(f"Checking page {page_num + 1} of {total}…")
+
+    @Slot(int, str)
+    def on_page_error(self, page_num: int, message: str):
+        self._errors.append((page_num, message))
+        print(f"OCR error on page {page_num + 1}: {message}")
+
+    @Slot()
+    def on_cancel(self):
+        # QProgressDialog.closeEvent() emits canceled() as part of any close,
+        # including the programmatic close below. Without this guard a normal
+        # completion would be misreported as user-cancelled.
+        if self._finishing:
+            return
+        self._cancelled = True
+        self._worker.cancel()
+        self._dialog.setLabelText("Cancelling…")
+
+    @Slot(int)
+    def on_worker_finished(self, ocred_count: int):
+        self._ocred = ocred_count
+        self._finishing = True
+        self._dialog.close()
+        self._thread.quit()
+
+    @Slot()
+    def on_thread_finished(self):
+        self._dialog.deleteLater()
+        self._on_done(self._ocred, self._cancelled, list(self._errors))
 
 
 def run_ocr_enhance(parent_widget, doc, on_done):
     """Kick off the OCR pass on a background thread with a modal progress
-    dialog. `on_done(ocred_count, cancelled)` is called on the UI thread once
-    the worker finishes or is cancelled.
+    dialog. `on_done(ocred_count, cancelled, errors)` is called on the UI
+    thread once the worker finishes or is cancelled; `errors` is a list of
+    (page_num, message) for pages whose OCR failed.
 
-    Returns the QThread (kept alive by the caller holding a reference) so the
-    caller can decide what to do afterward (e.g. re-save the document).
+    Returns (thread, worker); the caller holds references so neither is
+    garbage-collected mid-run.
     """
     from PySide6.QtWidgets import QProgressDialog
-    from PySide6.QtCore import Qt, QTimer
 
     thread = QThread(parent_widget)
     worker = OCRWorker(doc)
@@ -73,56 +140,17 @@ def run_ocr_enhance(parent_widget, doc, on_done):
     dialog.setAutoReset(False)
     dialog.setValue(0)
 
-    state = {"cancelled": False}
+    controller = _OcrUiController(dialog, worker, thread, on_done, parent=parent_widget)
 
-    def on_progress(done, total):
-        dialog.setMaximum(max(total, 1))
-        dialog.setValue(done)
-        dialog.setLabelText(f"Checking page {done} of {total}…")
-
-    def on_page_error(page_num, message):
-        print(f"OCR error on page {page_num + 1}: {message}")
-
-    def on_cancel():
-        state["cancelled"] = True
-        worker.cancel()
-        dialog.setLabelText("Cancelling…")
-
-    def on_worker_finished(ocred_count):
-        # Defer dialog.close() to the next event-loop iteration rather than
-        # calling it synchronously from inside this slot. Closing a
-        # WindowModal QProgressDialog while still nested inside delivery of
-        # the cross-thread `finished` signal was observed (empirically, via
-        # manual testing) to hang indefinitely — QTimer.singleShot(0, ...)
-        # lets the current signal delivery unwind first.
-        QTimer.singleShot(0, dialog.close)
-        # Ask the thread's event loop to stop. Do NOT block here with
-        # thread.wait() — calling it synchronously from inside a slot that is
-        # itself being delivered through the event loop can stall well past
-        # the thread actually finishing (observed empirically: wait() timed
-        # out even though the worker's run() had already returned). Instead,
-        # defer on_done() to QThread.finished, which Qt fires once the
-        # thread's loop has genuinely stopped.
-        state["ocred"] = ocred_count
-        thread.quit()
-
-    def on_thread_finished():
-        on_done(state.get("ocred", 0), state["cancelled"])
-
-    # worker.progress/finished/page_error fire from the worker's own thread.
-    # on_progress/on_worker_finished/on_page_error touch GUI widgets (the
-    # dialog), which is only legal on the main thread. worker is a QObject
-    # moved to `thread`, so connections FROM its signals auto-queue correctly
-    # — but the receivers here are plain closures with no thread affinity of
-    # their own, so force QueuedConnection explicitly rather than relying on
-    # Qt's auto-detection (which caused these to run in-thread and freeze the
-    # dialog's paint/event handling during manual testing).
+    # worker signals fire on the worker thread; the controller is a QObject on
+    # the UI thread, so Qt's AutoConnection queues these to the UI thread.
     thread.started.connect(worker.run)
-    worker.progress.connect(on_progress, Qt.ConnectionType.QueuedConnection)
-    worker.page_error.connect(on_page_error, Qt.ConnectionType.QueuedConnection)
-    worker.finished.connect(on_worker_finished, Qt.ConnectionType.QueuedConnection)
-    thread.finished.connect(on_thread_finished)
-    dialog.canceled.connect(on_cancel)
+    worker.progress.connect(controller.on_progress)
+    worker.page_error.connect(controller.on_page_error)
+    worker.finished.connect(controller.on_worker_finished)
+    thread.finished.connect(controller.on_thread_finished)
+    thread.finished.connect(worker.deleteLater)
+    dialog.canceled.connect(controller.on_cancel)
 
     thread.start()
     dialog.show()
