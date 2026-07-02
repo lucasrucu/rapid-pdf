@@ -75,6 +75,16 @@ class PDFDocument:
         """Drop the whole cache (doc reopened/saved, pages reordered/deleted)."""
         self._render_cache.clear()
 
+    def adopt(self, fitz_doc):
+        """Take ownership of an in-memory fitz document (e.g. the Combine
+        dialog's merged output). The document has no path yet, so the first
+        save is forced through Save As; nothing touches disk until then."""
+        if self.doc:
+            self.doc.close()
+        self.invalidate_render_cache()
+        self.doc = fitz_doc
+        self.path = None
+
     def open(self, path: str) -> bool:
         try:
             if self.doc:

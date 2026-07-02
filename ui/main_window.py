@@ -14,6 +14,7 @@ from ui.toolbar import ToolBar
 from ui.page_panel import PagePanel
 from ui.organizer import PageOrganizer
 from ui.search_bar import SearchBar
+from ui.combine_dialog import CombineDialog
 from ui.theme import ThemeManager, apply_mica, themed_icon
 
 
@@ -153,6 +154,7 @@ class MainWindow(QMainWindow):
 
         fm = mb.addMenu("File")
         self._add_action(fm, "Open / Combine PDFs…", self.open_pdf, QKeySequence.StandardKey.Open)
+        self._add_action(fm, "Combine PDFs…", self.combine_pdfs)
         self._add_action(fm, "Close PDF", self.close_pdf)
         fm.addSeparator()
         self._add_action(fm, "Save", self.save_pdf, QKeySequence.StandardKey.Save)
@@ -231,6 +233,12 @@ class MainWindow(QMainWindow):
             )
             return
 
+        # Multiple files with nothing open: stage the combine (Adobe-style)
+        # instead of merging blindly in filename order.
+        if len(paths) > 1:
+            self._combine_with_dialog(paths)
+            return
+
         # No document yet → open the first file, then append any others.
         if not self._doc.open(paths[0]):
             QMessageBox.critical(self, "Error", f"Could not open:\n{paths[0]}")
@@ -256,6 +264,45 @@ class MainWindow(QMainWindow):
         self._update_status(
             f"Combined {len(paths)} files" if len(paths) > 1 else ""
         )
+
+    def combine_pdfs(self):
+        """File > Combine PDFs: pick files, stage them as movable cards, merge
+        only when Combine is clicked. Any open document is closed first (with
+        the usual save prompt)."""
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Combine PDFs", "", "PDF Files (*.pdf)"
+        )
+        if not paths:
+            return
+        if self._doc.doc:
+            self.close_pdf()          # prompts to save; may be cancelled
+            if self._doc.doc:
+                return                # user backed out, keep the open doc
+        self._combine_with_dialog(sorted(paths))
+
+    def _combine_with_dialog(self, paths: list):
+        """Run the staged-combine dialog and adopt its merged output.
+
+        The dialog holds everything in memory: cancelling (or closing it)
+        leaves the app and every input file exactly as they were."""
+        dlg = CombineDialog(paths, palette=self._theme.palette, parent=self)
+        if dlg.exec() != CombineDialog.DialogCode.Accepted:
+            return
+        merged = dlg.merged_document()
+        if merged is None or len(merged) == 0:
+            if merged is not None:
+                merged.close()
+            return
+        self._doc.adopt(merged)       # untitled: first save goes to Save As
+        self._canvas.set_document(self._doc)
+        self._page_panel.set_document(self._doc)
+        self._current_page = 0
+        self._search_hits = []
+        self._search_index = -1
+        self._search_term = None
+        self._mark_dirty()
+        self._refresh_panel_thumbnails()
+        self._update_status(f"Combined {len(paths)} files (not saved yet)")
 
     def _append_pdfs(self, paths) -> int:
         """Insert each PDF's pages at the end of the current doc. Returns pages added."""
