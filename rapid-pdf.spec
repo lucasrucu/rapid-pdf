@@ -18,6 +18,11 @@ Notes baked in from docs/build.md research:
 
 from PyInstaller.utils.hooks import collect_data_files
 
+# assets/ includes assets/tessdata/eng.traineddata (~4 MB, tessdata_fast,
+# Apache-2.0): the Tesseract language data the OCR feature needs at runtime.
+# PyMuPDF embeds the OCR engine itself, so this file is the ONLY OCR
+# dependency that has to ship; without it, OCR only works on machines that
+# happen to have Tesseract-OCR installed. See assets/tessdata/README.txt.
 datas = [("assets", "assets")]
 datas += collect_data_files("qtawesome")  # bundle the icon-font files
 

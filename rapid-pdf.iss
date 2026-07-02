@@ -49,7 +49,9 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 ; The whole PyInstaller onedir folder. The wildcard + recursesubdirs pulls every
-; DLL, Qt plugin, and bundled asset.
+; DLL, Qt plugin, and bundled asset. That includes assets\tessdata\
+; eng.traineddata (the OCR language data; PyMuPDF embeds the engine, this
+; file is the only OCR dependency that must ship).
 Source: "dist\rapid-pdf\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
