@@ -4,7 +4,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QTabWidget,
     QFileDialog, QMessageBox, QStatusBar, QApplication, QPushButton,
 )
-from PySide6.QtCore import QSettings, QTimer
+from PySide6.QtCore import QSettings, QTimer, Qt
 from PySide6.QtGui import QAction, QKeySequence, QShortcut, QIcon
 
 # Debounce for search-as-you-type: long enough that fast typing doesn't
@@ -246,8 +246,13 @@ class MainWindow(QMainWindow):
         )
         if not paths:
             return
-        paths = sorted(paths)  # combine in filename order
+        self.open_paths(sorted(paths))  # combine in filename order
 
+    def open_paths(self, paths: list):
+        """Open/append the given PDF paths (shared by the Open dialog and the
+        shell/CLI launch path)."""
+        if not paths:
+            return
         # A document is already open → append the chosen PDFs to the end.
         if self._doc.doc:
             added = self._append_pdfs(paths)
@@ -303,6 +308,31 @@ class MainWindow(QMainWindow):
             if self._doc.doc:
                 return                # user backed out, keep the open doc
         self._combine_with_dialog(sorted(paths))
+
+    def handle_cli_files(self, files: list, combine: bool):
+        """One aggregated shell/CLI launch batch (see core.single_instance).
+
+        Several files together, or an explicit --combine verb, go to the
+        staged Combine dialog as whole-file cards; a lone file opens (or
+        appends, matching the Open menu's behavior). Also pulls the window to
+        the front, since the launch came from Explorer, not from the app.
+        """
+        # Un-minimize and raise: the user just acted in Explorer.
+        self.setWindowState((self.windowState() & ~Qt.WindowState.WindowMinimized)
+                            | Qt.WindowState.WindowActive)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        if not files:
+            return
+        if combine or len(files) > 1:
+            if self._doc.doc:
+                self.close_pdf()      # prompts to save; may be cancelled
+                if self._doc.doc:
+                    return
+            self._combine_with_dialog(files)
+        else:
+            self.open_paths(files)
 
     def _combine_with_dialog(self, paths: list):
         """Run the staged-combine dialog and adopt its merged output.
