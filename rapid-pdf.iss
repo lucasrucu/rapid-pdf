@@ -26,6 +26,9 @@ AppVerName={#AppName} {#AppVersion}
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
+; Skip the "where to install" page: per-user installs always land in
+; %LocalAppData%\Programs\Rapid PDF, no reason to ask.
+DisableDirPage=yes
 PrivilegesRequired=lowest
 OutputDir=installer_output
 OutputBaseFilename=rapid-pdf-setup-{#AppVersion}
