@@ -11,7 +11,7 @@
 ; DefaultDirName to {autopf}.
 
 #define AppName "Rapid PDF"
-#define AppVersion "1.1.0"
+#define AppVersion "1.2.0"
 #define AppPublisher "Lucas Ruiz"
 #define AppExeName "rapid-pdf.exe"
 ; Stable GUID for upgrades/uninstall — keep this fixed across versions.
