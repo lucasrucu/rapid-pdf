@@ -13,6 +13,7 @@ from ui.canvas import PDFCanvas
 from ui.toolbar import ToolBar
 from ui.page_panel import PagePanel
 from ui.organizer import PageOrganizer
+from ui.search_bar import SearchBar
 from ui.theme import ThemeManager, apply_mica, themed_icon
 
 
@@ -29,6 +30,10 @@ class MainWindow(QMainWindow):
         self._force_quit = False # Quit menu wants a real app quit, not "close PDF"
         self._ocr_thread = None  # active OCR QThread, or None when idle
         self._ocr_worker = None  # keep a ref alive alongside the thread
+        # Text-search state (driven by the Ctrl+F bar)
+        self._search_hits: list = []   # [(page_num, fitz.Rect), ...]
+        self._search_index = -1
+        self._search_term = None       # term the hits were computed for
         self._update_title()
         self.setMinimumSize(1100, 720)
         icon_path = app_icon_path()
@@ -89,7 +94,23 @@ class MainWindow(QMainWindow):
         # Keep the title/modified indicator in sync whenever the undo stack crosses
         # the clean boundary (e.g. Ctrl+Z back to saved state clears the * marker).
         self._canvas.undo_stack.cleanChanged.connect(self._on_clean_changed)
-        editor_layout.addWidget(self._canvas, stretch=1)
+
+        # Search bar sits above the canvas, hidden until Ctrl+F.
+        self._search_bar = SearchBar()
+        self._search_bar.search_changed.connect(self._on_search_term_changed)
+        self._search_bar.next_requested.connect(lambda: self._search_step(1))
+        self._search_bar.prev_requested.connect(lambda: self._search_step(-1))
+        self._search_bar.closed.connect(self._on_search_closed)
+        # Re-apply highlights once a (debounced) page render lands, since
+        # _load_page clears any overlays that belonged to the previous page.
+        self._canvas.page_loaded.connect(self._on_canvas_page_loaded)
+
+        canvas_col = QVBoxLayout()
+        canvas_col.setContentsMargins(0, 0, 0, 0)
+        canvas_col.setSpacing(0)
+        canvas_col.addWidget(self._search_bar)
+        canvas_col.addWidget(self._canvas, stretch=1)
+        editor_layout.addLayout(canvas_col, stretch=1)
 
         self._toolbar = ToolBar()
         self._toolbar.tool_changed.connect(self._canvas.set_tool)
@@ -148,6 +169,8 @@ class MainWindow(QMainWindow):
         redo_act.setShortcut(QKeySequence.StandardKey.Redo)
         em.addAction(undo_act)
         em.addAction(redo_act)
+        em.addSeparator()
+        self._add_action(em, "Find…", self._open_search, QKeySequence.StandardKey.Find)
         em.addSeparator()
         self._add_action(em, "Copy", self.copy_selection, QKeySequence.StandardKey.Copy)
         self._add_action(em, "Paste", self.paste, QKeySequence.StandardKey.Paste)
@@ -218,6 +241,10 @@ class MainWindow(QMainWindow):
         self._canvas.set_document(self._doc)
         self._page_panel.set_document(self._doc)
         self._current_page = 0
+        # Stale search hits reference the previous document's pages.
+        self._search_hits = []
+        self._search_index = -1
+        self._search_term = None
         if len(paths) == 1:
             # A single freshly opened file may carry an editable model to restore.
             self._load_saved_annotations()
@@ -289,6 +316,8 @@ class MainWindow(QMainWindow):
             return
         self._close_org_render()
         self._close_panel_render()
+        self._search_bar.hide()
+        self._on_search_closed()
         self._doc.close()
         self._dirty = False
         self._canvas.set_document(self._doc)
@@ -365,10 +394,10 @@ class MainWindow(QMainWindow):
             self, self._doc, self._on_ocr_finished
         )
 
-    def _on_ocr_finished(self, ocred_count: int, cancelled: bool):
+    def _on_ocr_finished(self, ocred_count: int, cancelled: bool, errors: list):
         self._ocr_thread = None
         self._ocr_worker = None
-        # OCR rewrote page content streams directly on the live document —
+        # OCR rewrote page content streams directly on the live document, so
         # every cached render is stale and the panel/current page must be
         # redrawn from the new (now-searchable) page content.
         self._doc.invalidate_render_cache()
@@ -377,22 +406,131 @@ class MainWindow(QMainWindow):
         self._page_panel.set_current_page(self._current_page)
 
         if cancelled:
-            self._update_status(f"OCR cancelled — {ocred_count} page(s) enhanced before stopping")
+            self._update_status(f"OCR cancelled: {ocred_count} page(s) enhanced before stopping")
+        elif errors and ocred_count == 0:
+            self._update_status("OCR failed (no pages enhanced)")
         elif ocred_count == 0:
             self._update_status("OCR: no pages needed enhancing (already searchable)")
         else:
             self._update_status(f"OCR: enhanced {ocred_count} page(s) for search")
 
+        # Surface real failures instead of burying them in the console. The
+        # big one in the field: no Tesseract language data on the machine.
+        if errors and not cancelled:
+            first = errors[0][1]
+            if "tesseract" in first.lower() or "tessdata" in first.lower():
+                detail = ("OCR needs the Tesseract language data, which was not "
+                          "found on this computer.\n\nInstall Tesseract-OCR (UB "
+                          "Mannheim build) or set the TESSDATA_PREFIX environment "
+                          "variable, then try again.")
+            else:
+                detail = f"First error: {first}"
+            QMessageBox.warning(
+                self, "OCR Problem",
+                f"OCR failed on {len(errors)} page(s). {ocred_count} page(s) "
+                f"were enhanced.\n\n{detail}",
+            )
+
         if ocred_count:
             self._mark_dirty()
+            # In-app verification: per-page text layer check, so the user gets
+            # proof the document is now searchable (plus Ctrl+F to try it).
+            counts = self._doc.text_layer_report()
+            no_text = [i + 1 for i, c in enumerate(counts) if c == 0]
+            if no_text:
+                shown = ", ".join(str(p) for p in no_text[:15])
+                more = "…" if len(no_text) > 15 else ""
+                verify = (f"Text layer check: {len(counts) - len(no_text)} of "
+                          f"{len(counts)} pages searchable. Still no text on "
+                          f"page(s) {shown}{more}.")
+            else:
+                verify = (f"Text layer check: all {len(counts)} pages now carry "
+                          f"searchable text ({sum(counts)} characters total). "
+                          f"Try it with Ctrl+F.")
             reply = QMessageBox.question(
                 self, "Save Now?",
-                f"Enhanced {ocred_count} page(s) for search. Save now?",
+                f"Enhanced {ocred_count} page(s) for search.\n\n{verify}\n\nSave now?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.Yes,
             )
             if reply == QMessageBox.StandardButton.Yes:
                 self.save_pdf()
+
+    # ------------------------------------------------------------------
+    # Text search (Ctrl+F)
+    # ------------------------------------------------------------------
+
+    def _open_search(self):
+        if not self._doc.doc:
+            QMessageBox.warning(self, "No PDF", "Open a PDF first.")
+            return
+        self._tabs.setCurrentIndex(0)   # search lives in the Editor view
+        self._search_bar.open_and_focus()
+
+    def _on_search_term_changed(self, term: str):
+        # Invalidate cached hits; the search itself runs on Enter/arrows so
+        # typing in a big document doesn't re-scan every page per keystroke.
+        self._search_term = None
+        if not term:
+            self._search_hits = []
+            self._search_index = -1
+            self._search_bar.set_count_text("")
+            self._canvas.clear_search_hits()
+
+    def _search_step(self, delta: int):
+        if not self._doc.doc:
+            return
+        term = self._search_bar.term().strip()
+        if not term:
+            return
+        if term != self._search_term:
+            self._search_hits = self._doc.search_text(term)
+            self._search_term = term
+            self._search_index = -1
+        if not self._search_hits:
+            self._search_bar.set_count_text("No matches")
+            self._canvas.clear_search_hits()
+            return
+        n = len(self._search_hits)
+        if self._search_index < 0:
+            # First jump: land on the first hit at or after the current page.
+            start = next((i for i, (pn, _) in enumerate(self._search_hits)
+                          if pn >= self._current_page), 0)
+            self._search_index = start if delta >= 0 else (start - 1) % n
+        else:
+            self._search_index = (self._search_index + delta) % n
+        self._search_bar.set_count_text(f"{self._search_index + 1} of {n} matches")
+        page, _ = self._search_hits[self._search_index]
+        if page != self._current_page:
+            self._current_page = page
+            self._canvas.set_page(page, immediate=True)   # loads + emits page_loaded
+            self._page_panel.set_current_page(page)
+            self._update_status()
+        else:
+            self._apply_search_highlights()
+
+    def _apply_search_highlights(self):
+        """Paint every hit on the current page; emphasise the active one."""
+        if not self._search_bar.isVisible() or not self._search_hits:
+            return
+        page_rects = [(i, r) for i, (pn, r) in enumerate(self._search_hits)
+                      if pn == self._current_page]
+        rects = [r for _, r in page_rects]
+        current = next((k for k, (i, _) in enumerate(page_rects)
+                        if i == self._search_index), -1)
+        self._canvas.set_search_hits(rects, current)
+
+    def _on_canvas_page_loaded(self, page_num: int):
+        # _load_page just cleared any overlays; put back the ones that belong
+        # to this page (no-op when the search bar is closed).
+        self._apply_search_highlights()
+
+    def _on_search_closed(self):
+        self._search_hits = []
+        self._search_index = -1
+        self._search_term = None
+        self._canvas.clear_search_hits()
+        self._canvas.setFocus()
 
     def _delete_key(self):
         """Delete (keypad) routes by active tab: pages in the Organizer, else
@@ -701,6 +839,8 @@ class MainWindow(QMainWindow):
             if self._maybe_save_before_close():
                 self._close_org_render()
                 self._close_panel_render()
+                self._search_bar.hide()
+                self._on_search_closed()
                 self._doc.close()
                 self._dirty = False
                 self._canvas.set_document(self._doc)

@@ -640,6 +640,7 @@ class PDFCanvas(QGraphicsView):
     selection_changed = Signal(dict)
     page_changed = Signal(int)   # canvas-initiated page turn (continuous scroll)
     fit_mode_broken = Signal()   # emitted when the user zooms manually while fit is active
+    page_loaded = Signal(int)    # a page render just completed (search bar re-applies hits)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -707,6 +708,9 @@ class PDFCanvas(QGraphicsView):
 
         # In-app annotation clipboard (clones of copied items)
         self._clipboard_items: list = []
+
+        # Transient text-search highlight overlays (current page only)
+        self._search_items: list = []
 
         # Copy-confirmation flash: a brief pulsing outline over the copied items
         self._flash_items: list = []
@@ -815,7 +819,8 @@ class PDFCanvas(QGraphicsView):
         self._embedded_images_page = -1
         self._pending_page = None
         self._current_page = 0
-        self._scene.clear()
+        self._scene.clear()          # deletes any search overlays C++-side too
+        self._search_items = []
         self._bg_item = None
         self._undo_stack.clear()
         self._cancel_interaction()
@@ -843,6 +848,49 @@ class PDFCanvas(QGraphicsView):
             self._render_pending_page()
         else:
             self._page_timer.start(PAGE_RENDER_DEBOUNCE_MS)
+
+    # ------------------------------------------------------------------
+    # Text-search highlights (transient, never part of the annotation model)
+    # ------------------------------------------------------------------
+
+    def set_search_hits(self, rects, current_index: int = -1):
+        """Overlay translucent boxes for text-search hits on the CURRENT page.
+
+        `rects` are fitz.Rects in the page's displayed coordinate space (what
+        PDFDocument.search_text returns); scene coords are that times _zoom.
+        The hit at `current_index` is emphasised and scrolled into view.
+        These are plain QGraphicsRectItems, NOT AnnotationBase, so the canvas's
+        picking/serialisation only ever looks at AnnotationBase, so search
+        overlays can't be dragged, saved, or copied.
+        """
+        self.clear_search_hits()
+        z = self._zoom
+        current_item = None
+        for i, r in enumerate(rects):
+            rect = QRectF(r.x0 * z, r.y0 * z,
+                          (r.x1 - r.x0) * z, (r.y1 - r.y0) * z).adjusted(-2, -2, 2, 2)
+            item = self._scene.addRect(rect)
+            if i == current_index:
+                item.setBrush(QColor(241, 174, 4, 120))   # accent, stronger
+                item.setPen(QPen(QColor(241, 174, 4), 1.5))
+                current_item = item
+            else:
+                item.setBrush(QColor(255, 235, 59, 80))   # soft yellow wash
+                item.setPen(QPen(Qt.PenStyle.NoPen))
+            item.setZValue(40)
+            item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self._search_items.append(item)
+        if current_item is not None:
+            self.centerOn(current_item)
+
+    def clear_search_hits(self):
+        for item in self._search_items:
+            try:
+                if item.scene() is not None:
+                    self._scene.removeItem(item)
+            except RuntimeError:
+                pass   # C++ side already deleted (e.g. scene.clear on close)
+        self._search_items = []
 
     def set_tool(self, tool: str):
         self._cancel_interaction()
@@ -1429,6 +1477,9 @@ class PDFCanvas(QGraphicsView):
         return self._embedded_images
 
     def _load_page(self, page_num: int):
+        # Search overlays belong to the page they were computed for; drop them
+        # on any (re)load; the search bar re-applies for the new page.
+        self.clear_search_hits()
         # Cached render: page switches that land back on a page+zoom already shown
         # (back/forth navigation, reload-after-strip, organizer round-trips) reuse
         # the rasterised pixmap instead of re-rendering an A1 page (~120ms each).
@@ -1462,6 +1513,7 @@ class PDFCanvas(QGraphicsView):
 
         self._apply_pending_scroll()
         self._apply_fit_if_active()
+        self.page_loaded.emit(page_num)
 
     def _apply_pending_scroll(self):
         """Position a continuous-scroll page turn at the top/bottom of the new page.
