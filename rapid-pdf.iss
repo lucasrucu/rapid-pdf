@@ -11,7 +11,7 @@
 ; DefaultDirName to {autopf}.
 
 #define AppName "Rapid PDF"
-#define AppVersion "1.2.0"
+#define AppVersion "1.2.1"
 #define AppPublisher "Lucas Ruiz"
 #define AppExeName "rapid-pdf.exe"
 ; Stable GUID for upgrades/uninstall — keep this fixed across versions.
@@ -40,6 +40,12 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+; Do NOT inherit task choices from a previous install: 1.1.0 stored
+; desktopicon=unchecked in its uninstall log, so an upgrade would silently
+; keep skipping the desktop icon even though it now defaults to on
+; (verified: 1.1.0 -> 1.2.1 /SILENT upgrade produced no desktop shortcut
+; until this line was added).
+UsePreviousTasks=no
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -92,6 +98,9 @@ Root: HKCU; Subkey: "Software\Classes\RapidPDF.Document\shell\combine\command"; 
 Root: HKCU; Subkey: "Software\Classes\.pdf\OpenWithProgids"; ValueType: string; ValueName: "RapidPDF.Document"; ValueData: ""; Flags: uninsdeletevalue
 ; Default Programs registration: appears in Settings > Default apps so the
 ; user CAN pick Rapid PDF for .pdf. Selectable, never forced, never prompted.
+; The parent key is removed too when uninstall leaves it empty (verified: with
+; only the Capabilities entry flagged, an empty Software\Rapid PDF lingered).
+Root: HKCU; Subkey: "Software\{#AppName}"; ValueType: none; Flags: uninsdeletekeyifempty
 Root: HKCU; Subkey: "Software\{#AppName}\Capabilities"; ValueType: string; ValueName: "ApplicationName"; ValueData: "{#AppName}"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\{#AppName}\Capabilities"; ValueType: string; ValueName: "ApplicationDescription"; ValueData: "Fast PDF page management and markup"
 Root: HKCU; Subkey: "Software\{#AppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".pdf"; ValueData: "RapidPDF.Document"
