@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Signal, Qt, QSize, QRect, QTimer, QPoint
 from PySide6.QtGui import QIcon, QColor, QPixmap, QPainter, QDrag
 
-from ui.thumbnails import aspect_ratio_placeholder
+from ui.thumbnails import aspect_ratio_placeholder, draw_thumbnail
 
 THUMB_W = 160
 THUMB_H = 210
@@ -87,12 +87,7 @@ class _ThumbDelegate(QStyledItemDelegate):
         if icon is not None:
             area = QRect(inner.x(), inner.y(), inner.width(),
                          max(1, inner.height() - self._TEXT_H - self._LABEL_GAP))
-            pm = icon.pixmap(area.size())
-            painter.drawPixmap(
-                area.x() + (area.width() - pm.width()) // 2,
-                area.y() + (area.height() - pm.height()) // 2,
-                pm,
-            )
+            draw_thumbnail(painter, icon, area)
         text = index.data(Qt.ItemDataRole.DisplayRole)
         if text:
             painter.setPen(self.sel_text_color if selected else self.text_color)
@@ -433,7 +428,7 @@ class PageOrganizer(QWidget):
         self._list.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
         self._list.verticalScrollBar().valueChanged.connect(self._render_visible)
         layout.addWidget(self._list)
-        self._placeholder_cache: dict[int, QPixmap] = {}
+        self._placeholder_cache: dict[tuple[int, int], QPixmap] = {}
 
     def set_document(self, doc, render=None):
         """doc = live document (edited in place). render = optional doc whose pages

@@ -23,6 +23,20 @@ SETTLE_MS = 140
 # Minimum drag distance (scene units) before a press over an embedded image lifts
 # it — kept well above double-click jitter so a click/double-click never lifts.
 LIFT_DRAG_THRESHOLD = 8
+# How close to a scrollbar end still counts as "nothing left to scroll" when
+# deciding whether to turn the page. A fractional view transform can leave the
+# bar a pixel short of its maximum, and without a little slack the last press or
+# wheel tick before a page turn does nothing at all.
+_SCROLL_EDGE_TOLERANCE_PX = 2
+# Arrow keys that turn a page once their axis has no scroll left: forward (+1)
+# on Down/Right, back (-1) on Up/Left. Mirrors the wheel, which turns forward
+# scrolling past the bottom and back past the top.
+_PAGE_TURN_ARROWS = {
+    Qt.Key.Key_Down: 1,
+    Qt.Key.Key_Right: 1,
+    Qt.Key.Key_Up: -1,
+    Qt.Key.Key_Left: -1,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -1542,6 +1556,44 @@ class PDFCanvas(QGraphicsView):
         self.page_changed.emit(target)   # main window mirrors panel + status
         return True
 
+    def _turn_page_at_edge(self, bar, delta: int) -> bool:
+        """Turn a page if `bar` has nothing left to scroll in the `delta` direction.
+
+        delta is +1 for forward (next page) or -1 for back. Returns True when the
+        page actually turned, so the caller knows to swallow the event.
+
+        The one place that decides "there is nothing left to scroll, so turn the
+        page". Both the wheel and the arrow keys call it, so they cannot end up
+        disagreeing about when a page turn happens. A page that fits the viewport
+        entirely has minimum() == maximum(), so it turns on the first press.
+        """
+        if delta > 0:
+            at_edge = bar.value() >= bar.maximum() - _SCROLL_EDGE_TOLERANCE_PX
+        else:
+            at_edge = bar.value() <= bar.minimum() + _SCROLL_EDGE_TOLERANCE_PX
+        return at_edge and self._goto_adjacent_page(delta)
+
+    def _arrow_turns_page(self, key, mods, auto_repeat: bool) -> bool:
+        """Handle Down/Right/Up/Left as a page turn when the page is scrolled out.
+
+        Down and Right go forward, Up and Left go back, each measured against the
+        scrollbar for its own axis: when the page fits, that axis has no scroll
+        range and the key pages straight away.
+
+        Auto-repeat never turns a page. Holding an arrow still scrolls the page
+        smoothly (Qt's own repeat handling does that); it just stops at the edge
+        instead of flipping through pages faster than anyone can read them. A
+        deliberate fresh press turns the page.
+        """
+        if auto_repeat or mods != Qt.KeyboardModifier.NoModifier:
+            return False
+        delta = _PAGE_TURN_ARROWS.get(key)
+        if delta is None:
+            return False
+        vertical = key in (Qt.Key.Key_Up, Qt.Key.Key_Down)
+        bar = self.verticalScrollBar() if vertical else self.horizontalScrollBar()
+        return self._turn_page_at_edge(bar, delta)
+
     def _compute_embedded_images(self, page_num: int) -> list:
         """List (xref, PDF-coord Rect) for every raster image currently drawn on the page.
 
@@ -2187,10 +2239,10 @@ class PDFCanvas(QGraphicsView):
             # its bottom) — like Adobe.
             vbar = self.verticalScrollBar()
             dy = event.angleDelta().y()
-            if dy < 0 and vbar.value() >= vbar.maximum() and self._goto_adjacent_page(1):
+            if dy < 0 and self._turn_page_at_edge(vbar, 1):
                 event.accept()
                 return
-            if dy > 0 and vbar.value() <= vbar.minimum() and self._goto_adjacent_page(-1):
+            if dy > 0 and self._turn_page_at_edge(vbar, -1):
                 event.accept()
                 return
             self._mark_interacting()   # fast scaling while panning the page
@@ -2221,6 +2273,9 @@ class PDFCanvas(QGraphicsView):
                 self._push(NudgeCommand(self, items, dx, dy))
                 self._mark_interacting()
                 self.annotation_changed.emit()
+            elif self._arrow_turns_page(key, mods, event.isAutoRepeat()):
+                # Nothing left to scroll that way, so the arrow paged instead.
+                event.accept()
             else:
                 super().keyPressEvent(event)
         elif key == Qt.Key.Key_BracketRight and mods & Qt.KeyboardModifier.ControlModifier:
