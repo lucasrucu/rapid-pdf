@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Signal, Qt, QSize, QTimer, QRect, QEvent
 from PySide6.QtGui import QIcon, QPixmap, QColor
 
-from ui.thumbnails import aspect_ratio_placeholder
+from ui.thumbnails import aspect_ratio_placeholder, draw_thumbnail, fit_size
 
 
 # Reference cell proportions. The ACTUAL cell width is derived from the list
@@ -61,12 +61,7 @@ class _PageDelegate(QStyledItemDelegate):
         if icon is not None:
             thumb_area = QRect(inner.x(), inner.y(), inner.width(),
                                max(1, inner.height() - _TEXT_H - self._LABEL_GAP))
-            pm = icon.pixmap(thumb_area.size())
-            painter.drawPixmap(
-                thumb_area.x() + (thumb_area.width() - pm.width()) // 2,
-                thumb_area.y() + (thumb_area.height() - pm.height()) // 2,
-                pm,
-            )
+            draw_thumbnail(painter, icon, thumb_area)
 
         text = index.data(Qt.ItemDataRole.DisplayRole)
         if text:
@@ -101,9 +96,13 @@ class PagePanel(QWidget):
         self._render = None
         # Rows whose real thumbnail has been rendered (others show a placeholder).
         self._rendered: set[int] = set()
-        self._placeholder_cache: dict[int, QPixmap] = {}
+        self._placeholder_cache: dict[tuple[int, int], QPixmap] = {}
         self._placeholder_color = QColor("#F3EFE6")  # themed via apply_palette()
-        self._thumb_w = THUMB_W   # actual render width, derived from viewport
+        # Live thumbnail box, derived from the viewport (see _apply_layout). It is
+        # the delegate's thumb_area, so a thumbnail rendered to it always fits
+        # inside its own selection border.
+        self._thumb_w = THUMB_W
+        self._thumb_h = THUMB_H
         self._setup_ui()
         self.setFixedWidth(PANEL_W)
 
@@ -115,9 +114,8 @@ class PagePanel(QWidget):
     def _placeholder_for(self, page_num: int) -> QPixmap:
         """A grey placeholder sized to the page's real aspect ratio, so a landscape
         drawing's thumbnail doesn't visibly change shape when it renders."""
-        thumb_h = max(40, int(self._thumb_w * THUMB_H / THUMB_W))
         return aspect_ratio_placeholder(
-            self._doc, page_num, self._thumb_w, thumb_h,
+            self._doc, page_num, self._thumb_w, self._thumb_h,
             self._placeholder_color, self._placeholder_cache,
         )
 
@@ -203,17 +201,28 @@ class PagePanel(QWidget):
         cell_w = max(60, vw - 2 * self._list.spacing())
         return QSize(cell_w, int(cell_w * ITEM_H / ITEM_W))
 
+    def _adopt_cell(self, cell: QSize):
+        """Take `cell` as the cell size and derive the thumbnail box from it.
+
+        The box is the delegate's thumb_area exactly, worked out from the same
+        padding constants the delegate paints with, so the rendered thumbnail
+        and the border drawn around it can never disagree. Single seam: both
+        refresh() and _apply_layout() go through here.
+        """
+        self._delegate.cell = cell
+        pad = 2 * (_PageDelegate._PAD + 4)   # backing inset + inner inset, both sides
+        self._thumb_w = max(40, cell.width() - pad)
+        self._thumb_h = max(40, cell.height() - pad - _TEXT_H
+                            - _PageDelegate._LABEL_GAP)
+        self._list.setIconSize(QSize(self._thumb_w, self._thumb_h))
+        self._placeholder_cache.clear()
+
     def _apply_layout(self):
         """Fit cells to the current viewport width and re-render at that size."""
         cell = self._cell_size()
         if cell == self._delegate.cell:
             return
-        self._delegate.cell = cell
-        # 16 = delegate padding (4 backing + 4 inner, each side)
-        self._thumb_w = max(40, cell.width() - 16)
-        self._list.setIconSize(QSize(self._thumb_w,
-                                     max(40, cell.height() - _TEXT_H - 16)))
-        self._placeholder_cache.clear()
+        self._adopt_cell(cell)
         self._rendered.clear()   # thumbnails must be re-rendered at the new width
         for i in range(self._list.count()):
             self._list.item(i).setSizeHint(cell)
@@ -226,8 +235,7 @@ class PagePanel(QWidget):
         self._list.clear()
         self._rendered.clear()
         cell = self._cell_size()
-        self._delegate.cell = cell
-        self._thumb_w = max(40, cell.width() - 16)
+        self._adopt_cell(cell)
         if self._doc:
             for i in range(self._doc.page_count()):
                 item = QListWidgetItem(QIcon(self._placeholder_for(i)), str(i + 1))
@@ -241,6 +249,20 @@ class PagePanel(QWidget):
         self._render_visible()
         QTimer.singleShot(0, self._render_visible)
 
+    def _render_width(self, page_num: int) -> int:
+        """Width to rasterise page `page_num` at so it fits the box in BOTH axes.
+
+        Rendering every page at the full box width overshoots for anything taller
+        than the box (a portrait page comes out taller than the cell), and those
+        extra pixels only get thrown away again when the delegate fits it into
+        the cell. Ask for the fitted width up front instead.
+        """
+        if self._doc:
+            w_pt, h_pt = self._doc.get_page_size(page_num)
+            if w_pt > 0 and h_pt > 0:
+                return fit_size(w_pt, h_pt, self._thumb_w, self._thumb_h)[0]
+        return self._thumb_w
+
     def _render_visible(self):
         """Render real thumbnails for any not-yet-rendered rows in (or near) view."""
         if not self._doc:
@@ -252,7 +274,8 @@ class PagePanel(QWidget):
             item = self._list.item(i)
             if item is None or not self._list.visualItemRect(item).intersects(vp):
                 continue
-            thumb = self._render_source().render_thumbnail(i, max_width=self._thumb_w)
+            thumb = self._render_source().render_thumbnail(
+                i, max_width=self._render_width(i))
             item.setIcon(QIcon(thumb))
             self._rendered.add(i)
 
