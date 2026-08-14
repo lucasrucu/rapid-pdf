@@ -1,0 +1,3 @@
+# Dev-only. The frozen build installs requirements.txt and nothing from here.
+-r requirements.txt
+pytest>=7.0

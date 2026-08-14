@@ -72,6 +72,17 @@ class CombineDialog(QDialog):
         self._setup_ui(palette)
         self._populate()
 
+    def apply_palette(self, palette):
+        """Theme the thumbnail delegate, the same call the page panel, organizer,
+        toolbar and canvas take. The palette still arrives by constructor because
+        this dialog is built fresh on every Combine and closed again, so it never
+        has to survive a light/dark toggle, but the tinting itself now goes
+        through the one method name the rest of the UI uses."""
+        self._delegate.sel_color = QColor(palette.accent)
+        self._delegate.hover_color = QColor(palette.surface_hover)
+        self._delegate.text_color = QColor(palette.text_dim)
+        self._delegate.sel_text_color = QColor(palette.accent_text)
+
     # ------------------------------------------------------------------
     # UI
     # ------------------------------------------------------------------
@@ -115,10 +126,7 @@ class CombineDialog(QDialog):
         self._list.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
         self._delegate = _ThumbDelegate(self._list)
         if palette is not None:
-            self._delegate.sel_color = QColor(palette.selection)
-            self._delegate.hover_color = QColor(palette.surface)
-            self._delegate.text_color = QColor(palette.text_dim)
-            self._delegate.sel_text_color = QColor(palette.selection_text)
+            self.apply_palette(palette)
         self._list.setItemDelegate(self._delegate)
         self._list.reordered.connect(lambda order: self._retag())
         self._list.reorder_invalid.connect(self._retag)

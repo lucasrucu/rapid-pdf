@@ -1,13 +1,12 @@
 """
-Qori theme module — a reusable light/dark QSS theme for PySide6 desktop apps.
+Qori theme module, a reusable light/dark QSS theme for PySide6 desktop apps.
 
 WHY THIS EXISTS
 ---------------
 rapid-pdf is the first of Lucas's desktop apps to adopt the "Qori" design
-language (his personal brand: Quechua for "gold" — cream + amber/gold). The same
-look should carry into VideoOS and any future PySide6 tool, so this module is
-written to be DROPPED IN WHOLE: copy `ui/theme.py`, call `apply_theme(app, ...)`,
-and the whole app picks up the palette.
+language, and the same look should carry into VideoOS and any future PySide6
+tool, so this module is written to be DROPPED IN WHOLE: copy `ui/theme.py`,
+call `apply_theme(app, ...)`, and the whole app picks up the palette.
 
 STRUCTURE (so it ports cleanly)
 -------------------------------
@@ -17,26 +16,62 @@ STRUCTURE (so it ports cleanly)
 - `ThemeManager`   : holds the current mode, applies the QSS to a QApplication,
                      toggles light<->dark, persists the choice via QSettings, and
                      emits `theme_changed` so widgets can re-tint code-drawn bits
-                     (icons, scene backgrounds) that QSS can't reach.
+                     (icons, scene backgrounds, canvas selection chrome) that QSS
+                     can't reach.
 - `apply_theme()`  : one-line convenience for `main.py`.
 - helpers          : `themed_icon()` (qtawesome with graceful fallback),
                      `accent_shadow()` (the glow QSS can't draw).
 
-DESIGN NOTES
-------------
-- Qt QSS has NO transitions/animations and NO box-shadow on widgets. Depth comes
-  from gradients (in QSS) plus QGraphicsDropShadowEffect (in code). This mirrors
-  the approved prototype in prototypes/ui_preview.py.
-- LIGHT is the default per Lucas. The Sovereign palette is warm: cream surfaces,
-  amber/gold accent (#F1AE04), matching finance.qori.land.
-- Tokens are named by ROLE (surface, surface_raised, border, accent…), never by
-  literal color, so the dark variant is a drop-in swap and VideoOS can re-skin by
-  editing one Palette.
+GRAPHITE, ONE ACCENT
+--------------------
+Near-monochrome. Nothing carries color except a single accent, and the accent
+appears on very few things: the active tool, the current selection (pages,
+thumbnails, canvas handles), a checked button, and the active tab's underline.
+Menus and hover states move on surface value instead, so the accent keeps
+meaning "this is the thing you are acting on".
+
+The neutral ramp is Radix `slate`, the published sRGB values, each step used
+for the role Radix defines for it:
+
+    step 1  app background      -> window
+    step 2  subtle background   -> surface (panels, toolbars, lists)
+    step 3  component           -> surface_raised (control fill)
+    step 4  component hover     -> surface_hover
+    step 5  component active    -> surface_active (pressed)
+    step 6  subtle border       -> border (also the scrollbar handle)
+    step 7  interactive border  -> border_strong (hover/focus, handle hover)
+    step 10 low-contrast text   -> text_faint
+    step 11 secondary text      -> text_dim
+    step 12 high-contrast text  -> text
+
+`canvas` is the one neutral with no Radix role: it is the work area behind the
+page, and its whole job is to make a white page the brightest thing on screen.
+Dark sits below step 1; light sits at step 8, because "further from the content"
+in a light theme means darker, not lighter.
+
+SOLID COLORS ONLY
+-----------------
+No gradients anywhere, no shadow standing in for a border, no glass. Depth comes
+from surface VALUE (each layer one step lighter), which is why the hover and
+active steps exist as tokens instead of hover being a border swap. There is a
+test that fails if a gradient function ever reappears in the stylesheet.
+
+THE ACCENT IS THREE LINES
+-------------------------
+`_ACCENT`, `_ACCENT_PRESS` and `_ACCENT_TEXT` below are the whole accent. Change
+those three to Patina teal ("#1FB8AD", "#14857C", "#04211F") and nothing else
+moves.
+
+Tokens are named by ROLE (surface, border, accent...), never by literal color,
+so the dark variant is a drop-in swap and another app can re-skin by editing one
+Palette. A token that is always equal to another token is not a role, it is a
+copy, so there are none: every field holds a distinct value in both palettes and
+`tests/test_theme.py` enforces it.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from enum import Enum
 
 from PySide6.QtCore import QObject, Signal, QSettings
@@ -52,112 +87,106 @@ class ThemeMode(str, Enum):
     DARK = "dark"
 
 
+# --- THE ACCENT. Qori gold. Three lines, shared by both palettes: swap them for
+# --- Patina teal ("#1FB8AD", "#14857C", "#04211F") and the whole app follows.
+_ACCENT = "#F1AE04"
+_ACCENT_PRESS = "#C28F0A"
+_ACCENT_TEXT = "#1A1408"
+
+
 # ---------------------------------------------------------------------------
-# Palette — every color token the app needs, named by role.
+# Palette: every color token the app needs, named by role.
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Palette:
     name: str
 
-    # Surfaces (back to front)
+    # Surfaces (back to front). Depth is value, not gradient or shadow.
     window: str          # app background, behind everything
-    surface: str         # panels, toolbars, tab pane
-    surface_raised: str  # raised control top (gradient start)
-    surface_sunken: str  # raised control bottom (gradient end) / list backgrounds
-    canvas: str          # the document/work area behind page content
+    surface: str         # panels, toolbars, lists, menus
+    surface_raised: str  # control fill (buttons, combos, thumbnail placeholders)
+    surface_hover: str   # control fill under the pointer
+    surface_active: str  # control fill while pressed
+    canvas: str          # the work area behind the page
 
     # Lines + text
-    border: str          # soft borders / dividers
-    border_strong: str   # hover/focus borders
+    border: str          # soft borders, dividers, scrollbar handle
+    border_strong: str   # hover/focus borders, scrollbar handle hover
     text: str            # primary text
     text_dim: str        # secondary / section labels
     text_faint: str      # hints, disabled
 
-    # Accent (Qori gold)
-    accent: str          # primary accent (gradient start on active)
-    accent_hi: str       # lighter accent (active border, hover ring)
-    accent_deep: str     # darker accent (gradient end on active)
+    # The one accent. Selection, the active tool, a checked button, the tab
+    # underline, and the canvas selection chrome. Nothing else.
+    accent: str
+    accent_press: str    # accent while pressed
     accent_text: str     # text/icon color ON an accent fill
-
-    # Menus + selection
-    menu_bg: str
-    selection: str       # list/menu selection fill
-    selection_text: str
-
-    # Scrollbar
-    scroll_track: str
-    scroll_handle: str
-    scroll_handle_hover: str
 
     @property
     def is_dark(self) -> bool:
         return QColor(self.window).lightnessF() < 0.5
 
+    @property
+    def color_fields(self) -> tuple[str, ...]:
+        """Every field that holds a color (i.e. all of them except `name`)."""
+        return tuple(f.name for f in fields(self) if f.name != "name")
 
-# --- Sovereign LIGHT (default) — cream + amber/gold, matches finance.qori.land
+
+# --- Graphite LIGHT (default): Radix slate light at the roles Radix specifies.
 LIGHT = Palette(
     name="light",
-    window="#FAF7F0",          # warm cream (matches --background 48 33% 97%)
-    surface="#FFFFFF",         # clean white panels
-    surface_raised="#FFFFFF",
-    surface_sunken="#F3EFE6",  # faint cream for control gradient end / list bg
-    canvas="#E8E3D8",          # soft taupe behind the page (not flat grey)
-    border="#E3DCCB",          # warm low-contrast border
-    border_strong="#D8BE72",   # amber-tinted hover border
-    text="#2A2620",            # near-black warm
-    text_dim="#7A7264",        # muted brown-grey section labels
-    text_faint="#A99F8C",
-    accent="#F1AE04",          # Qori gold
-    accent_hi="#FBC43A",       # lighter gold (hover ring / active border)
-    accent_deep="#D6970A",     # deeper gold (active gradient end)
-    accent_text="#2A2010",     # dark text on gold (gold is bright → dark reads best)
-    menu_bg="#FFFFFF",
-    selection="#F1AE04",
-    selection_text="#2A2010",
-    scroll_track="#F3EFE6",
-    scroll_handle="#D9D1BF",
-    scroll_handle_hover="#C7BCA3",
+    window="#FCFCFD",          # slate 1
+    surface="#F9F9FB",         # slate 2
+    surface_raised="#F0F0F3",  # slate 3
+    surface_hover="#E8E8EC",   # slate 4
+    surface_active="#E0E1E6",  # slate 5
+    canvas="#B9BBC6",          # slate 8: dark enough that a white page separates
+    border="#D9D9E0",          # slate 6
+    border_strong="#CDCED6",   # slate 7
+    text="#1C2024",            # slate 12
+    text_dim="#60646C",        # slate 11
+    text_faint="#80838D",      # slate 10
+    accent=_ACCENT,
+    accent_press=_ACCENT_PRESS,
+    accent_text=_ACCENT_TEXT,
 )
 
-# --- Sovereign DARK — warm charcoal + the same amber accent (the "midnight" feel)
+# --- Graphite DARK: Radix slate dark at the same roles.
 DARK = Palette(
     name="dark",
-    window="#1A1814",          # warm near-black (not the old cold #1a1a1a)
-    surface="#242019",         # warm charcoal panel
-    surface_raised="#2C2820",  # raised control top
-    surface_sunken="#201C16",  # gradient end / list bg
-    canvas="#15130F",          # deep warm behind the page
-    border="#3A352B",          # warm low-contrast border
-    border_strong="#6E5A2E",   # amber-tinted hover border
-    text="#EDE7D8",            # warm off-white
-    text_dim="#A89E89",        # muted section labels
-    text_faint="#6E6553",
-    accent="#F1AE04",          # same Qori gold
-    accent_hi="#FBC43A",
-    accent_deep="#C28F0A",
-    accent_text="#1A1408",     # dark text on gold
-    menu_bg="#242019",
-    selection="#F1AE04",
-    selection_text="#1A1408",
-    scroll_track="#201C16",
-    scroll_handle="#3E382D",
-    scroll_handle_hover="#574F3E",
+    window="#111113",          # slate 1
+    surface="#18191B",         # slate 2
+    surface_raised="#212225",  # slate 3
+    surface_hover="#272A2D",   # slate 4
+    surface_active="#2E3135",  # slate 5
+    canvas="#0B0B0D",          # below slate 1: the page is the brightest thing
+    border="#363A3F",          # slate 6
+    border_strong="#43484E",   # slate 7
+    text="#EDEEF0",            # slate 12
+    text_dim="#B0B4BA",        # slate 11
+    text_faint="#777B84",      # slate 10
+    accent=_ACCENT,
+    accent_press=_ACCENT_PRESS,
+    accent_text=_ACCENT_TEXT,
 )
 
 _PALETTES = {ThemeMode.LIGHT: LIGHT, ThemeMode.DARK: DARK}
 
 
 # ---------------------------------------------------------------------------
-# QSS builder — one global stylesheet from a Palette.
+# QSS builder: one global stylesheet from a Palette.
 # ---------------------------------------------------------------------------
 def build_qss(p: Palette) -> str:
     """Return the full application stylesheet for the given palette.
 
-    Selectors are GENERIC (QPushButton, QToolButton, QMenu…) so any app picks up
-    the look without per-widget styling. App-specific object names referenced:
-      #section  — small uppercase section labels (toolbar headers)
-      #tool     — checkable tool buttons (the accent-on-active rail buttons)
-    Both degrade gracefully if an app doesn't use them.
+    Selectors are GENERIC (QPushButton, QToolButton, QMenu...) so any app picks
+    up the look without per-widget styling. App-specific object names referenced:
+      #section  : small uppercase section labels (toolbar headers)
+      #tool     : checkable tool buttons (the accent-on-active rail buttons)
+      #ToolBar  : the tool rail panel
+    All degrade gracefully if an app doesn't use them.
+
+    Solid fills only. No gradient function may appear here (tested).
     """
     return f"""
 /* ---- base ---------------------------------------------------------- */
@@ -166,74 +195,96 @@ QMainWindow, QWidget {{
     color: {p.text};
 }}
 QToolTip {{
-    background-color: {p.surface};
+    background-color: {p.surface_raised};
     color: {p.text};
     border: 1px solid {p.border};
     padding: 4px 6px;
     border-radius: 6px;
 }}
 
-/* ---- panels / toolbars --------------------------------------------- */
+/* ---- panels / toolbars ---------------------------------------------
+   No border between the rail and the canvas: the value step separates them. */
 QWidget#ToolBar {{
     background-color: {p.surface};
-    border-left: 1px solid {p.border};
+    border: none;
 }}
 
-/* ---- buttons ------------------------------------------------------- */
+/* ---- buttons -------------------------------------------------------
+   One flat fill, one step per state. */
 QPushButton {{
-    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-        stop:0 {p.surface_raised}, stop:1 {p.surface_sunken});
+    background-color: {p.surface_raised};
     border: 1px solid {p.border};
-    border-radius: 8px;
+    border-radius: 6px;
     color: {p.text};
     padding: 5px 10px;
     text-align: left;
 }}
 QPushButton:hover {{
+    background-color: {p.surface_hover};
     border: 1px solid {p.border_strong};
     color: {p.text};
 }}
 QPushButton:pressed {{
-    background-color: {p.surface_sunken};
+    background-color: {p.surface_active};
 }}
 QPushButton:checked {{
-    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-        stop:0 {p.accent_hi}, stop:1 {p.accent_deep});
-    border: 1px solid {p.accent_hi};
+    background-color: {p.accent};
+    border: 1px solid {p.accent};
     color: {p.accent_text};
     font-weight: 600;
 }}
+QPushButton:checked:pressed {{
+    background-color: {p.accent_press};
+    border: 1px solid {p.accent_press};
+}}
 QPushButton:disabled {{
+    background-color: {p.surface};
     color: {p.text_faint};
     border: 1px solid {p.border};
 }}
 
-/* tool-rail buttons: same gradient, taller, accent fill when active */
+/* tool-rail buttons: no fill at all until you point at one. Only the active
+   tool is filled, which is the biggest single reduction in chrome here. */
 QPushButton#tool {{
-    border-radius: 8px;
+    background-color: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    color: {p.text_dim};
     padding: 7px 10px;
     font-size: 12px;
 }}
+QPushButton#tool:hover {{
+    background-color: {p.surface_hover};
+    border: 1px solid transparent;
+    color: {p.text};
+}}
 QPushButton#tool:checked {{
-    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-        stop:0 {p.accent_hi}, stop:1 {p.accent_deep});
-    border: 1px solid {p.accent_hi};
+    background-color: {p.accent};
+    border: 1px solid {p.accent};
     color: {p.accent_text};
+    font-weight: 600;
+}}
+QPushButton#tool:checked:pressed {{
+    background-color: {p.accent_press};
+    border: 1px solid {p.accent_press};
 }}
 
 /* ---- tool buttons (color dropdowns, opacity) ----------------------- */
 QToolButton {{
-    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-        stop:0 {p.surface_raised}, stop:1 {p.surface_sunken});
+    background-color: {p.surface_raised};
     border: 1px solid {p.border};
-    border-radius: 8px;
+    border-radius: 6px;
     color: {p.text};
     padding: 5px 8px 5px 8px;
     text-align: left;
 }}
 QToolButton:hover {{
+    background-color: {p.surface_hover};
     border: 1px solid {p.border_strong};
     color: {p.text};
+}}
+QToolButton:pressed {{
+    background-color: {p.surface_active};
 }}
 QToolButton::menu-indicator {{
     subcontrol-origin: padding;
@@ -241,51 +292,65 @@ QToolButton::menu-indicator {{
     right: 6px;
 }}
 
-/* ---- combo boxes --------------------------------------------------- */
+/* ---- text inputs / combo boxes ------------------------------------- */
+QLineEdit {{
+    background-color: {p.window};
+    border: 1px solid {p.border};
+    border-radius: 6px;
+    color: {p.text};
+    selection-background-color: {p.accent};
+    selection-color: {p.accent_text};
+    padding: 3px 8px;
+}}
+QLineEdit:focus {{ border-color: {p.border_strong}; }}
+QLineEdit:disabled {{ color: {p.text_faint}; }}
 QComboBox {{
     background-color: {p.surface_raised};
     border: 1px solid {p.border};
-    border-radius: 8px;
+    border-radius: 6px;
     color: {p.text};
     padding: 3px 6px;
 }}
-QComboBox:focus {{ border-color: {p.accent}; }}
+QComboBox:hover {{ background-color: {p.surface_hover}; }}
+QComboBox:focus {{ border-color: {p.border_strong}; }}
 QComboBox::drop-down {{ border: none; width: 18px; }}
 QComboBox QAbstractItemView {{
-    background-color: {p.menu_bg};
+    background-color: {p.surface};
     color: {p.text};
     border: 1px solid {p.border};
-    selection-background-color: {p.selection};
-    selection-color: {p.selection_text};
+    selection-background-color: {p.surface_hover};
+    selection-color: {p.text};
 }}
 
 /* ---- labels -------------------------------------------------------- */
 QLabel {{ color: {p.text}; background: transparent; }}
 QLabel#section {{
-    color: {p.text_dim};
+    color: {p.text_faint};
     font-size: 9px;
     font-weight: 700;
     letter-spacing: 2px;
     text-transform: uppercase;
 }}
 
-/* ---- menus / menubar ----------------------------------------------- */
+/* ---- menus / menubar ------------------------------------------------
+   Highlight moves on surface value, not on the accent: the accent stays
+   reserved for the thing you are acting on. */
 QMenuBar {{
+    background-color: {p.window};
+    color: {p.text_dim};
+    border: none;
+}}
+QMenuBar::item {{ padding: 4px 10px; background: transparent; border-radius: 4px; }}
+QMenuBar::item:selected {{ background-color: {p.surface_raised}; color: {p.text}; }}
+QMenu {{
     background-color: {p.surface};
     color: {p.text};
-    border-bottom: 1px solid {p.border};
-}}
-QMenuBar::item {{ padding: 4px 10px; background: transparent; }}
-QMenuBar::item:selected {{ background-color: {p.selection}; color: {p.selection_text}; }}
-QMenu {{
-    background-color: {p.menu_bg};
-    color: {p.text};
     border: 1px solid {p.border};
-    border-radius: 8px;
+    border-radius: 6px;
     padding: 4px;
 }}
-QMenu::item {{ padding: 5px 22px 5px 18px; border-radius: 6px; }}
-QMenu::item:selected {{ background-color: {p.selection}; color: {p.selection_text}; }}
+QMenu::item {{ padding: 5px 22px 5px 18px; border-radius: 4px; }}
+QMenu::item:selected {{ background-color: {p.surface_hover}; color: {p.text}; }}
 QMenu::separator {{ height: 1px; background: {p.border}; margin: 4px 8px; }}
 
 /* ---- status bar ---------------------------------------------------- */
@@ -296,51 +361,49 @@ QStatusBar {{
 }}
 QStatusBar::item {{ border: none; }}
 
-/* ---- tabs ---------------------------------------------------------- */
+/* ---- tabs -----------------------------------------------------------
+   A label with an accent underline. No boxes, no border row. */
 QTabWidget::pane {{ border: none; background-color: {p.window}; }}
 QTabBar::tab {{
-    background-color: {p.surface_sunken};
-    color: {p.text_dim};
-    border: 1px solid {p.border};
-    border-bottom: none;
-    border-top-left-radius: 8px;
-    border-top-right-radius: 8px;
-    padding: 6px 18px;
+    background: transparent;
+    color: {p.text_faint};
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 7px 16px;
     min-width: 80px;
-    margin-right: 2px;
 }}
 QTabBar::tab:selected {{
-    background-color: {p.window};
     color: {p.text};
-    border-top: 2px solid {p.accent};
+    border-bottom: 2px solid {p.accent};
+    font-weight: 600;
 }}
-QTabBar::tab:hover:!selected {{ background-color: {p.surface}; color: {p.text}; }}
+QTabBar::tab:hover:!selected {{ color: {p.text_dim}; }}
 
 /* ---- list widgets (organizer / page panel) ------------------------- */
 QListWidget {{
-    background-color: {p.surface_sunken};
+    background-color: {p.surface};
     border: none;
     outline: none;
 }}
 QListWidget::item {{ border-radius: 6px; color: {p.text}; padding: 4px; }}
-QListWidget::item:selected {{ background-color: {p.selection}; color: {p.selection_text}; }}
-QListWidget::item:hover:!selected {{ background-color: {p.surface}; }}
+QListWidget::item:selected {{ background-color: {p.accent}; color: {p.accent_text}; }}
+QListWidget::item:hover:!selected {{ background-color: {p.surface_hover}; }}
 
 /* ---- frames / dividers --------------------------------------------- */
 QFrame[frameShape="4"] {{ color: {p.border}; }}
 
 /* ---- scrollbars ---------------------------------------------------- */
-QScrollBar:vertical {{ background: {p.scroll_track}; width: 10px; margin: 0; }}
+QScrollBar:vertical {{ background: {p.surface}; width: 10px; margin: 0; }}
 QScrollBar::handle:vertical {{
-    background: {p.scroll_handle}; border-radius: 5px; min-height: 20px;
+    background: {p.border}; border-radius: 5px; min-height: 20px;
 }}
-QScrollBar::handle:vertical:hover {{ background: {p.scroll_handle_hover}; }}
+QScrollBar::handle:vertical:hover {{ background: {p.border_strong}; }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
-QScrollBar:horizontal {{ background: {p.scroll_track}; height: 10px; margin: 0; }}
+QScrollBar:horizontal {{ background: {p.surface}; height: 10px; margin: 0; }}
 QScrollBar::handle:horizontal {{
-    background: {p.scroll_handle}; border-radius: 5px; min-width: 20px;
+    background: {p.border}; border-radius: 5px; min-width: 20px;
 }}
-QScrollBar::handle:horizontal:hover {{ background: {p.scroll_handle_hover}; }}
+QScrollBar::handle:horizontal:hover {{ background: {p.border_strong}; }}
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
 
 /* ---- dialogs / message boxes -------------------------------------- */
@@ -413,13 +476,17 @@ def soft_shadow(widget: QWidget, blur: int = 28, alpha: int = 60, dy: int = 6) -
 # ---------------------------------------------------------------------------
 def apply_mica(window: QWidget, dark: bool) -> bool:
     """Best-effort Win11 Mica backdrop. Returns True if applied. Silent no-op on
-    non-Win11 / when pywinstyles isn't installed, so it's safe to always call."""
+    non-Win11 / when pywinstyles isn't installed, so it's safe to always call.
+
+    Reads its colors from the palette, so the title bar follows a re-skin instead
+    of keeping whatever four literals were pasted in here."""
+    p = DARK if dark else LIGHT
     try:
         import pywinstyles
         pywinstyles.apply_style(window, "mica")
-        pywinstyles.change_header_color(window, "#1A1814" if dark else "#FAF7F0")
+        pywinstyles.change_header_color(window, p.window)
         try:
-            pywinstyles.change_title_color(window, "#EDE7D8" if dark else "#2A2620")
+            pywinstyles.change_title_color(window, p.text)
         except Exception:
             pass
         return True
@@ -428,7 +495,7 @@ def apply_mica(window: QWidget, dark: bool) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# ThemeManager — the public entry point.
+# ThemeManager: the public entry point.
 # ---------------------------------------------------------------------------
 class ThemeManager(QObject):
     """Applies the QSS to a QApplication, toggles light/dark, persists the choice,
@@ -497,13 +564,13 @@ class ThemeManager(QObject):
         qp.setColor(QPalette.ColorRole.Window, QColor(p.window))
         qp.setColor(QPalette.ColorRole.WindowText, QColor(p.text))
         qp.setColor(QPalette.ColorRole.Base, QColor(p.surface))
-        qp.setColor(QPalette.ColorRole.AlternateBase, QColor(p.surface_sunken))
+        qp.setColor(QPalette.ColorRole.AlternateBase, QColor(p.surface_raised))
         qp.setColor(QPalette.ColorRole.Text, QColor(p.text))
         qp.setColor(QPalette.ColorRole.Button, QColor(p.surface_raised))
         qp.setColor(QPalette.ColorRole.ButtonText, QColor(p.text))
-        qp.setColor(QPalette.ColorRole.Highlight, QColor(p.selection))
-        qp.setColor(QPalette.ColorRole.HighlightedText, QColor(p.selection_text))
-        qp.setColor(QPalette.ColorRole.ToolTipBase, QColor(p.surface))
+        qp.setColor(QPalette.ColorRole.Highlight, QColor(p.accent))
+        qp.setColor(QPalette.ColorRole.HighlightedText, QColor(p.accent_text))
+        qp.setColor(QPalette.ColorRole.ToolTipBase, QColor(p.surface_raised))
         qp.setColor(QPalette.ColorRole.ToolTipText, QColor(p.text))
         qp.setColor(QPalette.ColorRole.PlaceholderText, QColor(p.text_faint))
         disabled = QColor(p.text_faint)

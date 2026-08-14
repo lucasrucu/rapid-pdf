@@ -6,6 +6,7 @@ from PySide6.QtCore import Signal, Qt, QSize, QTimer, QRect, QEvent
 from PySide6.QtGui import QIcon, QPixmap, QColor
 
 from ui.thumbnails import aspect_ratio_placeholder, draw_thumbnail, fit_size
+from ui.theme import LIGHT
 
 
 # Reference cell proportions. The ACTUAL cell width is derived from the list
@@ -29,10 +30,12 @@ class _PageDelegate(QStyledItemDelegate):
     item position when icon sizes vary. ListMode + this delegate is pixel-perfect.
     """
 
-    sel_color = QColor("#F1AE04")
-    hover_color = QColor("#FFFFFF")
-    text_color = QColor("#7A7264")
-    sel_text_color = QColor("#2A2010")
+    # Themed by PagePanel.apply_palette(); these LIGHT defaults only cover the
+    # moment before the first call.
+    sel_color = QColor(LIGHT.accent)
+    hover_color = QColor(LIGHT.surface_hover)
+    text_color = QColor(LIGHT.text_dim)
+    sel_text_color = QColor(LIGHT.accent_text)
 
     # Even inset of the selection/hover backing inside the cell (all four sides),
     # so the rounded accent wraps the whole thumbnail evenly instead of bleeding
@@ -97,7 +100,7 @@ class PagePanel(QWidget):
         # Rows whose real thumbnail has been rendered (others show a placeholder).
         self._rendered: set[int] = set()
         self._placeholder_cache: dict[tuple[int, int], QPixmap] = {}
-        self._placeholder_color = QColor("#F3EFE6")  # themed via apply_palette()
+        self._placeholder_color = QColor(LIGHT.surface_raised)  # themed via apply_palette()
         # Live thumbnail box, derived from the viewport (see _apply_layout). It is
         # the delegate's thumb_area, so a thumbnail rendered to it always fits
         # inside its own selection border.
@@ -122,11 +125,11 @@ class PagePanel(QWidget):
     def apply_palette(self, palette):
         """Theme the delegate (selection/hover/label) and placeholder fill, then
         repaint. Called once at start and on every light/dark toggle."""
-        _PageDelegate.sel_color = QColor(palette.selection)
-        _PageDelegate.hover_color = QColor(palette.surface)
+        _PageDelegate.sel_color = QColor(palette.accent)
+        _PageDelegate.hover_color = QColor(palette.surface_hover)
         _PageDelegate.text_color = QColor(palette.text_dim)
-        _PageDelegate.sel_text_color = QColor(palette.selection_text)
-        self._placeholder_color = QColor(palette.surface_sunken)
+        _PageDelegate.sel_text_color = QColor(palette.accent_text)
+        self._placeholder_color = QColor(palette.surface_raised)
         self._placeholder_cache.clear()
         self._list.viewport().update()
 

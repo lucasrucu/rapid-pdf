@@ -8,6 +8,7 @@ from PySide6.QtCore import Signal, Qt, QSize, QRect, QTimer, QPoint
 from PySide6.QtGui import QIcon, QColor, QPixmap, QPainter, QDrag
 
 from ui.thumbnails import aspect_ratio_placeholder, draw_thumbnail
+from ui.theme import LIGHT
 
 THUMB_W = 160
 THUMB_H = 210
@@ -52,10 +53,12 @@ class _ThumbDelegate(QStyledItemDelegate):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.sel_color = QColor("#F1AE04")
-        self.hover_color = QColor("#F3EFE6")
-        self.text_color = QColor("#2A2620")
-        self.sel_text_color = QColor("#2A2010")
+        # Themed by Organizer.apply_palette(); these LIGHT defaults only cover
+        # the moment before the first call.
+        self.sel_color = QColor(LIGHT.accent)
+        self.hover_color = QColor(LIGHT.surface_hover)
+        self.text_color = QColor(LIGHT.text_dim)
+        self.sel_text_color = QColor(LIGHT.accent_text)
 
     def paint(self, painter, option, index):
         painter.save()
@@ -247,7 +250,7 @@ class _DragList(QListWidget):
     def _delegate_sel_color(self):
         delegate = self.itemDelegate()
         color = getattr(delegate, "sel_color", None)
-        return color if color is not None else QColor("#F1AE04")
+        return color if color is not None else QColor(LIGHT.accent)
 
     def dragMoveEvent(self, event):
         super().dragMoveEvent(event)
@@ -363,7 +366,7 @@ class PageOrganizer(QWidget):
         super().__init__(parent)
         self._doc = None       # real document — all structural edits happen here
         self._render = None    # optional PDFDocument whose pages have markup baked in
-        self._placeholder_color = QColor("#F3EFE6")  # themed via apply_palette()
+        self._placeholder_color = QColor(LIGHT.surface_raised)  # themed via apply_palette()
         self._setup_ui()
 
     def _setup_ui(self):
@@ -453,11 +456,11 @@ class PageOrganizer(QWidget):
     def apply_palette(self, palette):
         """Theme the delegate (selection/hover/label) and placeholder fill, then
         repaint. Called once at start and on every light/dark toggle."""
-        self._delegate.sel_color = QColor(palette.selection)
-        self._delegate.hover_color = QColor(palette.surface)
+        self._delegate.sel_color = QColor(palette.accent)
+        self._delegate.hover_color = QColor(palette.surface_hover)
         self._delegate.text_color = QColor(palette.text_dim)
-        self._delegate.sel_text_color = QColor(palette.selection_text)
-        self._placeholder_color = QColor(palette.surface_sunken)
+        self._delegate.sel_text_color = QColor(palette.accent_text)
+        self._placeholder_color = QColor(palette.surface_raised)
         self._placeholder_cache.clear()
         self._list.viewport().update()
 
