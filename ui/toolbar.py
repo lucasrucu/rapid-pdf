@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Signal, Qt, QSize
 from PySide6.QtGui import QColor, QPixmap, QIcon, QPainter, QPen, QIntValidator
 
-from ui.theme import themed_icon
+from ui.theme import themed_icon, LIGHT
 
 
 PRESETS = [
@@ -29,9 +29,12 @@ _TOOL_ICONS = {
 }
 
 
-def _swatch_pixmap(color: QColor, size: int = 16, none: bool = False,
-                   border: str = "#55555a") -> QPixmap:
-    """A small rounded chip used as the face icon of a color dropdown."""
+def _swatch_pixmap(color: QColor, size: int, none: bool, border: str) -> QPixmap:
+    """A small rounded chip used as the face icon of a color dropdown.
+
+    `border` is themed, so the caller passes it rather than this defaulting to
+    a literal. The red diagonal on a "no color" chip is deliberately NOT themed:
+    it is a signifier like a no-entry sign, not a surface."""
     pm = QPixmap(size, size)
     pm.fill(Qt.GlobalColor.transparent)
     p = QPainter(pm)
@@ -70,7 +73,11 @@ class ColorToolButton(QToolButton):
         self._color = QColor(0, 0, 0)
         self._is_none = False
         self._width = 2.0
-        self._chip_border = "#9a8f78"
+        # Themed by apply_palette(); the LIGHT defaults only cover construction,
+        # which happens before the first apply_palette lands.
+        self._chip_border = LIGHT.border_strong
+        self._caption_color = LIGHT.text_faint
+        self._accent = LIGHT.accent
 
         self.setText(f"  {label}")
         self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
@@ -97,8 +104,11 @@ class ColorToolButton(QToolButton):
     def set_width(self, w: float):
         self._width = float(w)
 
-    def set_chip_border(self, color: str):
-        self._chip_border = color
+    def apply_palette(self, palette):
+        """Theme the chip border, the menu captions and the swatch hover ring."""
+        self._chip_border = palette.border_strong
+        self._caption_color = palette.text_faint
+        self._accent = palette.accent
         self._refresh_face()
 
     def _refresh_face(self):
@@ -112,7 +122,8 @@ class ColorToolButton(QToolButton):
         m.clear()
 
         if self._allow_none:
-            act = m.addAction(QIcon(_swatch_pixmap(QColor(255, 255, 255), 16, none=True)),
+            act = m.addAction(QIcon(_swatch_pixmap(QColor(255, 255, 255), 16, True,
+                                                   self._chip_border)),
                               self._none_label)
             act.triggered.connect(self._on_none)
             m.addSeparator()
@@ -145,7 +156,8 @@ class ColorToolButton(QToolButton):
 
     def _build_caption(self, text: str) -> QWidget:
         lbl = QLabel(text)
-        lbl.setStyleSheet("color:#888; font-size:9px; font-weight:bold; padding:2px 8px;")
+        lbl.setStyleSheet(f"color:{self._caption_color}; font-size:9px; "
+                          f"font-weight:bold; padding:2px 8px;")
         return lbl
 
     def _build_grid(self, colors) -> QWidget:
@@ -159,8 +171,9 @@ class ColorToolButton(QToolButton):
             b.setFixedSize(22, 22)
             b.setToolTip(c.name())
             b.setStyleSheet(
-                f"QPushButton{{background:{c.name()};border:1px solid #9a8f78;border-radius:4px;}}"
-                f"QPushButton:hover{{border:2px solid #F1AE04;}}"
+                f"QPushButton{{background:{c.name()};"
+                f"border:1px solid {self._chip_border};border-radius:4px;}}"
+                f"QPushButton:hover{{border:2px solid {self._accent};}}"
             )
             b.clicked.connect(lambda _, col=QColor(c): self._choose_color(col))
             g.addWidget(b, i // cols, i % cols)
@@ -231,9 +244,10 @@ class ToolBar(QWidget):
         self._current_tool = "select"
         self._selection_types: set[str] = set()
         # Icon tints for tool buttons; updated by apply_palette() on theme change.
-        self._icon_color = "#2A2620"
-        self._active_icon_color = "#2A2010"
-        self._chip_border = "#D8BE72"
+        # The LIGHT defaults only cover construction.
+        self._icon_color = LIGHT.text_dim
+        self._active_icon_color = LIGHT.accent_text
+        self._chip_border = LIGHT.border_strong
         self._setup_ui()
         self.setFixedWidth(180)
 
@@ -412,15 +426,17 @@ class ToolBar(QWidget):
 
     def apply_palette(self, palette):
         """Re-tint tool-button icons + color-chip borders for the new theme."""
-        self._icon_color = palette.text
+        # An inactive tool button is text_dim in the stylesheet, so its icon is
+        # too; only the active one sits on an accent fill.
+        self._icon_color = palette.text_dim
         self._active_icon_color = palette.accent_text
         self._chip_border = palette.border_strong
         self._retint_tool_icons()
-        # Refresh the color dropdown faces so their chip borders match the theme.
+        # Refresh the color dropdowns so chips, captions and hover rings match.
         for btn in (getattr(self, "_fill_btn", None), getattr(self, "_line_btn", None),
                     getattr(self, "_font_color_btn", None)):
             if btn is not None:
-                btn.set_chip_border(palette.border_strong)
+                btn.apply_palette(palette)
 
     def _on_line_color(self, color: QColor):
         self._push_recent(color)

@@ -12,7 +12,15 @@ from PySide6.QtGui import (
     QUndoStack, QUndoCommand,
 )
 
+from ui.theme import LIGHT
+
 HANDLE_SIZE = 8
+
+# Search hits are the accent at two strengths: the hit you are on is a solid
+# wash with an accent outline, the rest are a hint. Both used to be raw RGB,
+# and the weaker one was a yellow that appeared in no palette at all.
+_HIT_CURRENT_ALPHA = 120
+_HIT_ALPHA = 60
 
 # Rapid page switches coalesce within this window, so only the page you land on
 # pays for a full fitz render (fast-scroll, render-on-land).
@@ -48,6 +56,15 @@ class AnnotationBase:
     page_num: int = 0
     ann_type: str = ""
     text: str = ""
+
+    # Selection chrome, shared by every item class. Set on the base by
+    # PDFCanvas.apply_palette so the canvas speaks the same selection language
+    # as the panels instead of the Windows blue it used to hardcode. The fill
+    # stays white because handles sit on the page, which is white in both
+    # themes. The LIGHT default only covers the moment before the first
+    # apply_palette lands.
+    handle_color: QColor = QColor(LIGHT.accent)
+    handle_fill: QColor = QColor("#FFFFFF")
 
     def to_annotation_dict(self, zoom: float) -> dict:
         raise NotImplementedError
@@ -142,8 +159,8 @@ class AnnotationItem(QGraphicsRectItem, AnnotationBase):
         ]
         painter.save()
         pen_w = 1.0 / m11 if m11 > 0 else 1.0
-        painter.setPen(QPen(QColor(0, 120, 215), pen_w))
-        painter.setBrush(QBrush(QColor(255, 255, 255)))
+        painter.setPen(QPen(self.handle_color, pen_w))
+        painter.setBrush(QBrush(self.handle_fill))
         for x, y in corners:
             painter.drawRect(QRectF(x - hs / 2, y - hs / 2, hs, hs))
         painter.restore()
@@ -297,7 +314,7 @@ class ImageAnnotationItem(AnnotationItem):
         painter.drawPixmap(self.rect().toRect(), self._pixmap)
         if self.isSelected():
             painter.save()
-            painter.setPen(QPen(QColor(0, 120, 215), 1))
+            painter.setPen(QPen(self.handle_color, 1))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(self.rect())
             painter.restore()
@@ -390,8 +407,8 @@ class LineAnnotationItem(QGraphicsLineItem, AnnotationBase):
             hs = HANDLE_SIZE / m11 if m11 > 0 else HANDLE_SIZE
             painter.save()
             pen_w = 1.0 / m11 if m11 > 0 else 1.0
-            painter.setPen(QPen(QColor(0, 120, 215), pen_w))
-            painter.setBrush(QBrush(QColor(255, 255, 255)))
+            painter.setPen(QPen(self.handle_color, pen_w))
+            painter.setBrush(QBrush(self.handle_fill))
             for pt in [ln.p1(), ln.p2()]:
                 painter.drawRect(QRectF(pt.x() - hs / 2, pt.y() - hs / 2, hs, hs))
             painter.restore()
@@ -450,11 +467,11 @@ class TextAnnotationItem(QGraphicsTextItem, AnnotationBase):
             hs = HANDLE_SIZE / m11 if m11 > 0 else HANDLE_SIZE
             pen_w = 1.0 / m11 if m11 > 0 else 1.0
             painter.save()
-            painter.setPen(QPen(QColor(0, 120, 215), pen_w, Qt.PenStyle.DashLine))
+            painter.setPen(QPen(self.handle_color, pen_w, Qt.PenStyle.DashLine))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(br.adjusted(pen_w, pen_w, -pen_w, -pen_w))
-            painter.setPen(QPen(QColor(0, 120, 215), pen_w))
-            painter.setBrush(QBrush(QColor(255, 255, 255)))
+            painter.setPen(QPen(self.handle_color, pen_w))
+            painter.setBrush(QBrush(self.handle_fill))
             for x, y in [
                 (br.left(), br.top()), (br.right(), br.top()),
                 (br.left(), br.bottom()), (br.right(), br.bottom()),
@@ -773,8 +790,15 @@ class PDFCanvas(QGraphicsView):
         # Ctrl+scroll keeps the point under the mouse fixed instead of drifting.
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
-        self._backdrop_color = QColor("#E8E3D8")  # themed via set_backdrop_color()
+        self._backdrop_color = QColor(LIGHT.canvas)  # themed via apply_palette()
         self.setBackgroundBrush(QBrush(self._backdrop_color))
+        # Selection chrome the stylesheet cannot reach: the rubber band, the
+        # locate flash and the search hits. Themed via apply_palette().
+        self._accent = QColor(LIGHT.accent)
+        self._hit_current_fill = QColor(LIGHT.accent)
+        self._hit_current_fill.setAlpha(_HIT_CURRENT_ALPHA)
+        self._hit_fill = QColor(LIGHT.accent)
+        self._hit_fill.setAlpha(_HIT_ALPHA)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
@@ -790,6 +814,24 @@ class PDFCanvas(QGraphicsView):
         """Set the color of the work area behind the page (themed light/dark)."""
         self._backdrop_color = QColor(color)
         self.setBackgroundBrush(QBrush(self._backdrop_color))
+
+    def apply_palette(self, palette):
+        """Re-tint everything this view draws in code: the work-area backdrop,
+        the selection handles on every annotation item, the marquee, the locate
+        flash and the search hits. Called once at start and on every light/dark
+        toggle, the same way the page panel, organizer and toolbar are.
+
+        QSS cannot reach any of this because it is drawn inside paint() and
+        drawForeground(), which is how the canvas ended up on Windows blue while
+        the rest of the app was on the accent."""
+        self.set_backdrop_color(palette.canvas)
+        AnnotationBase.handle_color = QColor(palette.accent)
+        self._accent = QColor(palette.accent)
+        self._hit_current_fill = QColor(palette.accent)
+        self._hit_current_fill.setAlpha(_HIT_CURRENT_ALPHA)
+        self._hit_fill = QColor(palette.accent)
+        self._hit_fill.setAlpha(_HIT_ALPHA)
+        self.viewport().update()
 
     def _push(self, command):
         self._undo_stack.push(command)
@@ -885,11 +927,11 @@ class PDFCanvas(QGraphicsView):
                           (r.x1 - r.x0) * z, (r.y1 - r.y0) * z).adjusted(-2, -2, 2, 2)
             item = self._scene.addRect(rect)
             if i == current_index:
-                item.setBrush(QColor(241, 174, 4, 120))   # accent, stronger
-                item.setPen(QPen(QColor(241, 174, 4), 1.5))
+                item.setBrush(self._hit_current_fill)
+                item.setPen(QPen(self._accent, 1.5))
                 current_item = item
             else:
-                item.setBrush(QColor(255, 235, 59, 80))   # soft yellow wash
+                item.setBrush(self._hit_fill)
                 item.setPen(QPen(Qt.PenStyle.NoPen))
             item.setZValue(40)
             item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
@@ -1041,7 +1083,7 @@ class PDFCanvas(QGraphicsView):
             return
         frac = 1.0 - (self._flash_step / self._flash_total)  # 1 → 0 as it fades
         margin = 3 + self._flash_step * 2                     # expands outward
-        col = QColor(0, 120, 215)
+        col = QColor(self._accent)
         col.setAlphaF(max(0.0, frac))
         painter.save()
         painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -2023,8 +2065,10 @@ class PDFCanvas(QGraphicsView):
             if self._rubber_item is None and moved > 3:
                 self._rubber_item = QGraphicsRectItem()
                 self._rubber_item.setPen(
-                    QPen(QColor(0, 120, 215), 0, Qt.PenStyle.DashLine))
-                self._rubber_item.setBrush(QBrush(QColor(0, 120, 215, 40)))
+                    QPen(self._accent, 0, Qt.PenStyle.DashLine))
+                band = QColor(self._accent)
+                band.setAlpha(40)
+                self._rubber_item.setBrush(QBrush(band))
                 self._rubber_item.setZValue(1000)
                 self._scene.addItem(self._rubber_item)
             if self._rubber_item is not None:

@@ -59,9 +59,10 @@ class MainWindow(QMainWindow):
         apply_mica(self, self._theme.is_dark)
 
     def _apply_theme_surfaces(self, palette):
-        """Re-tint the bits QSS can't reach: the canvas page backdrop, the thumbnail
-        delegates, the toggle action's icon/label, and the Mica header on a switch."""
-        self._canvas.set_backdrop_color(palette.canvas)
+        """Re-tint the bits QSS can't reach: the canvas backdrop and its selection
+        chrome, the thumbnail delegates, the toggle action's icon/label, and the
+        Mica header on a switch."""
+        self._canvas.apply_palette(palette)
         self._page_panel.apply_palette(palette)
         self._organizer.apply_palette(palette)
         self._toolbar.apply_palette(palette)
