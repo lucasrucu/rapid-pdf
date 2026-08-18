@@ -20,3 +20,6 @@ _testfiles/
 # throwaway perf/invalidation probes (kept locally, numbers live in docs/report)
 _perf_probe.py
 _invalidation_test.py
+# Claude Code: keep the shared launch config, ignore local session state
+.claude/*
+!.claude/launch.json
