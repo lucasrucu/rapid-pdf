@@ -60,7 +60,7 @@ Programs.
 
 Keep THREE files in sync:
 
-1. `APP_VERSION` in `core/version.py` — the one the running app reads, and the
+1. `APP_VERSION` in `core/version.py`, the one the running app reads and the
    one the self-updater compares against the newest GitHub release.
 2. `filevers`/`prodvers` + the `FileVersion`/`ProductVersion` strings in
    `packaging/version_info.txt`.
