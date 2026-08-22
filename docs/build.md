@@ -58,10 +58,37 @@ Programs.
 
 ### Bumping the version
 
-Keep three places in sync: `filevers`/`prodvers` + the strings in
-`packaging/version_info.txt`, and `#define AppVersion` in `rapid-pdf.iss`. The
-`AppId` GUID in the .iss must stay FIXED across versions (it's how Windows tracks
-upgrades/uninstall).
+Keep THREE files in sync:
+
+1. `APP_VERSION` in `core/version.py`, the one the running app reads and the
+   one the self-updater compares against the newest GitHub release.
+2. `filevers`/`prodvers` + the `FileVersion`/`ProductVersion` strings in
+   `packaging/version_info.txt`.
+3. `#define AppVersion` in `rapid-pdf.iss`.
+
+`tests/test_version.py` fails if they drift, so run the suite before tagging.
+The `AppId` GUID in the .iss must stay FIXED across versions (it's how Windows
+tracks upgrades/uninstall).
+
+### Publishing a release (what self-update reads)
+
+`core/update/` checks `api.github.com/repos/lucasrucu/rapid-pdf/releases/latest`
+on startup and offers an update when the release's version is higher than
+`APP_VERSION`. For that to work, a release needs:
+
+- a tag of `vX.Y.Z` (the title "Rapid PDF X.Y.Z" is the fallback), and
+- the `rapid-pdf-X.Y.Z-portable.zip` asset attached, holding the whole
+  `dist\rapid-pdf\` folder with its `rapid-pdf/` top level intact.
+
+The updater takes the PORTABLE ZIP, never the setup `.exe`: the zip is the
+install folder, so an update is a verified file swap in place, with no
+SmartScreen prompt on an unsigned download and no second install created
+beside a portable copy. See the docstring at the top of `core/update/client.py`
+for the full reasoning. A release published without the zip is simply not
+offered to anybody; nothing breaks, nobody is told.
+
+GitHub publishes a sha256 for every asset and the updater refuses to install
+one that has none, so nothing extra has to be uploaded alongside it.
 
 ### Adding code signing later (currently OFF)
 

@@ -11,9 +11,17 @@ from PySide6.QtGui import QAction, QKeySequence, QShortcut, QIcon
 # re-scan the document per keystroke, short enough to feel live.
 SEARCH_DEBOUNCE_MS = 220
 
+# How long after the window is up before the update check goes out. Nothing
+# about it blocks startup (it runs on its own thread), but the first render
+# and the first PDF load should have the machine to themselves; an update is
+# never urgent enough to compete with them.
+UPDATE_CHECK_DELAY_MS = 1500
+
 from core.pdf_document import PDFDocument
 from core.resources import app_icon_path
 from core.ocr_worker import run_ocr_enhance
+from core.version import APP_VERSION
+from ui.update_notice import UpdateNotice
 from ui.canvas import PDFCanvas
 from ui.toolbar import ToolBar
 from ui.page_panel import PagePanel
@@ -57,6 +65,10 @@ class MainWindow(QMainWindow):
         self._theme.theme_changed.connect(self._apply_theme_surfaces)
         # Optional Win11 Mica backdrop (silent no-op elsewhere).
         apply_mica(self, self._theme.is_dark)
+        # Ask GitHub whether there is a newer release. Off the GUI thread, and
+        # after the window is up: see UPDATE_CHECK_DELAY_MS and
+        # ui/update_notice.py. Offline this does nothing at all, silently.
+        QTimer.singleShot(UPDATE_CHECK_DELAY_MS, self._update_notice.start_check)
 
     def _apply_theme_surfaces(self, palette):
         """Re-tint the bits QSS can't reach: the canvas backdrop and its selection
@@ -66,6 +78,7 @@ class MainWindow(QMainWindow):
         self._page_panel.apply_palette(palette)
         self._organizer.apply_palette(palette)
         self._toolbar.apply_palette(palette)
+        self._update_notice.apply_palette(palette)
         if hasattr(self, "_theme_action"):
             dark = self._theme.is_dark
             self._theme_action.setText("Light Mode" if dark else "Dark Mode")
@@ -84,6 +97,12 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
+
+        # Update strip, above everything, hidden until GitHub says there is a
+        # newer release. Nothing in the layout moves while it stays hidden.
+        self._update_notice = UpdateNotice()
+        self._update_notice.staged_ready.connect(self._on_update_staged)
+        root.addWidget(self._update_notice)
 
         self._tabs = QTabWidget()
         self._tabs.currentChanged.connect(self._on_tab_changed)
@@ -217,6 +236,43 @@ class MainWindow(QMainWindow):
         self._theme_action.setIcon(
             themed_icon("mdi6.weather-sunny" if dark else "mdi6.weather-night",
                         self._theme.palette.text))
+
+        hm = mb.addMenu("Help")
+        self._add_action(hm, "Check for Updates…", self._check_for_updates)
+        self._add_action(hm, "About Rapid PDF", self._about)
+
+    # ------------------------------------------------------------------
+    # Updates (see ui/update_notice.py and core/update/)
+    # ------------------------------------------------------------------
+
+    def _check_for_updates(self):
+        """Help menu. Same check as startup, but it says so when there is
+        nothing to report, because somebody asked."""
+        self._update_notice.start_check(manual=True)
+
+    def _about(self):
+        QMessageBox.about(
+            self, "About Rapid PDF",
+            f"<b>Rapid PDF {APP_VERSION}</b>"
+            "<p>Fast PDF annotation and page organization.</p>"
+            "<p>Copyright (c) 2026 Lucas Ruiz</p>")
+
+    def _on_update_staged(self, staged):
+        """A verified update is on disk and the app has to close for the swap.
+
+        The unsaved-changes prompt runs FIRST, and a cancelled prompt leaves
+        everything as it was: the download stays staged and the strip keeps
+        offering it. The helper is only started once closing is certain,
+        because the moment it starts it is watching for this process to exit.
+        """
+        if not self._maybe_save_before_close():
+            self._update_notice.apply_cancelled()
+            return
+        if not self._update_notice.launch_swap(staged):
+            return
+        self._dirty = False          # the prompt above has already settled this
+        self._force_quit = True
+        self.close()
 
     def _toggle_theme(self):
         self._theme.toggle()
@@ -993,5 +1049,8 @@ class MainWindow(QMainWindow):
             return
         self._close_org_render()
         self._close_panel_render()
+        # A check thread still running when the window goes is a crash on
+        # exit. Bounded wait, see UpdateNotice.shutdown().
+        self._update_notice.shutdown()
         self._doc.close()
         super().closeEvent(event)
