@@ -10,7 +10,7 @@ Built in Python with PySide6 (Qt6) and PyMuPDF. Single window, dark theme, Windo
 
 ## Key features
 
-- **Page manager**: open, combine, reorder, delete, and add pages from a thumbnail grid.
+- **Page manager**: open, combine, reorder, delete, and add pages, from the Editor's left thumbnail strip or the full Organizer grid. Shift/ctrl to select several, drag to move them, Delete to remove them, Ctrl+Z to take it back.
 - **Markup tools**: highlight, rectangle, and line annotations with an Office-style color picker, opacity presets, and line weights.
 - **Object editing**: select, move, resize with 8-point handles, Ctrl+drag to duplicate, marquee group-select, copy/paste, and full undo/redo.
 - **Embedded-image lift**: grab an image baked into the page and move or resize it like any other object, with no white hole left behind.
@@ -54,13 +54,15 @@ See [Architecture](docs/architecture.md) for the full walkthrough.
 rapid-pdf/
 ├── main.py            # entry point: builds the app, opens a CLI-passed PDF
 ├── core/
-│   └── pdf_document.py  # PyMuPDF wrapper: render cache, save lifecycle, annotation model
+│   ├── pdf_document.py  # PyMuPDF wrapper: render cache, save lifecycle, annotation model
+│   └── page_ops.py      # pure page-order arithmetic: drag targets, undo permutations
 ├── ui/
 │   ├── main_window.py   # window, menus, tabs, save/open lifecycle, dirty-state
 │   ├── canvas.py        # the editor: annotation items, undo stack, image lift, marquee
 │   ├── toolbar.py       # tools and contextual color/opacity/weight controls
 │   ├── organizer.py     # page reorder / delete / add grid
-│   └── page_panel.py    # left-hand thumbnail strip
+│   ├── page_panel.py    # left thumbnail strip: select, delete, drag to reorder
+│   └── page_commands.py # undoable page delete + reorder
 ├── docs/              # architecture, performance, UI, build, shortcuts, PRD
 ├── prototypes/        # throwaway UI restyle preview (not shipped)
 ├── requirements.txt   # pymupdf, PySide6

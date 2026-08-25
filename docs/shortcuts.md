@@ -19,6 +19,23 @@
 | `Ctrl+A` | Select all annotations on the page |
 | Arrow keys (`Shift` = 10px) | Nudge selected annotation(s) |
 
+## Pages (left thumbnail strip, and the Organizer)
+
+| Action | Result |
+|---|---|
+| Click a thumbnail | Select that page and show it in the editor |
+| `Shift+click` | Extend the selection to a run of pages |
+| `Ctrl+click` | Add or remove a single page from the selection |
+| `Ctrl+A` | Select every page (right-click menu, or with the strip focused) |
+| `Delete` / `Backspace` | Delete the selected page(s) in one step |
+| Right-click | Delete / select-all menu |
+| Drag a thumbnail | Move it; the line shows where it will land |
+| Drag a multi-selection | Moves the whole selection together, order kept |
+| `Ctrl+Z` | Undo a page delete or move (same stack as annotations) |
+
+Deleting is not confirmed, because it is undoable. The last page cannot be
+deleted: a document has to keep at least one.
+
 ## Files
 
 | Key | Action |

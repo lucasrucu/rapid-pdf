@@ -402,6 +402,57 @@ class PDFDocument:
             self.doc.delete_page(page_num)
             self.invalidate_render_cache()   # pages after this one renumbered
 
+    def delete_pages(self, page_nums: list) -> list:
+        """Delete a whole selection of pages in one go.
+
+        Indices are into the CURRENT document and may arrive in any order or
+        with duplicates. Returns the ascending list actually deleted, which is
+        what an undo needs to put them back at.
+        """
+        if not self.doc:
+            return []
+        rows = sorted({p for p in page_nums if 0 <= p < len(self.doc)})
+        if not rows:
+            return []
+        for page_num in reversed(rows):   # descending, so the rest stay valid
+            self.doc.delete_page(page_num)
+        self.invalidate_render_cache()
+        return rows
+
+    def extract_pages(self, page_nums: list):
+        """A standalone in-memory PDF holding copies of `page_nums`, ascending.
+
+        This is the stash that makes a page delete undoable: take the copy
+        first, then delete. Page content and annotations travel with the copy
+        (insert_pdf keeps both). Document-level things a lone page cannot carry
+        by itself, such as a link pointing at another page, do not, so an undone
+        delete restores what you can see rather than a byte-identical page.
+        Caller owns the returned document.
+        """
+        stash = fitz.open()
+        if not self.doc:
+            return stash
+        for page_num in sorted({p for p in page_nums if 0 <= p < len(self.doc)}):
+            stash.insert_pdf(self.doc, from_page=page_num, to_page=page_num)
+        return stash
+
+    def restore_pages(self, stash, positions: list):
+        """Put stashed pages back at the indices they held before a delete.
+
+        `positions` lines up with the stash's own page order (both ascending).
+        Inserting lowest-first is what keeps the arithmetic trivial: everything
+        below an insertion point is already back in place, so the next position
+        is still correct with no adjustment.
+        """
+        if not self.doc or stash is None:
+            return
+        for k, at in enumerate(sorted(positions)):
+            if k >= len(stash):
+                break
+            self.doc.insert_pdf(stash, from_page=k, to_page=k,
+                                start_at=max(0, min(at, len(self.doc))))
+        self.invalidate_render_cache()   # page set/indices changed
+
     def insert_pdf(self, src_path: str, from_page: int = 0,
                    to_page: int = -1, start_at: int = -1):
         if not self.doc:

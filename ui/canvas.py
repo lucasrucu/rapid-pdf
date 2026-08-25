@@ -1372,6 +1372,45 @@ class PDFCanvas(QGraphicsView):
         painter.end()
         return target
 
+    def current_page(self) -> int:
+        return self._current_page
+
+    def snapshot_page_annotations(self) -> dict:
+        """A copy of the per-page annotation map, for a structural page command
+        to put back later. The map is copied; the items in it are shared, which
+        is the point: an undo restores the same objects, still carrying whatever
+        style and geometry they have now."""
+        return {pn: list(items) for pn, items in self._page_annotations.items()}
+
+    def restore_page_annotations(self, snapshot: dict, current_page: int):
+        """Adopt a snapshot_page_annotations() map wholesale and re-render.
+
+        Structural page edits renumber pages under the markup, so a page command
+        restores the whole map rather than trying to patch it: every item is
+        re-pointed at the page it is filed under, and anything not in the
+        snapshot (markup that belonged to a deleted page) is pulled out of the
+        scene. That is what lets item-level undo commands underneath a page
+        command still replay against the numbering they were recorded with.
+        """
+        for items in self._page_annotations.values():
+            for item in items:
+                if item.scene() is not None:
+                    self._scene.removeItem(item)
+        self._page_annotations = {pn: list(items) for pn, items in snapshot.items()}
+        for pn, items in self._page_annotations.items():
+            for item in items:
+                item.page_num = pn
+                if item.scene() is None:
+                    self._scene.addItem(item)
+                item.setVisible(False)
+        self._cancel_interaction()
+        self._embedded_images = None
+        self._embedded_images_page = -1
+        if self._doc and self._doc.page_count() > 0:
+            self._current_page = max(0, min(current_page, self._doc.page_count() - 1))
+            self._pending_page = None
+            self._load_page(self._current_page)
+
     def remove_page_annotations(self, page_num: int):
         for item in self._page_annotations.get(page_num, []):
             if item.scene():
