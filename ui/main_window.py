@@ -18,6 +18,7 @@ SEARCH_DEBOUNCE_MS = 220
 UPDATE_CHECK_DELAY_MS = 1500
 
 from core.pdf_document import PDFDocument
+from core.page_ops import is_permutation
 from core.resources import app_icon_path
 from core.ocr_worker import run_ocr_enhance
 from core.version import APP_VERSION
@@ -25,6 +26,7 @@ from ui.update_notice import UpdateNotice
 from ui.canvas import PDFCanvas
 from ui.toolbar import ToolBar
 from ui.page_panel import PagePanel
+from ui.page_commands import DeletePagesCommand, ReorderPagesCommand
 from ui.organizer import PageOrganizer
 from ui.search_bar import SearchBar
 from ui.combine_dialog import CombineDialog
@@ -44,6 +46,9 @@ class MainWindow(QMainWindow):
         self._force_quit = False # Quit menu wants a real app quit, not "close PDF"
         self._ocr_thread = None  # active OCR QThread, or None when idle
         self._ocr_worker = None  # keep a ref alive alongside the thread
+        # Rows the page panel should end up with highlighted after the next
+        # structural edit (the pages that were just moved). Consumed once.
+        self._pending_page_selection = None
         # Text-search state (driven by the Ctrl+F bar)
         self._search_hits: list = []   # [(page_num, fitz.Rect), ...]
         self._search_index = -1
@@ -116,6 +121,8 @@ class MainWindow(QMainWindow):
 
         self._page_panel = PagePanel()
         self._page_panel.page_selected.connect(self._on_page_selected)
+        self._page_panel.pages_delete_requested.connect(self._delete_pages)
+        self._page_panel.pages_reorder_requested.connect(self._reorder_pages)
         editor_layout.addWidget(self._page_panel)
 
         self._canvas = PDFCanvas()
@@ -723,12 +730,75 @@ class MainWindow(QMainWindow):
         self._canvas.setFocus()
 
     def _delete_key(self):
-        """Delete (keypad) routes by active tab: pages in the Organizer, else
-        selected canvas objects in the Editor."""
+        """Delete routes by what is in front and what has the keyboard: pages in
+        the Organizer, pages in the Editor's thumbnail strip when the strip has
+        focus, else the selected canvas objects.
+
+        The menu action owns the Delete shortcut at window level, so it fires
+        even while the strip has focus. That is why the routing lives here
+        rather than only in the strip's own key handler (which still covers
+        Backspace, which the menu doesn't claim).
+        """
         if self._tabs.currentIndex() == 1:   # Organizer tab
             self._organizer.delete_selected()
+        elif self._page_panel.isVisible() and self._page_panel.has_focus():
+            self._delete_pages(self._page_panel.selected_rows())
         else:
             self._canvas.delete_selected()
+
+    # ------------------------------------------------------------------
+    # Page structure edits from the left panel (undoable)
+    # ------------------------------------------------------------------
+
+    def _delete_pages(self, rows: list):
+        """Delete the panel's selected pages as one undoable step."""
+        if not self._doc.doc or not rows:
+            return
+        if self._doc.page_count() - len(rows) < 1:
+            QMessageBox.warning(self, "Cannot Delete",
+                                "A document has to keep at least one page.")
+            return
+        self._pending_page_selection = None
+        self._canvas.undo_stack.push(DeletePagesCommand(self, rows))
+        count = len(rows)
+        self._update_status(
+            f"Deleted {count} page{'s' if count > 1 else ''}  (Ctrl+Z to undo)")
+
+    def _reorder_pages(self, order: list, moved_rows: list):
+        """Apply a drag from the panel as one undoable step.
+
+        A drop that doesn't describe a clean permutation is dropped on the floor
+        and the strip is rebuilt from the document, so a confused drag can never
+        leave the two disagreeing.
+        """
+        if not self._doc.doc:
+            return
+        if not is_permutation(order, self._doc.page_count()):
+            self._refresh_panel_thumbnails(current_page=self._current_page)
+            return
+        # Where the moved pages end up, so they stay selected after the rebuild.
+        self._pending_page_selection = sorted(order.index(r) for r in moved_rows
+                                              if r in order)
+        self._canvas.undo_stack.push(
+            ReorderPagesCommand(self, order, len(moved_rows)))
+        count = len(moved_rows)
+        self._update_status(
+            f"Moved {count} page{'s' if count > 1 else ''}  (Ctrl+Z to undo)")
+
+    def after_page_structure_change(self):
+        """Re-sync the shell around a page delete or reorder, in either direction.
+
+        The command has already changed the document and re-based the canvas's
+        markup; this is everything that hangs off that. Called by both redo() and
+        undo(), so an undo lands the app in exactly the state a fresh edit would.
+        """
+        self._mark_dirty()   # cleanChanged corrects this if we land back on saved
+        self._current_page = self._canvas.current_page()
+        select = self._pending_page_selection
+        self._pending_page_selection = None
+        self._refresh_panel_thumbnails(current_page=self._current_page, select=select)
+        self._refresh_current_thumb()
+        self._update_status()
 
     def delete_current_page(self):
         if not self._doc.doc or self._doc.page_count() <= 1:
@@ -800,7 +870,8 @@ class MainWindow(QMainWindow):
                 pass
         self._org_render = None
 
-    def _refresh_panel_thumbnails(self):
+    def _refresh_panel_thumbnails(self, current_page: int | None = None,
+                                  select: list | None = None):
         """Rebuild the left page panel's thumbnails from a markup-baked clone so
         they match the page + live overlays exactly.
 
@@ -815,7 +886,9 @@ class MainWindow(QMainWindow):
             self._page_panel.set_render_source(None)
             return
         self._panel_render = self._make_markup_baked_render()
-        self._page_panel.set_render_source(self._panel_render)
+        self._page_panel.set_render_source(self._panel_render,
+                                           current_page=current_page,
+                                           select=select)
 
     def _close_panel_render(self):
         if self._panel_render is not None and self._panel_render.doc is not None:

@@ -47,7 +47,8 @@ rapid-pdf/
 | Path | Role |
 |---|---|
 | `core/__init__.py` | Package marker. |
-| `core/pdf_document.py` | `PDFDocument`, the one wrapper over PyMuPDF (`fitz`). Owns the live document, the LRU page-pixmap render cache, the integrity-first save lifecycle, structural page ops (reorder/delete/insert), the editable embedded-JSON annotation model, markup writing, and the no-hole `remove_image_placement` image-lift primitive. |
+| `core/pdf_document.py` | `PDFDocument`, the one wrapper over PyMuPDF (`fitz`). Owns the live document, the LRU page-pixmap render cache, the integrity-first save lifecycle, structural page ops (reorder/delete/insert, plus the `extract_pages`/`restore_pages` stash that makes a delete undoable), the editable embedded-JSON annotation model, markup writing, and the no-hole `remove_image_placement` image-lift primitive. |
+| `core/page_ops.py` | The page-order arithmetic on its own, with no Qt and no PyMuPDF: where a dragged multi-selection lands, the permutation that undoes a reorder, and the re-keying a page edit forces on anything filed by page index. Pure functions, so the awkward cases are testable without a widget or a PDF. |
 
 ## `ui/`: interface layer
 
@@ -58,7 +59,8 @@ rapid-pdf/
 | `ui/canvas.py` | `PDFCanvas` (a `QGraphicsView`) plus every annotation item class (`HighlightItem`, `RectAnnotationItem`, `ImageAnnotationItem`, `LineAnnotationItem`, `TextAnnotationItem`) and the undo-command classes. The editing surface: drawing, selection, move/resize handles, marquee, copy/paste, Ctrl+drag duplicate, undo/redo, the embedded-image lift, and the JSON model round-trip. The largest module. |
 | `ui/toolbar.py` | `ToolBar` and `ColorToolButton`. The right-hand tool rail: Select/Rectangle/Line/Text tools and the contextual style controls (Office-style fill and line color pickers with presets, recents, and line weights; text color and size; opacity presets) that show only when relevant. |
 | `ui/organizer.py` | `PageOrganizer`, the page-management grid. Native drag-to-reorder, delete-selected, and add-pages-from-PDF, with lazily rendered thumbnails pulled from a markup-baked clone. |
-| `ui/page_panel.py` | `PagePanel`, the narrow left-hand thumbnail strip in the Editor. Click to switch page; thumbnails render lazily and stay in sync with unsaved overlays. |
+| `ui/page_panel.py` | `PagePanel`, the narrow left-hand thumbnail strip in the Editor. Click to switch page; shift/ctrl to select several; Delete, a header button or the right-click menu to remove them; drag to reorder, with an insertion line and a card-stack drag pixmap. It only ever asks for an edit and then redraws itself from the document, so the strip and the page order cannot drift. Thumbnails render lazily and stay in sync with unsaved overlays. |
+| `ui/page_commands.py` | The undoable page edits (`DeletePagesCommand`, `ReorderPagesCommand`) that the strip's requests turn into. They ride the canvas's existing undo stack and snapshot the whole page-to-markup map alongside the document change, which is what lets Ctrl+Z cover page edits without corrupting the item-level commands underneath them. |
 
 ## `prototypes/`: throwaway experiments (not shipped)
 
