@@ -1,4 +1,4 @@
-"""Which build this is, as a string the running app can read.
+﻿"""Which build this is, as a string the running app can read.
 
 WHY THIS FILE EXISTS AT ALL. Until now the version lived only in two build
 inputs: `rapid-pdf.iss` (what the installer stamps) and
@@ -32,7 +32,7 @@ from __future__ import annotations
 
 #: The one place the version is decided. Bump it, then bump `rapid-pdf.iss`
 #: and `packaging/version_info.txt` to match (tests/test_version.py checks).
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 
 def running_version() -> str:

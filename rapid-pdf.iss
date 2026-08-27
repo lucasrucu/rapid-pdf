@@ -1,4 +1,4 @@
-; Inno Setup script for rapid-pdf.
+﻿; Inno Setup script for rapid-pdf.
 ; Wraps the PyInstaller onedir output (dist\rapid-pdf\) into a real installer:
 ; setup wizard, Start-menu + optional desktop shortcut, uninstaller, app icon.
 ;
@@ -11,10 +11,10 @@
 ; DefaultDirName to {autopf}.
 
 #define AppName "Rapid PDF"
-#define AppVersion "1.3.0"
+#define AppVersion "1.4.0"
 #define AppPublisher "Lucas Ruiz"
 #define AppExeName "rapid-pdf.exe"
-; Stable GUID for upgrades/uninstall — keep this fixed across versions.
+; Stable GUID for upgrades/uninstall â€” keep this fixed across versions.
 #define AppId "{{A7E3C9F1-4B2D-4E6A-9C8F-1D5B7A0E3F42}"
 
 [Setup]
@@ -110,7 +110,7 @@ Root: HKCU; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueN
 Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
 
 ; -----------------------------------------------------------------------------
-; CODE SIGNING (deferred — see docs/build.md "Adding code signing later").
+; CODE SIGNING (deferred â€” see docs/build.md "Adding code signing later").
 ; When you have a signing cert/SignTool configured, define a sign tool in the
 ; Inno IDE (Tools -> Configure Sign Tools) named e.g. "signtool", then uncomment:
 ;   SignTool=signtool
