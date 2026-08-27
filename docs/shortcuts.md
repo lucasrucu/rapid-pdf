@@ -36,6 +36,20 @@
 Deleting is not confirmed, because it is undoable. The last page cannot be
 deleted: a document has to keep at least one.
 
+### Thumbnail zoom (Organizer only)
+
+| Action | Result |
+|---|---|
+| `Ctrl+scroll` | Grow / shrink the page thumbnails, anchored under the cursor |
+| `Ctrl++` / `Ctrl+=` | One step bigger (numpad `+` too) |
+| `Ctrl+-` | One step smaller (numpad `-` too) |
+| `Ctrl+0` | Back to the default size |
+
+Seven steps from half size to double. Thumbnails are re-rendered at the new
+size rather than stretched, so zooming in makes a page genuinely readable. The
+level is remembered between runs. Plain scrolling is unaffected, and the left
+strip keeps its own size.
+
 ## Files
 
 | Key | Action |

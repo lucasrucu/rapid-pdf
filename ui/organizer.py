@@ -4,16 +4,52 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QLabel, QFileDialog, QMessageBox,
     QStyledItemDelegate, QStyle, QStyleOptionViewItem,
 )
-from PySide6.QtCore import Signal, Qt, QSize, QRect, QTimer, QPoint
-from PySide6.QtGui import QIcon, QColor, QPixmap, QPainter, QDrag
+from PySide6.QtCore import Signal, Qt, QSize, QRect, QTimer, QPoint, QSettings
+from PySide6.QtGui import (
+    QIcon, QColor, QPixmap, QPainter, QDrag, QShortcut, QKeySequence,
+)
 
 from ui.thumbnails import aspect_ratio_placeholder, draw_thumbnail
 from ui.theme import LIGHT
 
+# Reference thumbnail and cell geometry, i.e. the 1.0x rung of the zoom ladder
+# below. Every other zoom level is these numbers scaled, so the grid keeps its
+# proportions at any size. Read once, in _adopt_zoom.
 THUMB_W = 160
 THUMB_H = 210
 ITEM_W = 192
 ITEM_H = 262
+
+# Thumbnail zoom ladder, as multipliers of the reference geometry above.
+#
+# Discrete steps rather than free scaling. Two reasons: a ladder lands on the
+# same handful of pixel sizes every time, so the placeholder cache stays useful
+# and a fast wheel spin can't ask PyMuPDF for forty slightly different widths;
+# and stepping feels more controllable than continuous scaling on a grid that
+# re-flows its columns as it grows. Roughly 1.25x per rung, the same feel as a
+# browser's zoom.
+#
+# The bounds. The floor of 0.5 puts the thumbnail at 80x105, a touch smaller
+# than the left strip's 100x130 and still plainly a page: orientation, margins
+# and blocks of text all read. The ceiling of 2.0 gives 320x420, a genuinely
+# readable page at roughly 0.5 MB of pixmap each. That ceiling is where memory
+# stops being free: a rendered thumbnail is held on its item until the next
+# zoom change drops it, so scrolling a 200-page document end to end at 2.0x
+# retains on the order of 100 MB. Anything above that is not worth the cost
+# when the Editor tab is one double-click away.
+ZOOM_STEPS = (0.5, 0.65, 0.8, 1.0, 1.25, 1.6, 2.0)
+DEFAULT_ZOOM_INDEX = ZOOM_STEPS.index(1.0)
+
+# Where the chosen zoom level is remembered, in the same store the page panel's
+# visibility and the light/dark choice already use.
+_SETTINGS_ORG = "Lucas"
+_SETTINGS_APP = "Rapid PDF"
+_ZOOM_SETTING = "ui/organizer_zoom_index"
+
+# One wheel notch on an ordinary mouse. Accumulated rather than compared
+# directly, so a high-resolution wheel or a trackpad (many small deltas) takes
+# one zoom step per notch's worth of travel instead of one per event.
+_WHEEL_NOTCH = 120
 
 # Render thumbnails this many pixels above/below the viewport so they're ready
 # just before they scroll into view (mirrors the page-panel lazy strategy).
@@ -44,6 +80,10 @@ class _ThumbDelegate(QStyledItemDelegate):
     # wraps the whole cell evenly, and a gap so the page-number label doesn't
     # touch the thumbnail above it.
     _PAD = 5
+    # Second inset, inside the selection backing, so the thumbnail doesn't sit
+    # flush against the accent when a cell is selected. Named because the
+    # organizer sizes its thumbnails from it (see PageOrganizer._adopt_zoom).
+    _INNER_PAD = 5
     _LABEL_GAP = 6
     # Purely cosmetic horizontal nudge applied to the cells flanking the
     # current drop line during a drag, so the insertion point reads as "pages
@@ -85,7 +125,8 @@ class _ThumbDelegate(QStyledItemDelegate):
             painter.setBrush(self.hover_color)
             painter.drawRoundedRect(backing, 8, 8)
 
-        inner = backing.adjusted(5, 5, -5, -5)
+        inner = backing.adjusted(self._INNER_PAD, self._INNER_PAD,
+                                 -self._INNER_PAD, -self._INNER_PAD)
         icon = index.data(Qt.ItemDataRole.DecorationRole)
         if icon is not None:
             area = QRect(inner.x(), inner.y(), inner.width(),
@@ -124,6 +165,9 @@ class _DragList(QListWidget):
     """
     reordered = Signal(list)       # new order as a list of original page indices
     reorder_invalid = Signal()     # drop left the list in an unexpected state
+    # Ctrl+wheel: (rungs to move on the zoom ladder, cursor position in viewport
+    # coords so the caller can keep the page under the cursor where it is).
+    zoom_stepped = Signal(int, QPoint)
 
     # Fanned-stack drag pixmap tuning: how far each card behind the top one
     # peeks out (purely cosmetic, mirrors a hand of playing cards).
@@ -141,6 +185,27 @@ class _DragList(QListWidget):
         self._autoscroll_timer.setInterval(16)
         self._autoscroll_timer.timeout.connect(self._do_autoscroll)
         self._autoscroll_dy = 0
+        # Unspent wheel travel from the current Ctrl+wheel gesture, in the same
+        # units as angleDelta (1/8 of a degree; 120 to a notch).
+        self._wheel_accum = 0
+
+    def wheelEvent(self, event):
+        """Ctrl+wheel steps the thumbnail zoom. A plain wheel is left alone, so
+        ordinary scrolling behaves exactly as it did before."""
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self._wheel_accum += event.angleDelta().y()
+            steps = int(self._wheel_accum / _WHEEL_NOTCH)
+            if steps:
+                self._wheel_accum -= steps * _WHEEL_NOTCH
+                pos = (event.position().toPoint() if hasattr(event, "position")
+                       else event.pos())
+                self.zoom_stepped.emit(steps, pos)
+            event.accept()
+            return
+        # A part-notch left over belongs to the zoom gesture that just ended, not
+        # to whatever comes next.
+        self._wheel_accum = 0
+        super().wheelEvent(event)
 
     def drag_target_row(self):
         """Row the drop indicator currently points at, or None when not dragging.
@@ -367,7 +432,15 @@ class PageOrganizer(QWidget):
         self._doc = None       # real document — all structural edits happen here
         self._render = None    # optional PDFDocument whose pages have markup baked in
         self._placeholder_color = QColor(LIGHT.surface_raised)  # themed via apply_palette()
+        # Current rung of ZOOM_STEPS, restored from the last run, plus the
+        # thumbnail box and cell size derived from it. Everything that used to
+        # read THUMB_W/ITEM_W directly reads these instead.
+        self._zoom_index = self._load_zoom_index()
+        self._thumb_w = THUMB_W
+        self._thumb_h = THUMB_H
+        self._cell = QSize(ITEM_W, ITEM_H)
         self._setup_ui()
+        self._adopt_zoom()   # take the remembered level (a no-op grid at this point)
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -390,7 +463,8 @@ class PageOrganizer(QWidget):
 
         bar.addStretch()
 
-        hint = QLabel("Drag to reorder  ·  Double-click to edit in canvas")
+        hint = QLabel("Drag to reorder  ·  Double-click to edit in canvas"
+                      "  ·  Ctrl+scroll to zoom")
         hint.setObjectName("section")
         hint.setStyleSheet("font-size: 10px;")
         bar.addWidget(hint)
@@ -426,12 +500,184 @@ class PageOrganizer(QWidget):
         self._list.setItemDelegate(self._delegate)
         self._list.reordered.connect(self._on_reordered)
         self._list.reorder_invalid.connect(self.needs_rebuild)
+        self._list.zoom_stepped.connect(self._on_zoom_stepped)
         self._list.itemDoubleClicked.connect(self._on_item_activated)
         # Smooth pixel scrolling + render thumbnails lazily as cells scroll in.
         self._list.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
         self._list.verticalScrollBar().valueChanged.connect(self._render_visible)
         layout.addWidget(self._list)
         self._placeholder_cache: dict[tuple[int, int], QPixmap] = {}
+        self._install_zoom_shortcuts()
+
+    def _install_zoom_shortcuts(self):
+        """Ctrl +, Ctrl - and Ctrl 0 on the thumbnails.
+
+        WidgetWithChildrenShortcut scopes them to this tab, so they are dead
+        while the Editor tab is in front and they fire wherever focus sits
+        inside the Organizer (grid, Add Pages, Delete).
+
+        Numpad + and - need no separate entry: QKeySequence has no keypad
+        modifier, so Qt matches a numpad press against the plain Ctrl++ /
+        Ctrl+- sequences. Ctrl+= and Ctrl+_ are there because + and - are
+        shifted keys on most layouts and people reach for the unshifted one.
+        """
+        self._zoom_shortcuts = []
+        for sequences, slot in (
+            (("Ctrl++", "Ctrl+="), self.zoom_in),
+            (("Ctrl+-", "Ctrl+_"), self.zoom_out),
+            (("Ctrl+0",), self.zoom_reset),
+        ):
+            for seq in sequences:
+                shortcut = QShortcut(QKeySequence(seq), self)
+                shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+                shortcut.activated.connect(slot)
+                self._zoom_shortcuts.append(shortcut)
+
+    # ------------------------------------------------------------------
+    # Thumbnail zoom
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_zoom_index() -> int:
+        """The zoom level remembered from the last run, clamped onto the ladder.
+
+        Anything unreadable (missing key, a string from an older build, an index
+        from a longer ladder) falls back to the default rather than raising.
+        """
+        raw = QSettings(_SETTINGS_ORG, _SETTINGS_APP).value(
+            _ZOOM_SETTING, DEFAULT_ZOOM_INDEX)
+        try:
+            index = int(raw)
+        except (TypeError, ValueError):
+            return DEFAULT_ZOOM_INDEX
+        return max(0, min(index, len(ZOOM_STEPS) - 1))
+
+    def zoom_index(self) -> int:
+        return self._zoom_index
+
+    def zoom_factor(self) -> float:
+        return ZOOM_STEPS[self._zoom_index]
+
+    def zoom_in(self):
+        self._set_zoom_index(self._zoom_index + 1, self._anchor_visible())
+
+    def zoom_out(self):
+        self._set_zoom_index(self._zoom_index - 1, self._anchor_visible())
+
+    def zoom_reset(self):
+        self._set_zoom_index(DEFAULT_ZOOM_INDEX, self._anchor_visible())
+
+    def _on_zoom_stepped(self, steps: int, vp_pos: QPoint):
+        """Ctrl+wheel from the grid. Anchored on the page under the cursor."""
+        self._set_zoom_index(self._zoom_index + steps, self._anchor_at(vp_pos))
+
+    def _set_zoom_index(self, index: int, anchor=None) -> bool:
+        """Move to `index` on the ladder, clamped at both ends. Returns whether
+        anything changed, so a zoom past either end is a cheap no-op instead of
+        a pointless re-render of every visible cell."""
+        index = max(0, min(index, len(ZOOM_STEPS) - 1))
+        if index == self._zoom_index:
+            return False
+        self._zoom_index = index
+        QSettings(_SETTINGS_ORG, _SETTINGS_APP).setValue(_ZOOM_SETTING, index)
+        self._adopt_zoom(anchor)
+        return True
+
+    def _adopt_zoom(self, anchor=None):
+        """Resize the cells to the current zoom level and re-rasterise.
+
+        Thumbnails are RE-RENDERED at the new size, never scaled. The icon on
+        each item is a bitmap rendered for one particular width, so stretching a
+        160px thumbnail to 320 would just give a blurry page; PyMuPDF redrawing
+        the handful actually on screen costs a few milliseconds.
+
+        Every cell is dropped back to a placeholder first. That does two jobs:
+        it releases the now wrong-sized pixmaps, which is the only thing keeping
+        a 200-page document's memory in check across repeated zooms, and it
+        leaves the lazy renderer to pay for the visible cells and nothing else.
+        """
+        factor = ZOOM_STEPS[self._zoom_index]
+        self._cell = QSize(max(1, round(ITEM_W * factor)),
+                           max(1, round(ITEM_H * factor)))
+        # Never ask for more pixels than the delegate will actually paint into.
+        # The page-number label is a fixed 22px tall at every zoom, so at the
+        # small end of the ladder it takes a bigger share of the cell than the
+        # reference proportions assume. Without this clamp a 0.5x thumbnail is
+        # rasterised at 80px wide and then squeezed to 63 on every repaint:
+        # wasted work, and visibly softer than rendering it at 63 to begin with.
+        # From 1.0x up the clamp never binds, so the default view is
+        # pixel-for-pixel what it was before zoom existed.
+        chrome = 2 * (_ThumbDelegate._PAD + _ThumbDelegate._INNER_PAD)
+        box_w = self._cell.width() - chrome
+        box_h = (self._cell.height() - chrome
+                 - _ThumbDelegate._TEXT_H - _ThumbDelegate._LABEL_GAP)
+        self._thumb_w = max(1, min(round(THUMB_W * factor), box_w))
+        self._thumb_h = max(1, min(round(THUMB_H * factor), box_h))
+        self._placeholder_cache.clear()
+        self._list.setIconSize(QSize(self._thumb_w, self._thumb_h))
+        self._list.setGridSize(self._cell)
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if item is None:
+                continue
+            item.setSizeHint(self._cell)
+            src_page = item.data(_SRC_ID)
+            item.setIcon(QIcon(self._placeholder_for(
+                i if src_page is None else src_page)))
+            item.setData(_RENDERED, False)
+        # Lay the grid out now rather than on the next event loop turn, so the
+        # anchor below measures where the cells have actually ended up.
+        self._list.doItemsLayout()
+        self._restore_anchor(anchor)
+        self._render_visible()
+
+    def _anchor_at(self, vp_pos: QPoint):
+        """(row, that row's top in viewport coords) for the cell under `vp_pos`.
+
+        Zooming re-flows the grid, so without this the view keeps its scroll
+        VALUE while the content under it changes height, and a wheel zoom two
+        thirds of the way down a long document lands somewhere else entirely.
+        Falls back to the general visible anchor when the cursor is over empty
+        space (past the last page, or in the gap after a short final row).
+        """
+        item = self._list.itemAt(vp_pos)
+        if item is None:
+            return self._anchor_visible()
+        return self._list.row(item), self._list.visualItemRect(item).top()
+
+    def _anchor_visible(self):
+        """Anchor for a keyboard zoom: the current row when it is on screen,
+        otherwise the first cell that is. A keyboard zoom has no cursor to hold
+        onto but should still not throw a long document back to the top."""
+        vp = self._list.viewport().rect()
+        rows = range(self._list.count())
+        current = self._list.currentRow()
+        if current >= 0:
+            rows = [current, *(r for r in rows if r != current)]
+        for row in rows:
+            item = self._list.item(row)
+            if item is None:
+                continue
+            rect = self._list.visualItemRect(item)
+            if rect.intersects(vp):
+                return row, rect.top()
+        return None
+
+    def _restore_anchor(self, anchor):
+        """Scroll so the anchored row's top sits back where it was.
+
+        visualItemRect is in viewport coordinates, so it already accounts for
+        the scroll position: raising the scrollbar by d moves a cell up by d,
+        hence the delta below.
+        """
+        if anchor is None:
+            return
+        row, want_top = anchor
+        item = self._list.item(row)
+        if item is None:
+            return
+        bar = self._list.verticalScrollBar()
+        bar.setValue(bar.value() + self._list.visualItemRect(item).top() - want_top)
 
     def set_document(self, doc, render=None):
         """doc = live document (edited in place). render = optional doc whose pages
@@ -449,7 +695,7 @@ class PageOrganizer(QWidget):
         """A grey placeholder sized to the page's real aspect ratio, so a landscape
         drawing's cell doesn't visibly change shape when its thumbnail renders."""
         return aspect_ratio_placeholder(
-            self._render_source(), page_num, THUMB_W, THUMB_H,
+            self._render_source(), page_num, self._thumb_w, self._thumb_h,
             self._placeholder_color, self._placeholder_cache,
         )
 
@@ -477,7 +723,7 @@ class PageOrganizer(QWidget):
         if src and src.doc:
             for i in range(src.page_count()):
                 item = QListWidgetItem(QIcon(self._placeholder_for(i)), f"Page {i + 1}")
-                item.setSizeHint(QSize(ITEM_W, ITEM_H))
+                item.setSizeHint(self._cell)
                 item.setData(_PAGE_ID, i)
                 item.setData(_SRC_ID, i)        # clone page this thumbnail comes from
                 item.setData(_RENDERED, False)
@@ -508,11 +754,14 @@ class PageOrganizer(QWidget):
             src_page = item.data(_SRC_ID)
             if src_page is None or src_page >= src.page_count():
                 continue
-            item.setIcon(QIcon(src.render_thumbnail(src_page, max_width=THUMB_W)))
+            item.setIcon(QIcon(src.render_thumbnail(src_page, max_width=self._thumb_w)))
             item.setData(_RENDERED, True)
 
     def thumb_width(self) -> int:
-        return THUMB_W
+        """Width the grid's thumbnails are rasterised at RIGHT NOW, not the
+        reference width: the host grabs canvas pixmaps at this size to patch a
+        single cell, and at 2x zoom a 160px grab would land visibly soft."""
+        return self._thumb_w
 
     def update_page_thumbnail(self, page_num: int, pixmap: QPixmap):
         """Patch one page's thumbnail in place (e.g. after a live canvas edit),
@@ -547,7 +796,7 @@ class PageOrganizer(QWidget):
             it = self._list.item(i)
             it.setData(_PAGE_ID, i)
             it.setText(f"Page {i + 1}")
-            it.setSizeHint(QSize(ITEM_W, ITEM_H))
+            it.setSizeHint(self._cell)
 
     def _on_reordered(self, new_order: list):
         if not self._doc:
