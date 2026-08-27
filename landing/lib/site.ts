@@ -7,11 +7,12 @@
 // hardcoded one rots the moment a release ships. Bump VERSION below and both
 // links follow.
 //
-// The installer is deliberately not offered. 1.3.0 shipped with the portable
-// zip only, because building the setup .exe needs Inno Setup on the build
-// machine and it is not installed there. Offering a button that 404s is worse
-// than not offering one. Put it back when an .exe is actually attached to a
-// release, and check the asset is there before you do.
+// BEFORE BUMPING, CHECK BOTH ASSETS ARE ON THE RELEASE. 1.3.0 and 1.4.0 each
+// shipped the portable zip alone, because the setup .exe needs Inno Setup on
+// the build machine and everybody believed it was not installed. It was, at
+// %LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe, a per-user path rather than
+// the Program Files one docs/build.md names. A button pointing at an asset
+// that is not there is worse than no button.
 
 export const REPO = "lucasrucu/rapid-pdf";
 
@@ -21,6 +22,9 @@ export const VERSION = "1.5.0";
 export const LINKS = {
   github: `https://github.com/${REPO}`,
   releasesLatest: `https://github.com/${REPO}/releases/latest`,
+  downloadInstaller:
+    `https://github.com/${REPO}/releases/latest/download/` +
+    `rapid-pdf-setup-${VERSION}.exe`,
   downloadPortable:
     `https://github.com/${REPO}/releases/latest/download/` +
     `rapid-pdf-${VERSION}-portable.zip`,

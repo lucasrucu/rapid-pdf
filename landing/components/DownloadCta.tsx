@@ -15,28 +15,27 @@ export function DownloadCta() {
               Download Rapid PDF {SITE.version}
             </h2>
             <p className="mt-4 text-lg text-muted-foreground">
-              No installer and no admin prompt. Unzip it anywhere and run{" "}
-              <span className="font-medium text-foreground">rapid-pdf.exe</span>. Everything the app
-              needs is in the folder, so deleting it uninstalls it.
+              A per-user installer, no admin prompt. Adds a Start-menu entry, an optional desktop
+              shortcut, and a clean uninstaller. Prefer no install? The portable zip is the same app
+              in a folder: unzip it anywhere and run{" "}
+              <span className="font-medium text-foreground">rapid-pdf.exe</span>.
             </p>
           </div>
 
           <div className="mt-8 flex flex-wrap items-center gap-3">
             <a
-              href={LINKS.downloadPortable}
+              href={LINKS.downloadInstaller}
               className="inline-flex items-center justify-center gap-2 rounded-md bg-primary px-5 py-3 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90"
             >
               <Download className="h-4 w-4" aria-hidden="true" />
-              Download (.zip)
+              Installer (.exe)
             </a>
             <a
-              href={LINKS.releasesLatest}
-              target="_blank"
-              rel="noopener noreferrer"
+              href={LINKS.downloadPortable}
               className="inline-flex items-center justify-center gap-2 rounded-md border border-border bg-card px-5 py-3 text-sm font-medium text-foreground transition-colors hover:bg-accent"
             >
               <Package className="h-4 w-4" aria-hidden="true" />
-              All releases
+              Portable (.zip)
             </a>
             <a
               href={LINKS.github}
