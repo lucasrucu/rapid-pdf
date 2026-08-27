@@ -1,4 +1,4 @@
-// Single source of truth for the landing's external links and copy.
+﻿// Single source of truth for the landing's external links and copy.
 //
 // VERSION LIVES IN ONE PLACE AND THE FILENAMES ARE BUILT FROM IT. On
 // 2026-08-27 the site still offered 1.2.1 while the newest release was 1.3.0,
@@ -16,7 +16,7 @@
 export const REPO = "lucasrucu/rapid-pdf";
 
 /** The released version the site advertises. The one place to change. */
-export const VERSION = "1.4.0";
+export const VERSION = "1.5.0";
 
 export const LINKS = {
   github: `https://github.com/${REPO}`,
