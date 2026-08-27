@@ -13,6 +13,9 @@ from PySide6.QtGui import (
 )
 
 from ui.theme import LIGHT
+from ui.scrolling import (
+    TRACKPAD_NOTCH_PX, WHEEL_NOTCH, scroll_area_by_pixels, wheel_pixels,
+)
 
 HANDLE_SIZE = 8
 
@@ -45,6 +48,10 @@ _PAGE_TURN_ARROWS = {
     Qt.Key.Key_Up: -1,
     Qt.Key.Key_Left: -1,
 }
+# How much the view scales for one notch of Ctrl+wheel. Applied as a power of
+# how many notches the event is worth, so a mouse click is still exactly this
+# and a trackpad's small deltas zoom smoothly instead of a whole step each.
+_ZOOM_PER_NOTCH = 1.15
 
 
 # ---------------------------------------------------------------------------
@@ -771,6 +778,11 @@ class PDFCanvas(QGraphicsView):
 
         # Fit-to-view mode: when True the page is kept fitted on page load/resize
         self._fit_mode = False
+
+        # Wheel travel spent pushing against a scroll edge, and the direction it
+        # went in. A notch's worth turns the page; see _wheel_turns_page.
+        self._wheel_turn_accum = 0.0
+        self._wheel_turn_dir = 0
 
         # Fires while a drag is active and the cursor is near a viewport edge
         self._autoscroll_timer = QTimer(self)
@@ -1648,11 +1660,14 @@ class PDFCanvas(QGraphicsView):
         disagreeing about when a page turn happens. A page that fits the viewport
         entirely has minimum() == maximum(), so it turns on the first press.
         """
+        return self._at_scroll_edge(bar, delta) and self._goto_adjacent_page(delta)
+
+    @staticmethod
+    def _at_scroll_edge(bar, delta: int) -> bool:
+        """True when `bar` has nothing left to scroll in the `delta` direction."""
         if delta > 0:
-            at_edge = bar.value() >= bar.maximum() - _SCROLL_EDGE_TOLERANCE_PX
-        else:
-            at_edge = bar.value() <= bar.minimum() + _SCROLL_EDGE_TOLERANCE_PX
-        return at_edge and self._goto_adjacent_page(delta)
+            return bar.value() >= bar.maximum() - _SCROLL_EDGE_TOLERANCE_PX
+        return bar.value() <= bar.minimum() + _SCROLL_EDGE_TOLERANCE_PX
 
     def _arrow_turns_page(self, key, mods, auto_repeat: bool) -> bool:
         """Handle Down/Right/Up/Left as a page turn when the page is scrolled out.
@@ -2300,36 +2315,110 @@ class PDFCanvas(QGraphicsView):
             self.scale(min_scale, min_scale)
 
     def wheelEvent(self, event):
+        """Wheel and trackpad, split on which delta the event actually carries.
+
+        A mouse wheel arrives as angleDelta in 120-unit notches and is handled
+        exactly as it always was. A trackpad arrives as pixelDelta: many small,
+        high-frequency events that Qt's own scroll handling ignores outright and
+        that the old page-turn check treated as a full notch each, so a two-
+        finger flick flew through the whole document.
+        """
+        pixels = wheel_pixels(event)
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            factor = 1.15 if event.angleDelta().y() > 0 else 1.0 / 1.15
-            # Re-anchor the zoom under the cursor: scale, then translate the view so
-            # the scene point that was under the mouse stays under the mouse.
-            cursor_pos = event.position().toPoint()
-            before = self.mapToScene(cursor_pos)
-            self.scale(factor, factor)
-            after = self.mapToScene(cursor_pos)
-            delta = after - before
-            self.translate(delta.x(), delta.y())
-            self._clamp_zoom_to_min()
-            if self._fit_mode:
-                self._fit_mode = False
-                self.fit_mode_broken.emit()
-            self._mark_interacting()   # fast scaling while zooming, crisp on settle
-            event.accept()
+            self._wheel_zoom(event, pixels)
         else:
-            # Continuous scroll: scrolling past the bottom of a page turns to the
-            # next page (landing at its top); past the top turns back (landing at
-            # its bottom) — like Adobe.
-            vbar = self.verticalScrollBar()
-            dy = event.angleDelta().y()
-            if dy < 0 and self._turn_page_at_edge(vbar, 1):
-                event.accept()
-                return
-            if dy > 0 and self._turn_page_at_edge(vbar, -1):
+            self._wheel_scroll(event, pixels)
+
+    def _wheel_zoom(self, event, pixels):
+        """Ctrl+wheel zoom, anchored under the cursor.
+
+        The factor is _ZOOM_PER_NOTCH raised to however many notches the event is
+        worth, so one mouse click is still exactly 1.15 (or exactly 1/1.15) and a
+        trackpad's stream of small deltas zooms smoothly instead of taking a whole
+        step each and slamming into the limit.
+        """
+        if pixels is not None:
+            steps = pixels.y() / TRACKPAD_NOTCH_PX
+        else:
+            steps = event.angleDelta().y() / WHEEL_NOTCH
+        if steps == 0:
+            event.accept()
+            return
+        # Two cases rather than one expression so a whole notch lands on 1.15
+        # and 1.0 / 1.15 bit for bit, which is what it was before.
+        factor = (_ZOOM_PER_NOTCH ** steps if steps > 0
+                  else (1.0 / _ZOOM_PER_NOTCH) ** -steps)
+        # Re-anchor the zoom under the cursor: scale, then translate the view so
+        # the scene point that was under the mouse stays under the mouse.
+        cursor_pos = event.position().toPoint()
+        before = self.mapToScene(cursor_pos)
+        self.scale(factor, factor)
+        after = self.mapToScene(cursor_pos)
+        delta = after - before
+        self.translate(delta.x(), delta.y())
+        self._clamp_zoom_to_min()
+        if self._fit_mode:
+            self._fit_mode = False
+            self.fit_mode_broken.emit()
+        self._mark_interacting()   # fast scaling while zooming, crisp on settle
+        event.accept()
+
+    def _wheel_scroll(self, event, pixels):
+        """Plain scroll, with the page turn at the edges.
+
+        Continuous scroll: scrolling past the bottom of a page turns to the next
+        page (landing at its top); past the top turns back (landing at its
+        bottom), like Adobe.
+        """
+        if pixels is not None:
+            # Trackpad. Qt's QAbstractScrollArea reads angleDelta only, so
+            # handing a pixel-only event to super() would scroll nothing at all.
+            if self._wheel_turns_page(pixels.y(), TRACKPAD_NOTCH_PX):
                 event.accept()
                 return
             self._mark_interacting()   # fast scaling while panning the page
-            super().wheelEvent(event)
+            scroll_area_by_pixels(self, pixels)
+            event.accept()
+            return
+        if self._wheel_turns_page(event.angleDelta().y(), WHEEL_NOTCH):
+            event.accept()
+            return
+        self._mark_interacting()   # fast scaling while panning the page
+        super().wheelEvent(event)
+
+    def _wheel_turns_page(self, dy, notch) -> bool:
+        """Turn the page once the wheel has pushed a full notch against the edge.
+
+        `dy` is one event's vertical delta, negative going down/forward. `notch`
+        is how much of it counts as one mouse click, so the two devices get
+        measured on the same scale.
+
+        A mouse delivers a whole notch in a single event, so it still turns on the
+        first click past the edge, exactly as before. A trackpad delivers dozens
+        of small events per flick and each one used to turn a page of its own,
+        which is what made two fingers unusable. Now the travel accumulates and
+        only a notch's worth of it turns a page.
+
+        Travel counts only while the view is already against the edge, and the
+        tally resets the moment it is not, so scrolling down a long page never
+        arrives at the bottom with a page turn already banked.
+        """
+        if not dy:
+            return False
+        direction = 1 if dy < 0 else -1     # scrolling down goes forward
+        bar = self.verticalScrollBar()
+        if not self._at_scroll_edge(bar, direction):
+            self._wheel_turn_accum = 0.0
+            self._wheel_turn_dir = 0
+            return False
+        if direction != self._wheel_turn_dir:
+            self._wheel_turn_dir = direction
+            self._wheel_turn_accum = 0.0
+        self._wheel_turn_accum += abs(dy)
+        if self._wheel_turn_accum < notch:
+            return False
+        self._wheel_turn_accum = 0.0
+        return self._turn_page_at_edge(bar, direction)
 
     def keyPressEvent(self, event):
         key = event.key()

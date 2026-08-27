@@ -36,6 +36,17 @@
 Deleting is not confirmed, because it is undoable. The last page cannot be
 deleted: a document has to keep at least one.
 
+## Going to a page
+
+| Key | Action |
+|---|---|
+| `Ctrl+G` | Jump to the page box in the status bar, number selected |
+| Type a number, `Enter` | Go to that page (editor and Organizer both follow) |
+
+The box sits at the right of the status bar with the page count beside it, and
+tracks the page you are on as you scroll. A number past either end clamps to the
+first or last page; an empty or abandoned box snaps back to the page on screen.
+
 ## Files
 
 | Key | Action |
@@ -54,3 +65,9 @@ deleted: a document has to keep at least one.
 | `Shift` while drawing | Constrain to square |
 | Double-click a shape | Add or edit text inside it |
 | `Ctrl+scroll` | Zoom in / out (centered on cursor) |
+| Scroll past the bottom / top of a page | Turn to the next / previous page |
+
+Trackpads scroll by the distance the fingers actually move, so two fingers cover
+the same ground as the same gesture in any other app. Turning a page takes a
+notch's worth of travel pushed against the edge, which is one click of a mouse
+wheel or about 120px of finger, so a flick no longer runs through the document.

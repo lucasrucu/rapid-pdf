@@ -9,6 +9,7 @@ from PySide6.QtGui import QIcon, QColor, QPixmap, QPainter, QDrag
 
 from ui.thumbnails import aspect_ratio_placeholder, draw_thumbnail
 from ui.theme import LIGHT
+from ui.scrolling import TrackpadScrollFilter
 
 THUMB_W = 160
 THUMB_H = 210
@@ -429,6 +430,10 @@ class PageOrganizer(QWidget):
         self._list.itemDoubleClicked.connect(self._on_item_activated)
         # Smooth pixel scrolling + render thumbnails lazily as cells scroll in.
         self._list.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
+        # A trackpad reports pixels, which Qt's own wheel handling drops on the
+        # floor. This scrolls the grid by the pixels the finger actually moved.
+        # Ctrl+wheel passes straight through, so a zoom handler still sees it.
+        self._trackpad_scroll = TrackpadScrollFilter(self._list)
         self._list.verticalScrollBar().valueChanged.connect(self._render_visible)
         layout.addWidget(self._list)
         self._placeholder_cache: dict[tuple[int, int], QPixmap] = {}
@@ -510,6 +515,23 @@ class PageOrganizer(QWidget):
                 continue
             item.setIcon(QIcon(src.render_thumbnail(src_page, max_width=THUMB_W)))
             item.setData(_RENDERED, True)
+
+    def reveal_page(self, page_num: int):
+        """Scroll a page's cell into view and make it current (Ctrl+G lands here too).
+
+        Rows and page numbers agree here: the grid is rebuilt from the document
+        after every structural edit, so row N is page N. A page number the grid
+        does not have is ignored rather than clamped, because the caller already
+        clamped against the live document and a mismatch means this grid is stale.
+        """
+        if not (0 <= page_num < self._list.count()):
+            return
+        item = self._list.item(page_num)
+        if item is None:
+            return
+        self._list.setCurrentItem(item)
+        self._list.scrollToItem(item, QListWidget.ScrollHint.PositionAtCenter)
+        self._render_visible()
 
     def thumb_width(self) -> int:
         return THUMB_W

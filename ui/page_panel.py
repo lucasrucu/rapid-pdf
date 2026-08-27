@@ -8,6 +8,7 @@ from PySide6.QtGui import QIcon, QPixmap, QColor, QPainter, QPen, QDrag
 
 from ui.thumbnails import aspect_ratio_placeholder, draw_thumbnail, fit_size
 from ui.theme import LIGHT, themed_icon, qtawesome_available
+from ui.scrolling import TrackpadScrollFilter
 from core.page_ops import move_rows
 
 
@@ -460,6 +461,9 @@ class PagePanel(QWidget):
         # Smooth pixel-based scrolling instead of jumping a whole page per wheel tick.
         self._list.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
         self._list.verticalScrollBar().setSingleStep(16)
+        # A trackpad reports pixels, which Qt's own wheel handling drops on the
+        # floor. This scrolls the strip by the pixels the finger actually moved.
+        self._trackpad_scroll = TrackpadScrollFilter(self._list)
         self._list.currentRowChanged.connect(self._on_row_changed)
         self._list.itemSelectionChanged.connect(self._on_selection_changed)
         self._list.delete_requested.connect(self._request_delete)
