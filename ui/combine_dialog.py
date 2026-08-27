@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 
 from core.pdf_document import PDFDocument
 from ui.organizer import _DragList, _ThumbDelegate, THUMB_W, THUMB_H, ITEM_W, ITEM_H, _PAGE_ID
+from ui.scrolling import TrackpadScrollFilter, WHEEL_NOTCH, wheel_pixels
 
 # Item payload: ("unit", src_idx) for a whole-file card,
 #               ("page", src_idx, page_idx) for a single page card.
@@ -51,6 +52,8 @@ class CombineDialog(QDialog):
         avail = screen.availableGeometry()
         self.resize(int(avail.width() * 0.92), int(avail.height() * 0.92))
         self._zoom = float(_session_state["zoom"])
+        # Unspent Ctrl+wheel travel, in angleDelta units (120 to a notch).
+        self._zoom_accum = 0
 
         self._merged: fitz.Document | None = None
         self._sources: list[dict] = []   # {path, name, short, pd (PDFDocument)}
@@ -124,6 +127,9 @@ class CombineDialog(QDialog):
         self._list.setSpacing(0)
         self._list.setUniformItemSizes(True)
         self._list.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
+        # Trackpad pixel scrolling. Sits in front of the Ctrl+wheel zoom filter
+        # below, which it leaves alone: it only handles unmodified wheel events.
+        self._trackpad_scroll = TrackpadScrollFilter(self._list)
         self._delegate = _ThumbDelegate(self._list)
         if palette is not None:
             self.apply_palette(palette)
@@ -224,9 +230,25 @@ class CombineDialog(QDialog):
         if (obj is self._list.viewport()
                 and event.type() == QEvent.Type.Wheel
                 and event.modifiers() & Qt.KeyboardModifier.ControlModifier):
-            self._zoom_step(1 if event.angleDelta().y() > 0 else -1)
+            self._zoom_wheel(event)
             return True   # eaten: don't also scroll the grid
         return super().eventFilter(obj, event)
+
+    def _zoom_wheel(self, event):
+        """Ctrl+wheel to the zoom ladder, one rung per notch.
+
+        The travel is banked rather than compared directly, because a trackpad
+        sends a stream of small deltas where a mouse sends one 120-unit notch.
+        Stepping a rung per event would run the grid to its zoom limit off a
+        single two-finger pinch. A whole notch still steps exactly one rung.
+        """
+        pixels = wheel_pixels(event)
+        self._zoom_accum += pixels.y() if pixels is not None else event.angleDelta().y()
+        steps = int(self._zoom_accum / WHEEL_NOTCH)
+        if not steps:
+            return
+        self._zoom_accum -= steps * WHEEL_NOTCH
+        self._zoom_step(1 if steps > 0 else -1)
 
     def _zoom_step(self, direction: int):
         factor = self._zoom * (_ZOOM_STEP if direction > 0 else 1 / _ZOOM_STEP)

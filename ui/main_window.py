@@ -28,6 +28,7 @@ from ui.toolbar import ToolBar
 from ui.page_panel import PagePanel
 from ui.page_commands import DeletePagesCommand, ReorderPagesCommand
 from ui.organizer import PageOrganizer
+from ui.page_jump import PageJump
 from ui.search_bar import SearchBar
 from ui.combine_dialog import CombineDialog
 from ui.theme import ThemeManager, apply_mica, themed_icon
@@ -176,6 +177,12 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self._status)
         self._status.showMessage("Open a PDF to start  (Ctrl+O)")
 
+        # Page box, immediately left of the Fit button. Permanent widgets are laid
+        # out left to right in the order they're added, so this one is added first.
+        self._page_jump = PageJump()
+        self._page_jump.page_requested.connect(self._on_page_jump)
+        self._status.addPermanentWidget(self._page_jump)
+
         self._fit_btn = QPushButton("Fit")
         self._fit_btn.setCheckable(True)
         self._fit_btn.setFixedWidth(40)
@@ -219,6 +226,7 @@ class MainWindow(QMainWindow):
         self._add_action(em, "Send to Back", self._canvas.send_to_back, "Ctrl+[")
 
         pm = mb.addMenu("Page")
+        self._add_action(pm, "Go to Page…", self._focus_page_jump, "Ctrl+G")
         self._add_action(pm, "Delete Current Page", self.delete_current_page)
 
         vm = mb.addMenu("View")
@@ -1015,14 +1023,30 @@ class MainWindow(QMainWindow):
         org_thumb = self._canvas.grab_current_thumbnail(self._organizer.thumb_width())
         self._organizer.update_page_thumbnail(self._current_page, org_thumb)
 
+    def _focus_page_jump(self):
+        """Ctrl+G / Page > Go to Page. Puts the cursor in the status-bar page box."""
+        self._page_jump.focus_box()
+
+    def _on_page_jump(self, page_num: int):
+        """A page number was typed into the status-bar box.
+
+        Moves the editor and, when it holds pages, the Organizer grid too, so
+        whichever tab is in front lands on the page that was asked for.
+        """
+        self._on_page_selected(page_num)
+        self._organizer.reveal_page(page_num)
+
     def _update_status(self, extra: str = ""):
         self._update_title()
         if self._doc.doc:
             name = self._doc.path or "Untitled"
             base = f"{name}  —  page {self._current_page + 1} of {self._doc.page_count()}"
             self._status.showMessage(f"{base}  {extra}".strip())
+            self._page_jump.set_total(self._doc.page_count())
+            self._page_jump.set_current_page(self._current_page)
         else:
             self._status.showMessage(extra or "Open a PDF to start  (Ctrl+O)")
+            self._page_jump.set_total(0)
 
     def _on_fit_toggled(self, checked: bool):
         self._canvas.set_fit_mode(checked)
