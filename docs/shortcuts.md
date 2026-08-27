@@ -1,4 +1,4 @@
-# Keyboard & mouse shortcuts
+﻿# Keyboard & mouse shortcuts
 
 ## Tools
 
@@ -46,6 +46,19 @@ deleted: a document has to keep at least one.
 The box sits at the right of the status bar with the page count beside it, and
 tracks the page you are on as you scroll. A number past either end clamps to the
 first or last page; an empty or abandoned box snaps back to the page on screen.
+### Thumbnail zoom (Organizer only)
+
+| Action | Result |
+|---|---|
+| `Ctrl+scroll` | Grow / shrink the page thumbnails, anchored under the cursor |
+| `Ctrl++` / `Ctrl+=` | One step bigger (numpad `+` too) |
+| `Ctrl+-` | One step smaller (numpad `-` too) |
+| `Ctrl+0` | Back to the default size |
+
+Seven steps from half size to double. Thumbnails are re-rendered at the new
+size rather than stretched, so zooming in makes a page genuinely readable. The
+level is remembered between runs. Plain scrolling is unaffected, and the left
+strip keeps its own size.
 
 ## Files
 
