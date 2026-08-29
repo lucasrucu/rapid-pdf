@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (
     QFileDialog, QMessageBox, QStatusBar, QApplication,
     QToolButton, QButtonGroup,
 )
-from PySide6.QtCore import QTimer, Qt, QSize
+from PySide6.QtCore import QTimer, Qt, QSize, Signal
 from PySide6.QtGui import QAction, QGuiApplication, QKeySequence, QShortcut, QIcon
 
 # Debounce for search-as-you-type: long enough that fast typing doesn't
@@ -29,12 +29,13 @@ _FIT_CONTROLS = [
 
 from core.pdf_document import PDFDocument
 from core.page_ops import is_permutation
-from core.settings import settings
+from core.settings import dialog_start_dir, remember_dialog_dir, settings
 from core.resources import app_icon_path
 from core.ocr_worker import run_ocr_enhance
 from core.version import APP_VERSION
 from ui.update_notice import UpdateNotice
-from ui.canvas import PDFCanvas
+from ui.canvas import PDFCanvas, FIT_MODES
+from ui.preferences_dialog import PreferencesDialog
 from ui.toolbar import ToolBar
 from ui.page_panel import PagePanel
 from ui.page_commands import DeletePagesCommand, ReorderPagesCommand
@@ -46,8 +47,14 @@ from ui.theme import ThemeManager, apply_mica, themed_icon, qtawesome_available,
 
 
 class MainWindow(QMainWindow):
+    #: The page-fit mode was chosen, by whichever surface chose it. The status
+    #: bar's icon group and the Preferences dropdown are two views of this one
+    #: value, so both go through choose_fit_mode() and both listen here.
+    fit_mode_chosen = Signal(str)
+
     def __init__(self, theme: ThemeManager | None = None):
         super().__init__()
+        self._prefs_dialog = None  # the one Preferences window, while it is open
         # Theme: use the passed-in manager, or stand one up (e.g. tests/smoke).
         self._theme = theme or ThemeManager(QApplication.instance())
         self._doc = PDFDocument()
@@ -274,6 +281,9 @@ class MainWindow(QMainWindow):
         em.addSeparator()
         self._add_action(em, "Bring to Front", self._canvas.bring_to_front, "Ctrl+]")
         self._add_action(em, "Send to Back", self._canvas.send_to_back, "Ctrl+[")
+        em.addSeparator()
+        # Ctrl+, is where every other app on this machine puts it.
+        self._add_action(em, "Preferences…", self.open_preferences, "Ctrl+,")
 
         pm = mb.addMenu("Page")
         self._add_action(pm, "Go to Page…", self._focus_page_jump, "Ctrl+G")
@@ -302,16 +312,47 @@ class MainWindow(QMainWindow):
                         self._theme.palette.text))
 
         hm = mb.addMenu("Help")
-        self._add_action(hm, "Check for Updates…", self._check_for_updates)
+        # The version, sitting directly above the control that asks whether it
+        # is the newest one. Disabled because it is a statement, not a command:
+        # "Check for Updates" is the only thing here to press, and the number it
+        # is talking about should be readable without pressing anything.
+        self._version_action = QAction(f"Rapid PDF v{APP_VERSION}", self)
+        self._version_action.setEnabled(False)
+        hm.addAction(self._version_action)
+        self._add_action(hm, "Check for Updates…", self.check_for_updates)
+        hm.addSeparator()
         self._add_action(hm, "About Rapid PDF", self._about)
+
+    # ------------------------------------------------------------------
+    # Preferences (see ui/preferences_dialog.py)
+    # ------------------------------------------------------------------
+
+    def open_preferences(self):
+        """Edit > Preferences / Ctrl+, . One dialog, raised if already open.
+
+        Not modal: the point of the dialog is that its controls and the View
+        menu's are the same controls, and a modal window would eat the Ctrl+B
+        and Ctrl+D that demonstrate it.
+        """
+        if self._prefs_dialog is None:
+            # Built once and kept. Deleting it on close and rebuilding it would
+            # mean tearing down and re-making the connections that are the
+            # whole point of it, for no gain: it is six controls.
+            self._prefs_dialog = PreferencesDialog(self)
+        else:
+            self._prefs_dialog.reload()
+        self._prefs_dialog.show()
+        self._prefs_dialog.raise_()
+        self._prefs_dialog.activateWindow()
+        return self._prefs_dialog
 
     # ------------------------------------------------------------------
     # Updates (see ui/update_notice.py and core/update/)
     # ------------------------------------------------------------------
 
-    def _check_for_updates(self):
-        """Help menu. Same check as startup, but it says so when there is
-        nothing to report, because somebody asked."""
+    def check_for_updates(self):
+        """Help menu, and the Preferences button. Same check as startup, but it
+        says so when there is nothing to report, because somebody asked."""
         self._update_notice.start_check(manual=True)
 
     def _about(self):
@@ -364,10 +405,12 @@ class MainWindow(QMainWindow):
 
     def open_pdf(self):
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "Open / Combine PDFs", "", "PDF Files (*.pdf)"
+            self, "Open / Combine PDFs", dialog_start_dir(self._doc.path),
+            "PDF Files (*.pdf)"
         )
         if not paths:
             return
+        remember_dialog_dir(paths[0])
         self.open_paths(sorted(paths))  # combine in filename order
 
     def open_paths(self, paths: list):
@@ -412,6 +455,7 @@ class MainWindow(QMainWindow):
         # file with baked markup and no model (or none to restore) still needs the
         # panel re-rendered so it matches the page rather than the pre-strip doc.
         self._refresh_panel_thumbnails()
+        self._apply_default_fit()
         self._update_status(
             f"Combined {len(paths)} files" if len(paths) > 1 else ""
         )
@@ -421,10 +465,12 @@ class MainWindow(QMainWindow):
         only when Combine is clicked. Any open document is closed first (with
         the usual save prompt)."""
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "Combine PDFs", "", "PDF Files (*.pdf)"
+            self, "Combine PDFs", dialog_start_dir(self._doc.path),
+            "PDF Files (*.pdf)"
         )
         if not paths:
             return
+        remember_dialog_dir(paths[0])
         if self._doc.doc:
             self.close_pdf()          # prompts to save; may be cancelled
             if self._doc.doc:
@@ -478,6 +524,7 @@ class MainWindow(QMainWindow):
         self._search_term = None
         self._mark_dirty()
         self._refresh_panel_thumbnails()
+        self._apply_default_fit()
         self._update_status(f"Combined {len(paths)} files (not saved yet)")
 
     def _append_pdfs(self, paths) -> int:
@@ -594,9 +641,12 @@ class MainWindow(QMainWindow):
     def save_pdf_as(self) -> bool:
         if not self._doc.doc:
             return False
-        path, _ = QFileDialog.getSaveFileName(self, "Save PDF As", "", "PDF Files (*.pdf)")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save PDF As", dialog_start_dir(self._doc.path),
+            "PDF Files (*.pdf)")
         if not path:
             return False
+        remember_dialog_dir(path)
         self._flush_annotations()
         if self._doc.save(path):  # save() adopts `path` as the new canonical path
             self._after_successful_save(f"Saved to {path}")
@@ -1107,9 +1157,55 @@ class MainWindow(QMainWindow):
             self._status.showMessage(extra or "Open a PDF to start  (Ctrl+O)")
             self._page_jump.set_total(0)
 
-    def _on_fit_clicked(self, mode: str):
+    # ------------------------------------------------------------------
+    # What Preferences edits. Narrow on purpose: the dialog holds no copy of
+    # any setting, it drives and follows the same objects the menus do.
+    # ------------------------------------------------------------------
+
+    def page_panel_action(self) -> QAction:
+        """The View menu's Show Page Panel action, which owns that setting."""
+        return self._panel_action
+
+    def theme_manager(self) -> ThemeManager:
+        """The ThemeManager, which owns the theme and persists it itself."""
+        return self._theme
+
+    def fit_mode_labels(self) -> dict:
+        """mode -> the name it goes by, in the order the status bar shows it."""
+        return {mode: tip for mode, _, tip, _ in _FIT_CONTROLS}
+
+    def current_fit_mode(self) -> str:
+        """The chosen page-fit mode.
+
+        This is the remembered choice, not the live state of the canvas: a
+        manual zoom breaks the fit that is applied without changing the mode
+        the user picked, and it is the pick that both controls display.
+        """
+        return settings().view.default_fit_mode
+
+    def choose_fit_mode(self, mode: str):
+        """Apply a page-fit mode, show it as chosen, and remember it.
+
+        The single entry point. The status bar's icons and the Preferences
+        dropdown both call this and both listen to `fit_mode_chosen`, which is
+        what keeps them from drifting into two separate values.
+        """
+        if mode not in FIT_MODES:
+            return
         self._canvas.set_fit_mode(mode)
+        button = self._fit_btns.get(mode)
+        if button is not None:
+            button.setChecked(True)
         self._retint_fit_icons(self._theme.palette)
+        settings().view.default_fit_mode = mode
+        self.fit_mode_chosen.emit(mode)
+
+    def _apply_default_fit(self):
+        """A freshly opened document starts in the remembered view mode."""
+        self.choose_fit_mode(settings().view.default_fit_mode)
+
+    def _on_fit_clicked(self, mode: str):
+        self.choose_fit_mode(mode)
 
     def _retint_fit_icons(self, palette):
         """The active mode sits on an accent fill, so its glyph has to flip to the
