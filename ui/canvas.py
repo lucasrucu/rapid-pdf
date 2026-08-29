@@ -609,6 +609,38 @@ class RemoveItemsCommand(_Command):
             it.setSelected(True)
 
 
+class LiftImageCommand(_Command):
+    """Lifting an embedded image out of the page, as one undoable step.
+
+    A lift is two edits at once: the image's placement operator leaves the page
+    content, and an ImageAnnotationItem takes its place on the canvas. Undo puts
+    both back, so the page renders exactly as it did before the image was
+    touched. Only pushed when the placement-removal path ran. The redaction
+    fallback rewrites the image's pixels, which restoring a content stream can't
+    bring back, so there is nothing safe to undo there.
+    """
+
+    def __init__(self, canvas, item, page_num, before, after, text="Lift image"):
+        super().__init__(canvas, text)
+        self._item = item
+        self._page_num = page_num
+        self._before = before
+        self._after = after
+
+    def _apply(self, snapshot):
+        self._canvas._doc.restore_page_content(self._page_num, snapshot)
+        self._canvas._invalidate_embedded_scan()
+        self._canvas._refresh_page_background(self._page_num)
+
+    def _do_redo(self):
+        self._canvas._attach_item(self._item)
+        self._apply(self._after)
+
+    def _do_undo(self):
+        self._canvas._detach_item(self._item)
+        self._apply(self._before)
+
+
 class MoveCommand(_Command):
     def __init__(self, canvas, items, dx, dy, text="Move"):
         super().__init__(canvas, text)
@@ -864,6 +896,22 @@ class PDFCanvas(QGraphicsView):
         lst = self._page_annotations.get(item.page_num, [])
         if item in lst:
             lst.remove(item)
+
+    def _invalidate_embedded_scan(self):
+        """Force the next embedded-image hit-test to re-scan the current page.
+
+        Used whenever a page's content changes underneath the scan (a lift, or a
+        lift being undone), because the scan is keyed on a page whose images may
+        no longer be the ones it recorded.
+        """
+        self._embedded_images = None
+        self._embedded_images_page = -1
+
+    def _refresh_page_background(self, page_num: int):
+        """Re-render the page behind the markup after its content changed."""
+        if self._bg_item is not None and self._doc and page_num == self._current_page:
+            self._bg_item.setPixmap(self._doc.render_page_cached(page_num, self._zoom))
+            self._bg_item.update()   # invalidate the item cache so the change shows
 
     def _cancel_interaction(self):
         """Drop any in-progress marquee/drag so a page or tool switch starts clean."""
@@ -1800,11 +1848,19 @@ class PDFCanvas(QGraphicsView):
         buf.close()
         image_bytes = bytes(buf.data())
 
+        # Snapshot the page content before the removal, so the lift itself can be
+        # undone. Only the placement-removal path below is reversible from this;
+        # see LiftImageCommand.
+        content_before = self._doc.page_content_snapshot(page_num)
+        placement_removed = False
+
         try:
             # Preferred: drop the image's single content-stream placement operator.
             # That removes the image while leaving the background behind it intact —
             # no white hole where it sat (the way a real editor moves an object).
-            if not self._doc.remove_image_placement(page_num, xref):
+            if self._doc.remove_image_placement(page_num, xref):
+                placement_removed = True
+            else:
                 # Fallback for images that aren't a tight `cm /Name Do` placement:
                 # redact PIXELS (blanks only the pixels under the rect, so it never
                 # wipes the whole-page background like IMAGE_REMOVE would — but it can
@@ -1847,6 +1903,14 @@ class PDFCanvas(QGraphicsView):
             self._embedded_images_page = page_num
         self._scene.clearSelection()
         item.setSelected(True)
+        # Record the lift so Ctrl+Z puts the image back into the page. Skipped on
+        # the redaction fallback, whose pixel wipe a content-stream restore can't
+        # reverse; the move that follows a lift is recorded either way, so an
+        # accidental drag is always at least recoverable to where the image sat.
+        if placement_removed and content_before is not None:
+            self._push(LiftImageCommand(
+                self, item, page_num, content_before,
+                self._doc.page_content_snapshot(page_num)))
         self.annotation_changed.emit()
         return item
 
@@ -1900,7 +1964,6 @@ class PDFCanvas(QGraphicsView):
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_moved = False
             self._drag_total = QPointF(0, 0)
-            self._drag_is_lift = False
             if self._tool == "select":
                 res_item, res_handle = self._handle_at(scene_pos)
                 if res_item and res_handle:
@@ -2108,7 +2171,6 @@ class PDFCanvas(QGraphicsView):
                         self._drag_applied = delta
                         self._drag_total = delta
                         self._drag_moved = True
-                        self._drag_is_lift = True
                         self._mark_interacting()
                     else:
                         # Lift failed → fall back to a marquee from here on.
@@ -2195,19 +2257,20 @@ class PDFCanvas(QGraphicsView):
                     self.annotation_changed.emit()
                     self._dup_clones = []
                     self._duplicating = False
-                elif self._drag_moved and not self._drag_is_lift:
-                    # An existing selection was moved — record one undoable step.
+                elif self._drag_moved:
+                    # The selection was moved, so record one undoable step. A drag
+                    # that lifted an embedded image out of the page counts too:
+                    # the lift is its own command underneath this one, so the
+                    # first Ctrl+Z puts the image back where it sat and a second
+                    # drops it back into the page.
                     self._push(MoveCommand(
                         self, list(self._drag_items),
                         self._drag_total.x(), self._drag_total.y()))
                     self.annotation_changed.emit()
-                elif self._drag_moved:
-                    self.annotation_changed.emit()  # lifted image moved (not undoable)
                 self._autoscroll_timer.stop()
                 self._drag_items = []
                 self._drag_start = None
                 self._drag_moved = False
-                self._drag_is_lift = False
                 self._drag_anchor = None
                 self._drag_applied = QPointF(0, 0)
 
@@ -2229,8 +2292,8 @@ class PDFCanvas(QGraphicsView):
                 # other apps are reachable with a click, not just an obscure drag.
                 # _embedded_image_at's near-full-page guard keeps a whole-page
                 # scan from being lifted, so this can't flip the page.
-                # (Note: a lift isn't on the undo stack — same as the drag path —
-                # but it's non-destructive: the image just becomes a movable copy.)
+                # The lift records itself on the undo stack (see LiftImageCommand),
+                # so a click that grabs an image by accident is Ctrl+Z-able.
                 # A Shift (additive) click never lifts: it preserves the selection.
                 if self._lift_candidate is not None and not self._press_additive:
                     self._lift_embedded_image(*self._lift_candidate)
