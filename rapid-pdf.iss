@@ -61,6 +61,11 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 ; eng.traineddata (the OCR language data; PyMuPDF embeds the engine, this
 ; file is the only OCR dependency that must ship).
 Source: "dist\rapid-pdf\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; The .pdf FILE icon, copied to the app root on purpose. PyInstaller buries
+; bundled data under {app}\_internal\assets\, and the shell holds DefaultIcon
+; as a literal path forever; keeping it at {app}\pdf-document.ico means a
+; PyInstaller layout change can never leave every PDF on the machine iconless.
+Source: "assets\pdf-document.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [InstallDelete]
 ; 1.1.0 put its shortcuts in a "Rapid PDF" Start Menu FOLDER ({group}); from
@@ -90,7 +95,16 @@ Root: HKCU; Subkey: "Software\Classes\RapidPDF.Document\shell\combine"; ValueTyp
 ;
 ; ProgID with a clean "open" verb: right-click a .pdf > Open with Rapid PDF.
 Root: HKCU; Subkey: "Software\Classes\RapidPDF.Document"; ValueType: string; ValueData: "PDF Document"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\RapidPDF.Document\DefaultIcon"; ValueType: string; ValueData: "{app}\{#AppExeName},0"
+; DefaultIcon is the icon Explorer paints on every .pdf FILE once the user
+; picks Rapid PDF as their default handler. Up to 1.5.0 it pointed at the exe,
+; so choosing us repainted every PDF on the machine with the gold app tile.
+; That is the wrong image for the job: the app icon identifies the APP, the
+; document icon identifies the FILE TYPE, and PDFs have read as a white page
+; with a red PDF label for twenty years. Changing that just confuses people
+; about what the file is. So this points at a document icon of our own
+; (assets\pdf-document.ico, regen: python tools\make_document_icon.py); the
+; exe, the Start-menu shortcut and the window all still carry rapid-pdf.ico.
+Root: HKCU; Subkey: "Software\Classes\RapidPDF.Document\DefaultIcon"; ValueType: string; ValueData: "{app}\pdf-document.ico,0"
 Root: HKCU; Subkey: "Software\Classes\RapidPDF.Document\shell\open"; ValueType: string; ValueData: "Open with {#AppName}"
 ; Explicit, even though Document is what the shell infers for a command-line
 ; verb: "open" makes a top-level window per item, so the 15-item cap is right.
@@ -118,6 +132,8 @@ Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations"; Flags: uninsdelet
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf"; Flags: uninsdeletekeyifempty
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell"; Flags: uninsdeletekeyifempty
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\RapidPDF.Combine"; ValueType: string; ValueName: "MUIVerb"; ValueData: "Combine with {#AppName}"; Flags: uninsdeletekey
+; This one stays the APP icon, and should. A context-menu verb icon says which
+; program is about to run, not what the file is, so the gold tile is right here.
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\RapidPDF.Combine"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#AppExeName},0"
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\RapidPDF.Combine"; ValueType: string; ValueName: "MultiSelectModel"; ValueData: "Player"
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\RapidPDF.Combine\command"; ValueType: string; ValueData: """{app}\{#AppExeName}"" --combine ""%1"""
@@ -145,3 +161,42 @@ Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; F
 ; and add `SignTool=signtool` under [Setup] to sign the generated setup.exe.
 ; Sign the app exe (dist\rapid-pdf\rapid-pdf.exe) BEFORE compiling this script.
 ; -----------------------------------------------------------------------------
+
+[Code]
+// Tell the shell the file associations moved. Explorer caches the icon for a
+// file type and will happily keep drawing the old one for the rest of the
+// session (and past a reboot, out of iconcache_*.db) unless it is told.
+//
+// This matters most on the 1.5.0 -> next upgrade: those users already have
+// RapidPDF.Document\DefaultIcon pointing at the exe and every PDF painted
+// gold. The registry value changes under them; without this call nothing on
+// screen changes until something else happens to invalidate the cache.
+//
+// SHCNE_ASSOCCHANGED is the documented way to do it and is what Explorer
+// itself fires when you change a default app. It is also the honest limit of
+// what an installer can do: it does not delete the icon cache database, so a
+// machine that has wedged its cache may still need a sign-out, or a manual
+// `ie4uinit.exe -show`. The new value is a different PATH from the old one
+// (pdf-document.ico, not rapid-pdf.exe), which is the case the shell handles
+// best, since cache entries are keyed on path plus index.
+const
+  SHCNE_ASSOCCHANGED = $08000000;
+  SHCNF_IDLIST       = $00000000;
+
+procedure SHChangeNotify(wEventId: Integer; uFlags: Cardinal;
+  dwItem1, dwItem2: Cardinal);
+  external 'SHChangeNotify@shell32.dll stdcall';
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, 0, 0);
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  // Same on the way out: the ProgID and its icon are gone, so whatever owns
+  // .pdf next should be drawn instead of a stale Rapid PDF page.
+  if CurUninstallStep = usPostUninstall then
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, 0, 0);
+end;

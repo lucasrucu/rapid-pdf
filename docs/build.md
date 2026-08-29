@@ -25,6 +25,16 @@ Prerequisites (one-time):
 Files that drive the build (all committed):
 
 - `assets/rapid-pdf.ico` — multi-size Qori app icon (regen: `python tools/make_icon.py`).
+  This is the APP icon: the exe, taskbar, Start menu, title bar, uninstaller.
+- `assets/pdf-document.ico` — multi-size PDF **document** icon, 16 to 256px
+  (regen: `python tools/make_document_icon.py`). This is the FILE icon, the one
+  the installer wires to `RapidPDF.Document\DefaultIcon` so Explorer paints it
+  on .pdf files. Deliberately a plain white page with a red PDF label and not
+  the gold tile: until 1.5.0 both jobs shared the app icon, so picking Rapid
+  PDF as the default handler turned every PDF on the machine gold. Keep them
+  separate. The installer copies this one to `{app}` with its own `[Files]`
+  line, because DefaultIcon is stored as a literal path and must not depend on
+  where PyInstaller happens to put bundled assets.
 - `packaging/version_info.txt` — exe version/publisher metadata.
 - `rapid-pdf.spec` — PyInstaller onedir spec (icon + version + bundles assets +
   qtawesome fonts).
