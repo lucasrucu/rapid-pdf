@@ -27,10 +27,18 @@ Background tabs also stop holding what nobody is looking at, which is why
 `_set_current_view` tells the leaving view it is no longer active. The
 releasing itself is DocumentView's, where phase 1 put the clone lifecycle.
 
-WHAT IS STILL DELIBERATELY NOT HERE. MRU Ctrl+Tab ordering: the next/previous
-shortcuts are positional and this class holds no visit history. The tear-off
-gesture is phase 4, and it will drive `detach`/`adopt` rather than replace
-them.
+PHASE 4 ADDED THE GESTURE AND THE VISIT HISTORY. The tear-off itself lives in
+`ui/tab_tear_off.py`; what is here is the three mouse events and the key press
+forwarded into it, and the insertion line the bar paints while a tab is hovering
+over it. It drives `detach`/`adopt` through MainWindow exactly as the menu item
+does, so switching it off would cost the gesture and nothing else.
+
+The MRU list is the other half. `_mru` is a visit history for TABS, which is a
+different list from the registry's activation order for WINDOWS, and Ctrl+Tab
+needs the first one. It is FROZEN while the walk is in flight (`_mru_walk`), so
+holding Ctrl and tapping Tab walks a stable stack instead of swapping the top
+two entries back and forth forever. Ctrl+PgDn stays strictly positional: the
+two orders are deliberately different and `step_current` is untouched.
 """
 
 from __future__ import annotations
@@ -44,6 +52,8 @@ from PySide6.QtWidgets import (
     QTabBar, QToolButton, QVBoxLayout, QWidget,
 )
 
+from ui.tab_tear_off import TabTearOff
+
 # Tabs share the bar equally until they hit the ceiling, then shrink to the
 # floor, and only once every tab is at the floor does the bar start scrolling.
 # That order is the point: scrolling hides tabs, eliding only shortens them.
@@ -56,6 +66,11 @@ CHEVRON_WIDTH = 26
 
 # The unsaved-changes dot, drawn in place of the close X.
 DIRTY_DOT_RADIUS = 3.5
+
+# The line drawn where a torn-off tab would land. Two pixels, in the accent, and
+# full height: it has to read as "between these two tabs" from the corner of the
+# eye, while the thing actually being looked at is the window under the cursor.
+DROP_LINE_WIDTH = 2
 
 
 def tab_titles(paths: list) -> list:
@@ -224,6 +239,73 @@ class DocumentTabBar(QTabBar):
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.DefaultContextMenu)
         self._palette = None
+        # Phase 4. Set by DocumentArea, which owns both halves of the move.
+        self._tear_off = None
+        # x of the insertion line while a torn-off tab is over this bar, or None.
+        self._drop_x = None
+
+    # -- the tear-off gesture ------------------------------------------
+
+    def set_tear_off(self, controller):
+        """The phase 4 gesture controller, installed by DocumentArea."""
+        self._tear_off = controller
+
+    def tear_off(self):
+        return self._tear_off
+
+    def set_drop_indicator(self, x):
+        """Draw (or clear) the insertion line at `x`. None clears it."""
+        if x == self._drop_x:
+            return
+        self._drop_x = x
+        self.update()
+
+    def drop_indicator(self):
+        """Where the insertion line is, or None. Named for the tests, which
+        cannot see pixels but can ask the question the pixels answer."""
+        return self._drop_x
+
+    def insertion_x(self, index: int) -> int:
+        """The x a tab inserted at `index` would start at.
+
+        Past the last tab is its right edge, so dropping on empty bar space
+        draws the line after everything rather than at the origin.
+        """
+        if self.count() == 0:
+            return 0
+        if index >= self.count():
+            return self.tabRect(self.count() - 1).right()
+        return self.tabRect(max(0, index)).left()
+
+    def mousePressEvent(self, event):
+        """Record the grab, then let QTabBar have the event.
+
+        `super()` is not optional: it is what still gives us Qt's own reorder
+        and the current-tab change. The tear-off decides nothing here.
+        """
+        if self._tear_off is not None:
+            self._tear_off.press(event)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        # Once the threshold is crossed the gesture owns the mouse, and feeding
+        # QTabBar any more moves would have it reordering a tab that is no
+        # longer in this bar.
+        if self._tear_off is not None and self._tear_off.move(event):
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._tear_off is not None and self._tear_off.release(event):
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        # Only ever reached mid-drag: the bar has NoFocus, and the gesture
+        # grabs the keyboard precisely so Escape lands here.
+        if self._tear_off is not None and self._tear_off.key_press(event):
+            return
+        super().keyPressEvent(event)
 
     # -- geometry ------------------------------------------------------
 
@@ -298,6 +380,23 @@ class DocumentTabBar(QTabBar):
 
     # -- gestures ------------------------------------------------------
 
+    def paintEvent(self, event):
+        """The tabs, and over them the insertion line if one is asked for.
+
+        Drawn on top rather than as part of a tab, because the line belongs to
+        the gap BETWEEN two tabs and there is no tab at the end of the bar for
+        it to belong to.
+        """
+        super().paintEvent(event)
+        if self._drop_x is None:
+            return
+        painter = QPainter(self)
+        colour = QColor(self._palette.accent) if self._palette is not None \
+            else QColor("#3b82f6")
+        left = max(0, min(int(self._drop_x) - DROP_LINE_WIDTH // 2,
+                          self.width() - DROP_LINE_WIDTH))
+        painter.fillRect(QRect(left, 0, DROP_LINE_WIDTH, self.height()), colour)
+
     def mouseDoubleClickEvent(self, event):
         """Empty space opens a new tab. A double-click ON a tab does nothing.
 
@@ -347,6 +446,14 @@ class DocumentArea(QWidget):
         super().__init__(parent)
         self._current_view = None
         self._syncing = False       # a bar/stack edit is mid-flight
+        # Most recently looked at FIRST. A visit history for TABS, which is not
+        # the same list as the registry's activation order for WINDOWS: that
+        # one answers "where does a new file go", this one answers Ctrl+Tab.
+        self._mru: list = []
+        # A frozen copy of the above while Ctrl is held down, plus where in it
+        # the walk has got to. None means no walk is in flight.
+        self._mru_walk = None
+        self._mru_pos = 0
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -366,6 +473,10 @@ class DocumentArea(QWidget):
         self._bar.tabCloseRequested.connect(self.tab_close_requested)
         self._bar.new_tab_requested.connect(self.new_tab_requested)
         self._bar.tab_menu_requested.connect(self._on_tab_menu)
+        # Phase 4. The bar forwards its mouse events in here; everything the
+        # gesture then does goes back out through MainWindow's move methods.
+        self._tear_off = TabTearOff(self._bar, self)
+        self._bar.set_tear_off(self._tear_off)
         header_row.addWidget(self._bar, stretch=1)
 
         # Every tab in one list, for when there are more than the bar can show
@@ -556,6 +667,7 @@ class DocumentArea(QWidget):
         finally:
             self._syncing = False
         self._disconnect_view(view)
+        self._forget_visit(view)
         self._refresh_titles()
         self._sync_header_visibility()
         self._resync_current()
@@ -585,6 +697,7 @@ class DocumentArea(QWidget):
         finally:
             self._syncing = False
         self._disconnect_view(view)
+        self._forget_visit(view)
         view.teardown()
         view.setParent(None)
         view.deleteLater()
@@ -604,13 +717,82 @@ class DocumentArea(QWidget):
     def step_current(self, delta: int):
         """Positional next/previous, wrapping. Ctrl+PgDn and Ctrl+PgUp.
 
-        Positional on purpose: the most-recently-used ordering behind Ctrl+Tab
-        is phase 3, and it needs a visit history this class does not keep.
+        Positional on purpose, and it stayed that way when phase 4 added the
+        MRU walk below. They are two different orders and conflating them is
+        the mistake: this one is "the tab to the right", `step_mru` is "the tab
+        I was just in", and a user reaches for each of them for its own reason.
         """
         count = self._bar.count()
         if count < 2:
             return
         self.set_current_index((self._bar.currentIndex() + delta) % count)
+
+    # ------------------------------------------------------------------
+    # Most recently used, for Ctrl+Tab
+    # ------------------------------------------------------------------
+
+    def _note_visit(self, view):
+        """This tab became the front one. Ignored while a walk is in flight.
+
+        The freeze is the whole design. Recording every step of a walk would
+        put the tab just landed on at the top of the list, so the next tap
+        would come straight back, and holding Ctrl would flip between two tabs
+        forever instead of walking back through the stack.
+        """
+        if view is None or self._mru_walk is not None:
+            return
+        self._mru = [v for v in self._mru if v is not view]
+        self._mru.insert(0, view)
+
+    def _forget_visit(self, view):
+        self._mru = [v for v in self._mru if v is not view]
+        if self._mru_walk is not None:
+            self._mru_walk = [v for v in self._mru_walk if v is not view]
+
+    def mru_order(self) -> list:
+        """Every open view, most recently looked at first.
+
+        Anything never visited (a background tab opened alongside others) comes
+        last, in tab order, so the list always names every tab exactly once
+        however the history got there.
+        """
+        live = self.views()
+        ordered = [v for v in self._mru if any(v is w for w in live)]
+        ordered += [v for v in live if not any(v is o for o in ordered)]
+        return ordered
+
+    def is_walking_mru(self) -> bool:
+        return self._mru_walk is not None
+
+    def step_mru(self, delta: int) -> bool:
+        """One tap of Ctrl+Tab. True if a walk is now in flight.
+
+        The caller is what notices Ctrl coming up: see
+        MainWindow._start_mru_walk, which arms an application event filter on a
+        True and disarms it on the release.
+        """
+        if self.count() < 2:
+            return False
+        if self._mru_walk is None:
+            self._mru_walk = self.mru_order()
+            self._mru_pos = 0
+        order = self._mru_walk
+        if len(order) < 2:
+            self._mru_walk = None
+            return False
+        self._mru_pos = (self._mru_pos + delta) % len(order)
+        index = self.index_of(order[self._mru_pos])
+        if index >= 0:
+            self.set_current_index(index)
+        return True
+
+    def end_mru_walk(self):
+        """Ctrl came up. Whatever tab it landed on is now the most recent."""
+        if self._mru_walk is None:
+            return
+        self._mru_walk = None
+        self._mru_pos = 0
+        self._note_visit(self._current_view)
 
     # ------------------------------------------------------------------
     # Staying in step
@@ -652,6 +834,9 @@ class DocumentArea(QWidget):
             previous.set_active(False)
         if new is not None:
             new.set_active(True)
+        # The one place a tab is looked at, so the one place the visit history
+        # is written. Frozen mid-walk; see _note_visit.
+        self._note_visit(new)
         self.current_view_changed.emit(previous, new)
         return True
 

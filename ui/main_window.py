@@ -132,6 +132,8 @@ class MainWindow(QMainWindow):
         self._force_quit = False # Quit menu wants a real app quit, not "close PDF"
         self._session_ending = False  # Windows is ending the session; never block it
         self._mica_applied = False  # the backdrop needs an HWND, so it waits for show()
+        self._screen_watched = False  # so does the QWindow behind screenChanged
+        self._mru_filter_on = False   # a Ctrl+Tab walk is waiting on Ctrl coming up
         # Joined BEFORE anything that asks the registry a question. In
         # particular _should_check_for_updates counts the windows already in it,
         # so a window that has not joined would think it was the first.
@@ -240,6 +242,30 @@ class MainWindow(QMainWindow):
         if not self._mica_applied:
             self._mica_applied = True
             apply_mica(self, self._theme.is_dark)
+        self._watch_screen_changes()
+
+    def _watch_screen_changes(self):
+        """Notice when this window is dragged onto a monitor at another scale.
+
+        Same reason as the Mica line above: there is no `QWindow` to listen to
+        until the widget has been shown. Phase 4 needs it because the tear-off
+        can put a document on a different monitor in one gesture, and a cached
+        page pixmap is DEVICE-dependent: rendered for a 1.0 screen and shown on
+        a 1.5 one it is soft, and the panel thumbnails with it.
+        """
+        if self._screen_watched:
+            return
+        handle = self.windowHandle()
+        if handle is None:
+            return
+        self._screen_watched = True
+        handle.screenChanged.connect(self._on_screen_changed)
+
+    def _on_screen_changed(self, _screen=None):
+        """Every open document in this window re-renders. Nothing about the
+        documents changed; their cached pixmaps are for the wrong device."""
+        for view in self._area.views():
+            view.rerender_for_screen_change()
 
     def changeEvent(self, event):
         """Tell the registry when this window comes to the front.
@@ -249,8 +275,15 @@ class MainWindow(QMainWindow):
         the window being read rather than the oldest one.
         """
         super().changeEvent(event)
-        if event.type() == QEvent.Type.ActivationChange and self.isActiveWindow():
+        if event.type() != QEvent.Type.ActivationChange:
+            return
+        if self.isActiveWindow():
             self._registry.note_activated(self)
+        elif self._mru_filter_on:
+            # Alt+Tab away with Ctrl still down and the release never arrives
+            # here. Losing activation ends the walk, or the filter would sit
+            # installed until some unrelated Ctrl came up.
+            self._end_mru_walk()
 
     def raise_and_focus(self):
         """Un-minimize, raise and focus. What an Explorer launch or a drop
@@ -329,8 +362,12 @@ class MainWindow(QMainWindow):
                 pass
         self._disconnect_view(view)
 
-    def move_view_to_window(self, view, target: "MainWindow") -> bool:
+    def move_view_to_window(self, view, target: "MainWindow", at: int = -1) -> bool:
         """Move one open document from this window into another one.
+
+        `at` is where in the target's bar it lands, and -1 appends. The menu
+        item never passes it; the phase 4 tear-off does, because a tab dropped
+        between two others has to go between them.
 
         THE ORDER IS THE WHOLE THING, and it is the order phase 1's reparenting
         test was measured with:
@@ -356,27 +393,39 @@ class MainWindow(QMainWindow):
         if index < 0:
             return False
         self.release_view(view)
-        target.adopt(view)
+        target.adopt(view, at)
         self._area.detach(view, index)
         if self._area.count() == 0:
             self.close()
         target.raise_and_focus()
         return True
 
-    def move_view_to_new_window(self, view=None) -> "MainWindow | None":
+    def move_view_to_new_window(self, view=None, geometry=None) -> "MainWindow | None":
         """Tab menu > Move to New Window. The user-facing half of phase 3.
 
         Offset from this window rather than placed exactly on top of it, so the
         document that just moved is visibly somewhere else.
+
+        `geometry` overrides that placement, and is how phase 4's tear-off
+        drops the new window straight under the cursor. It is an ARGUMENT and
+        not a second method on purpose: create, size, position, show, and only
+        then move the view across is the order the reparent depends on, and one
+        copy of that order is the only safe number.
         """
         if view is None:
             view = self.view
         if view is None or self._area.index_of(view) < 0:
             return None
         target = self._registry.create_window(theme=self._theme, show=False)
-        target.resize(self.size())
-        target.move(self.pos() + QPoint(NEW_WINDOW_OFFSET, NEW_WINDOW_OFFSET))
-        target.show()               # real, and on screen, BEFORE anything leaves
+        if geometry is not None:
+            target.setGeometry(geometry)
+        else:
+            target.resize(self.size())
+            target.move(self.pos() + QPoint(NEW_WINDOW_OFFSET, NEW_WINDOW_OFFSET))
+        # Real, and on screen, BEFORE anything leaves. show() is also what
+        # reapplies the Mica backdrop: a new top-level gets a fresh HWND and
+        # inherits nothing from the window it was torn off. See showEvent.
+        target.show()
         if not self.move_view_to_window(view, target):
             target.close()
             return None
@@ -699,6 +748,10 @@ class MainWindow(QMainWindow):
         vm.addSeparator()
         self._add_action(vm, "Next Tab", self.next_tab, "Ctrl+PgDown")
         self._add_action(vm, "Previous Tab", self.previous_tab, "Ctrl+PgUp")
+        # The MRU pair, and deliberately not the same order as the two above.
+        self._add_action(vm, "Recent Tab", self.next_recent_tab, "Ctrl+Tab")
+        self._add_action(vm, "Previous Recent Tab", self.previous_recent_tab,
+                         "Ctrl+Shift+Tab")
         vm.addSeparator()
         self._theme_action = QAction("Dark Mode", self)
         self._theme_action.setShortcut("Ctrl+D")
@@ -846,6 +899,59 @@ class MainWindow(QMainWindow):
     def previous_tab(self):
         """Ctrl+PgUp."""
         self._area.step_current(-1)
+
+    def next_recent_tab(self):
+        """Ctrl+Tab. Most recently used, NOT positional.
+
+        Deferred by phase 2, confirmed missing by phase 3, and here at last.
+        Ctrl+PgDn stays the positional one: "the tab to the right" and "the tab
+        I was just in" are different questions and the whole value of having
+        both is that they are not the same key.
+        """
+        self._start_mru_walk(1)
+
+    def previous_recent_tab(self):
+        """Ctrl+Shift+Tab. Back up the same stack."""
+        self._start_mru_walk(-1)
+
+    def _start_mru_walk(self, delta: int):
+        """Step the MRU, and start watching for Ctrl coming up if it stepped.
+
+        The list is frozen for as long as Ctrl is held, so tapping Tab walks
+        back through the stack rather than flipping between the top two.
+        """
+        if not self._area.step_mru(delta):
+            return
+        if self._mru_filter_on:
+            return
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+            self._mru_filter_on = True
+
+    def eventFilter(self, obj, event):
+        """Watch the whole application for Ctrl being released.
+
+        An application filter and not `keyReleaseEvent`, because the release
+        lands on whatever has keyboard focus (a canvas, a thumbnail list, the
+        page box) and several of those consume it long before it would reach
+        the window. Installed only while a walk is in flight and removed the
+        moment it ends, so nothing is filtering in the general case.
+        """
+        if (self._mru_filter_on
+                and event.type() == QEvent.Type.KeyRelease
+                and event.key() == Qt.Key.Key_Control):
+            self._end_mru_walk()
+        return super().eventFilter(obj, event)
+
+    def _end_mru_walk(self):
+        """Commit the walk: the tab landed on becomes the most recent."""
+        if self._mru_filter_on:
+            app = QApplication.instance()
+            if app is not None:
+                app.removeEventFilter(self)
+            self._mru_filter_on = False
+        self._area.end_mru_walk()
 
     def close_tab(self, index: int) -> bool:
         """Close one tab: its own X, its middle-click, or Ctrl+W on the front one.
@@ -1197,6 +1303,9 @@ class MainWindow(QMainWindow):
 
     def _teardown_for_quit(self):
         """Release everything the process owns, on the way out for good."""
+        # An application-wide event filter belonging to a window that is going
+        # away outlives the window that installed it. Ctrl+Tab arms one.
+        self._end_mru_walk()
         # Each view drops its render clones and closes its document.
         for view in self._area.views():
             view.teardown()

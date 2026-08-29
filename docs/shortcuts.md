@@ -95,11 +95,25 @@ them to one folder instead.
 |---|---|
 | `Ctrl+T` | New tab |
 | `Ctrl+W` | Close the current tab |
-| `Ctrl+PgDn` / `Ctrl+PgUp` | Next / previous tab, wrapping |
+| `Ctrl+PgDn` / `Ctrl+PgUp` | Next / previous tab by POSITION, wrapping |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab by RECENT USE |
 | Middle-click a tab | Close it |
 | Double-click empty bar space | New tab |
-| Drag a tab | Reorder it |
-| Right-click a tab | Close, Close Others, Close to the Right, Duplicate Tab, Copy Full Path, Open Containing Folder |
+| Drag a tab sideways | Reorder it |
+| Drag a tab off the bar | Tear it into its own window |
+| Right-click a tab | Close, Close Others, Close to the Right, Move to New Window, Duplicate Tab, Copy Full Path, Open Containing Folder |
+
+The two next/previous pairs are deliberately different orders. `Ctrl+PgDn` is
+the tab to the right. `Ctrl+Tab` is the tab you were just in: hold Ctrl and keep
+tapping Tab to walk further back through the ones you have visited, and let Ctrl
+go to land on one. The list is frozen while Ctrl is down, so the walk keeps
+going back instead of bouncing between the last two.
+
+Dragging a tab DOWN off the bar tears it into its own window, which appears
+under the cursor straight away and follows it. Drop it on another window's tab
+bar and it docks there, at the gap the insertion line is showing. Drop it
+anywhere else and it stays where you let go. Escape mid-drag puts it back where
+it came from. Dragging sideways, however far, is only ever a reorder.
 
 Closing the last tab closes the window. A tab with unsaved changes shows a dot
 where its close button would be; hover it and the dot becomes the X again.
