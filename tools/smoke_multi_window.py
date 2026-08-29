@@ -32,6 +32,12 @@ top-level windows: the position, the mime round-trip and the modifier reading
 are the platform's own rather than a stand-in object's. It also exercises the
 per-window undo stack end to end, which is the change phase 5 rests on.
 
+PHASE 6 ADDED STEP 8, session restore. Offscreen has no real geometry and no
+real screen name, so the suite can only pin the mechanism; here the session is
+recorded off windows the OS actually placed and the restored windows are put
+back at those coordinates. It also checks the thing the whole phase is for:
+that reopening N tabs reads exactly one file per window.
+
 PHASE 4 ADDED THE TEAR-OFF GESTURE STEPS. Those steps are the reason to
 prefer the second command line above. The pytest suite drives the gesture by
 handing synthesised QMouseEvents to the tab bar, which is enough to pin the
@@ -54,9 +60,10 @@ from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QDragMoveEvent, QDropEvent, QMouseEvent
 from PySide6.QtWidgets import QApplication, QWidget
 
-from core.settings import Settings, set_settings
+from core.settings import Settings, set_settings, settings
 from ui.canvas import AddItemsCommand, HighlightItem
 from ui.page_drag import make_page_mime
+from ui.session import restore_on_launch
 from ui.tab_tear_off import DETACH_MARGIN
 from ui.theme import apply_theme
 from ui.window_registry import WindowRegistry
@@ -343,21 +350,99 @@ def run(app, folder):
     check("Ctrl+PgDn is still positional",
           area.current_index() == 1, area.current_index())
 
-    print("\n8. close both windows")
+    print("\n8. save the session, close everything, and bring it back (phase 6)")
+    # The pytest suite drives this too, but only offscreen, where there is no
+    # real geometry and no real screen name to remember. What this step adds is
+    # a session recorded off windows the OS actually placed, and windows put
+    # back where those coordinates say.
+    store.startup.restore_tabs = True
+    expected = sorted(os.path.basename(v.document_path())
+                      for _, v in registry.views() if v.document_path())
+    expected_windows = registry.count()
+
+    # Closing the last window quits the application, and there would be nothing
+    # left to restore into. Disarmed for the length of this step and armed
+    # again for step 9, which is the one that proves the quit still happens.
+    registry.quit_on_last_window = False
+    for window in list(registry.windows()):
+        for view in window.document_area().views():
+            view.mark_clean()
+        window._force_quit = True
+        window.close()
+    check("everything closed", registry.count() == 0, registry.count())
+
+    saved = settings().session.windows
+    check("the session kept every window that went down with the app",
+          len(saved) == expected_windows, f"{len(saved)} of {expected_windows}")
+    check("it names every document that was open",
+          sorted(os.path.basename(t["path"])
+                 for w in saved for t in w["tabs"]) == expected,
+          sorted(os.path.basename(t["path"]) for w in saved for t in w["tabs"]))
+    check("it remembers where each window was",
+          all(w["geometry"] for w in saved), [w["geometry"] for w in saved])
+    # Offscreen's one screen has no name at all, so this is only a real check
+    # on a real platform. It is the reason to run this script the second way.
+    if QApplication.platformName() == "offscreen":
+        check("the screen was asked for (offscreen has no name to give)",
+              all("screen" in w for w in saved))
+    else:
+        check("and which screen it was on",
+              all(w["screen"] for w in saved), [w["screen"] for w in saved])
+
+    registry.quit_on_last_window = True
+    revived = registry.create_window(theme=theme, show=False)
+    missing = restore_on_launch(revived, registry)
+    revived.show()
+    check("no files went missing", missing == 0, missing)
+    check("the windows came back", registry.count() == len(saved), registry.count())
+
+    tabs_back = list(registry.views())
+    loaded = [v for _, v in tabs_back if v.has_document()]
+    pending = [v for _, v in tabs_back if v.is_pending()]
+    check("every tab came back",
+          len(tabs_back) == sum(len(w["tabs"]) for w in saved), len(tabs_back))
+    check("exactly one document per window was read",
+          len(loaded) == len(saved), len(loaded))
+    check("the rest are waiting to be looked at",
+          len(pending) == len(tabs_back) - len(loaded), len(pending))
+    check("a tab that has read nothing still names its file",
+          all(v.document_path() for v in pending))
+
+    want = saved[0]["geometry"]
+    got = revived.geometry()
+    check("the first window came back at its saved size",
+          [got.width(), got.height()] == want[2:],
+          f"{want[2:]} -> {[got.width(), got.height()]}")
+    check("and within a few pixels of its saved position",
+          abs(got.x() - want[0]) <= 8 and abs(got.y() - want[1]) <= 8,
+          f"{want[:2]} -> {[got.x(), got.y()]}")
+
+    if pending:
+        waiting = pending[0]
+        holder = waiting.window()
+        holder.document_area().set_current_index(
+            holder.document_area().index_of(waiting))
+        check("bringing a lazy tab forward opened it", waiting.has_document())
+        check("and it is no longer pending", not waiting.is_pending())
+
+    print("\n9. close the restored windows")
     quit_seen = []
     app.aboutToQuit.connect(lambda: quit_seen.append(True))
 
-    for view in second.document_area().views():
-        view.mark_clean()
-    second._force_quit = True
-    second.close()
+    windows = registry.windows()
+    for window in windows[:-1]:
+        for view in window.document_area().views():
+            view.mark_clean()
+        window._force_quit = True
+        window.close()
     check("one window left", registry.count() == 1, registry.count())
     check("the app has NOT quit yet", not quit_seen)
 
-    for view in first.document_area().views():
+    last = registry.windows()[0]
+    for view in last.document_area().views():
         view.mark_clean()
-    first._force_quit = True
-    first.close()
+    last._force_quit = True
+    last.close()
     check("no windows left", registry.count() == 0, registry.count())
 
 
