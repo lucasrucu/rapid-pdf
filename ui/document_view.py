@@ -536,7 +536,7 @@ class DocumentView(QWidget):
         if self._doc.save():
             self._after_successful_save("Saved")
             return True
-        QMessageBox.critical(self.window(), "Save Error", "Could not save the PDF.")
+        self._report_failed_save()
         return False
 
     def save_pdf_as(self) -> bool:
@@ -552,8 +552,25 @@ class DocumentView(QWidget):
         if self._doc.save(path):  # save() adopts `path` as the new canonical path
             self._after_successful_save(f"Saved to {path}")
             return True
-        QMessageBox.critical(self.window(), "Save Error", "Could not save the PDF.")
+        self._report_failed_save()
         return False
+
+    def _report_failed_save(self):
+        """Say what went wrong, in the words PDFDocument put together.
+
+        It used to say "Could not save the PDF" whatever had happened, which
+        was actively misleading for the one failure that does not lose the
+        work: an in-place save whose swap over the original fails writes the
+        new content to a `.bak` beside it and adopts that file. The user has to
+        be told, because the document in front of them is now a different file
+        from the one they opened. The title and the tab label both follow the
+        path, so both are re-read here.
+        """
+        QMessageBox.critical(
+            self.window(), "Save Error",
+            self._doc.last_save_error or "Could not save the PDF.")
+        self.title_changed.emit()
+        self._update_status()
 
     def enhance_for_search(self):
         """Run OCR once, on demand, over every page that doesn't already have
