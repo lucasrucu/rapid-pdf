@@ -129,12 +129,12 @@ def test_the_header_goes_back_to_its_label_for_one_page(panel):
     assert panel._title.text() == "Pages"
 
 
-def test_the_delete_button_only_lights_up_with_a_selection(panel):
-    panel._list.clearSelection()
-    panel._on_selection_changed()
-    assert not panel._del_btn.isEnabled()
-    panel._list.item(0).setSelected(True)
-    assert panel._del_btn.isEnabled()
+def test_the_strip_carries_no_delete_button(panel):
+    """The dedicated delete button is gone from the strip. Deleting stays on the
+    Delete key, the right-click menu and the Organizer."""
+    from PySide6.QtWidgets import QAbstractButton
+    assert not hasattr(panel, "_del_btn")
+    assert panel.findChildren(QAbstractButton) == []
 
 
 def test_syncing_the_page_does_not_collapse_a_multi_selection(panel):
@@ -172,11 +172,15 @@ def test_backspace_deletes_too(panel):
     assert asked == [[3]]
 
 
-def test_the_delete_button_asks_for_the_selection(panel):
+def test_the_context_menu_still_asks_for_the_selection(panel):
+    """With the button gone, right-click is the discoverable way to delete."""
     asked = []
     panel.pages_delete_requested.connect(asked.append)
     panel._list.setCurrentRow(2)
-    panel._del_btn.click()
+    menu = panel._build_context_menu()
+    labels = [a.text() for a in menu.actions() if a.text()]
+    assert "Delete Page" in labels
+    next(a for a in menu.actions() if a.text() == "Delete Page").trigger()
     assert asked == [[2]]
 
 
