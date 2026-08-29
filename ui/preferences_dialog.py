@@ -1,8 +1,8 @@
 """Edit > Preferences (Ctrl+,): everything the app remembers, on one page.
 
-WHY ONE PAGE. There are six settings. A category sidebar for six settings is
-navigation for its own sake, and it hides half of them behind a click for no
-gain. Four QGroupBoxes on one column is the whole design, and it stays the
+WHY ONE PAGE. There are seven settings. A category sidebar for seven settings
+is navigation for its own sake, and it hides half of them behind a click for no
+gain. Five QGroupBoxes on one column is the whole design, and it stays the
 design until the list is long enough that scrolling it is worse than clicking.
 
 WHY THERE IS NO OK AND NO CANCEL. Every control here applies the moment it is
@@ -102,6 +102,7 @@ class PreferencesDialog(QDialog):
         root.setContentsMargins(16, 16, 16, 12)
         root.setSpacing(12)
 
+        root.addWidget(self._build_startup_group())
         root.addWidget(self._build_closing_group())
         root.addWidget(self._build_appearance_group())
         root.addWidget(self._build_files_group())
@@ -116,6 +117,31 @@ class PreferencesDialog(QDialog):
         root.addWidget(buttons)
 
         self._load_from_settings()
+
+    # ------------------------------------------------------------------
+    # Startup
+    # ------------------------------------------------------------------
+
+    def _build_startup_group(self) -> QGroupBox:
+        """Session restore, and it is off until somebody asks for it.
+
+        First in the column because it is about what happens before anything
+        else does. One checkbox, because "reopen my tabs" is one question: how
+        many tabs, which windows and where they were are all recorded either
+        way and none of them is worth a control of its own.
+        """
+        box = QGroupBox("Startup")
+        col = QVBoxLayout(box)
+        self._restore_check = QCheckBox("Reopen the tabs I had open last time")
+        self._restore_check.setToolTip(
+            "Files that have moved or gone are skipped, and documents open "
+            "when they are first looked at")
+        self._restore_check.toggled.connect(self._on_restore_tabs)
+        col.addWidget(self._restore_check)
+        return box
+
+    def _on_restore_tabs(self, checked: bool) -> None:
+        settings().startup.restore_tabs = checked
 
     # ------------------------------------------------------------------
     # Closing
@@ -344,6 +370,8 @@ class PreferencesDialog(QDialog):
         or method these are bound to.
         """
         store = settings()
+
+        self._restore_check.setChecked(store.startup.restore_tabs)
 
         radio = self._close_radios.get(store.close.x_closes)
         if radio is not None:

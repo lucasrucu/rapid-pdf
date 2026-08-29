@@ -6,10 +6,14 @@ A fast, focused desktop PDF editor for page management and visual markup. No OCR
 
 Acrobat runs OCR and form-field detection every time it opens a file, which makes large technical PDFs slow to work with. rapid-pdf does only the two things that matter for field work, reorganizing pages and adding markup, and does them instantly. Open an A1 engineering drawing, move or delete pages, drop highlights and shapes, and save, all without the wait.
 
-Built in Python with PySide6 (Qt6) and PyMuPDF. Single window, dark theme, Windows-first.
+Built in Python with PySide6 (Qt6) and PyMuPDF. Tabbed, multi-window, light and dark, Windows-first.
 
 ## Key features
 
+- **Document tabs**: several PDFs open at once, one tab each, named by filename and disambiguated by folder when two match. Middle-click closes, `Ctrl+Tab` walks the tabs you were just in, and opening a file that is already open raises its tab instead of opening a second copy.
+- **Several windows**: `Ctrl+Shift+N` for a new one, or drag a tab off the bar and it tears into a window that appears under the cursor and follows it. Drop it on another window's tab bar to dock it there.
+- **Pages between tabs**: drag a page out of one document's thumbnail strip or Organizer and into another's. One undoable action across both documents, with unsaved markup carried along.
+- **Session restore**: optionally reopen the windows and tabs you had open last time, with each document read when you first look at it rather than all at once. Off by default, under Startup in Preferences.
 - **Page manager**: open, combine, reorder, delete, and add pages, from the Editor's left thumbnail strip or the full Organizer grid. Shift/ctrl to select several, drag to move them, Delete to remove them, Ctrl+Z to take it back.
 - **Markup tools**: highlight, rectangle, and line annotations with an Office-style color picker, opacity presets, and line weights.
 - **Object editing**: select, move, resize with 8-point handles, Ctrl+drag to duplicate, marquee group-select, copy/paste, and full undo/redo.
@@ -31,9 +35,12 @@ On Windows you can also run `run.bat`, which uses the bundled `.venv`.
 
 ```mermaid
 flowchart TD
-    A[main.py] --> B[MainWindow]
-    B --> E[Editor tab]
-    B --> O[Organizer tab]
+    A[main.py] --> R[WindowRegistry]
+    R --> B[MainWindow]
+    B --> AR[DocumentArea<br/>tab bar + stack]
+    AR --> V[DocumentView<br/>one per open PDF]
+    V --> E[Editor]
+    V --> O[Organizer]
     E --> C[Canvas]
     E --> T[Toolbar]
     E --> P[PagePanel]
@@ -44,7 +51,7 @@ flowchart TD
     F --> G[(PDF file)]
 ```
 
-`MainWindow` owns the lifecycle and two tabs. The **Editor** holds the page panel (thumbnail strip), the canvas (the annotation surface), and the toolbar. The **Organizer** is a drag-to-reorder page grid. Everything reads and writes through `core/PDFDocument`, a thin wrapper over PyMuPDF that owns rendering, the page cache, saves, and the embedded annotation model.
+`WindowRegistry` owns application lifetime and decides which window an incoming file lands in. Each `MainWindow` is chrome only: menus, status bar, theme, and one undo stack shared by every tab in it. `DocumentArea` is a tab bar over a stack of `DocumentView`s, and a `DocumentView` is everything that belongs to one open PDF: the **Editor** (page panel, canvas, toolbar), the **Organizer** page grid, and the document itself. Everything reads and writes through `core/PDFDocument`, a thin wrapper over PyMuPDF that owns rendering, the page cache, saves, and the embedded annotation model.
 
 See [Architecture](docs/architecture.md) for the full walkthrough.
 
@@ -52,21 +59,31 @@ See [Architecture](docs/architecture.md) for the full walkthrough.
 
 ```
 rapid-pdf/
-├── main.py            # entry point: builds the app, opens a CLI-passed PDF
+├── main.py               # entry point: single instance, theme, first window, session restore
 ├── core/
-│   ├── pdf_document.py  # PyMuPDF wrapper: render cache, save lifecycle, annotation model
-│   └── page_ops.py      # pure page-order arithmetic: drag targets, undo permutations
+│   ├── pdf_document.py     # PyMuPDF wrapper: render cache, save lifecycle, annotation model
+│   ├── page_ops.py         # pure page-order arithmetic: drag targets, undo permutations
+│   ├── settings.py         # the one settings file: typed schema, atomic writes, the session
+│   └── single_instance.py  # one process, and forwarding a shell launch into it
 ├── ui/
-│   ├── main_window.py   # window, menus, tabs, save/open lifecycle, dirty-state
-│   ├── canvas.py        # the editor: annotation items, undo stack, image lift, marquee
-│   ├── toolbar.py       # tools and contextual color/opacity/weight controls
-│   ├── organizer.py     # page reorder / delete / add grid
-│   ├── page_panel.py    # left thumbnail strip: select, delete, drag to reorder
-│   └── page_commands.py # undoable page delete + reorder
-├── docs/              # architecture, performance, UI, build, shortcuts, PRD
-├── prototypes/        # throwaway UI restyle preview (not shipped)
-├── requirements.txt   # pymupdf, PySide6
-└── run.bat            # Windows launcher using the bundled .venv
+│   ├── window_registry.py  # every open window, app lifetime, where an incoming file lands
+│   ├── main_window.py      # one window's chrome: menus, status bar, theme, undo stack
+│   ├── document_area.py    # the tab bar over a stack of documents, and tab labels
+│   ├── document_view.py    # everything belonging to ONE open PDF
+│   ├── tab_tear_off.py     # dragging a tab out into its own window
+│   ├── session.py          # what was open last time, and putting it back
+│   ├── undo.py             # one undo stack per window, shared by its tabs
+│   ├── canvas.py           # the editor: annotation items, image lift, marquee
+│   ├── toolbar.py          # tools and contextual color/opacity/weight controls
+│   ├── organizer.py        # page reorder / delete / add grid
+│   ├── page_panel.py       # left thumbnail strip: select, delete, drag to reorder
+│   ├── page_drag.py        # the mime payload a page carries between documents
+│   ├── page_commands.py    # undoable page delete, reorder and cross-document transfer
+│   └── preferences_dialog.py  # Ctrl+, : everything the app remembers, on one page
+├── docs/                 # architecture, tabs plan, performance, UI, build, shortcuts, PRD
+├── prototypes/           # throwaway UI restyle preview (not shipped)
+├── requirements.txt      # pymupdf, PySide6
+└── run.bat               # Windows launcher using the bundled .venv
 ```
 
 Full annotated tree: [File structure](docs/file-structure.md).
@@ -92,6 +109,7 @@ GitHub Releases is the single source of truth for versions. The strategy rolls o
 ## Documentation
 
 - [Architecture](docs/architecture.md): modules, coordinate system, save lifecycle, image-lift pipeline.
+- [Tabs and multi-window](docs/tabs-plan.md): the six-phase design record for tabs, several windows, the tear-off, pages between tabs and session restore. Read this before touching any of them.
 - [File structure](docs/file-structure.md): annotated tree of every file and its role.
 - [Performance & rendering](docs/performance.md): page cache, lazy thumbnails, debounce/settle, save integrity.
 - [UI direction](docs/ui.md): styling options and the recommended path.

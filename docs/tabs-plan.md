@@ -5,9 +5,14 @@ and line reference below was read out of the source at commit `a198784`
 (v1.5.0) and every Qt behaviour claim was run on this install, not taken from
 documentation.
 
-This is the plan, not a log. If you are picking it up cold, read "Current
-state" and "The three findings" first. Those are the parts that stop you
-rediscovering a week of work.
+**ALL SIX PHASES ARE IN.** This started as a plan and it is now a plan with the
+outcome written back into it. Where the two disagree the outcome wins, and each
+phase section says what actually happened under a "what it did" heading. If you
+are picking it up cold, read "Current state", then the phase you care about,
+then "Known bugs", which is the honest list of what is fixed and what is not.
+
+The one thing still outstanding for the set as a whole is the release: see
+"Standing constraints".
 
 ## The goal
 
@@ -22,7 +27,23 @@ Adobe-style tabs.
 
 ## Current state
 
-Verified, not assumed.
+**This table is the state BEFORE phase 0, at commit `a198784`.** It is kept
+because the sections under it are all written against it and because the
+before-and-after is the useful part. What it looks like now:
+
+| Thing | Before (a198784) | After phase 6 |
+| --- | --- | --- |
+| PySide6 / Qt | 6.11.1 | unchanged |
+| PyMuPDF | 1.27.2.3 (MuPDF 1.27.2) | unchanged |
+| Python | 3.12.10 | unchanged |
+| App version | 1.5.0 | 1.5.0, unreleased since (see Standing constraints) |
+| Packaging | PyInstaller onedir, then Inno Setup | unchanged |
+| Tests | 201, 11 files | **589, 32 files** |
+| `ui/main_window.py` | 1153 lines | 1497, and it is chrome only |
+| Where a document lives | `MainWindow._doc` | `DocumentView`, one per tab |
+| New modules | | `document_area`, `document_view`, `window_registry`, `tab_tear_off`, `page_drag`, `undo`, `session`, `settings`, `preferences_dialog` |
+
+Verified, not assumed, at `a198784`:
 
 | Thing | Value | Where |
 | --- | --- | --- |
@@ -196,17 +217,19 @@ implements it. No custom event handling needed.
 
 | Phase | What | Estimate | Status |
 | --- | --- | --- | --- |
-| 0 | Settings module plus close rework | 1.5 d | in progress, `feat/settings-and-close` |
-| 1 | Extract `DocumentView` from `MainWindow` | 2-3 d | **riskiest phase**, done on `refactor/document-view` |
-| 2 | Tabs in one window | 1.5-2 d | done on `feat/document-tabs` |
-| 3 | Multi-window via `WindowRegistry`, menu item only | 1.5-2 d | done on `feat/multi-window` |
-| 4 | Tear-off drag gesture | 1-1.5 d | done on `feat/tab-tear-off` |
-| 5 | Pages between tabs | 4 d | done on `feat/pages-between-tabs` |
-| 6 | Session restore | 0.5-1 d | |
+| 0 | Settings module plus close rework | 1.5 d | **done**, `feat/settings-and-close` |
+| 1 | Extract `DocumentView` from `MainWindow` | 2-3 d | **done**, `refactor/document-view` (the riskiest, as expected) |
+| 2 | Tabs in one window | 1.5-2 d | **done**, `feat/document-tabs` |
+| 3 | Multi-window via `WindowRegistry`, menu item only | 1.5-2 d | **done**, `feat/multi-window` |
+| 4 | Tear-off drag gesture | 1-1.5 d | **done**, `feat/tab-tear-off` |
+| 5 | Pages between tabs | 4 d | **done**, `feat/pages-between-tabs` |
+| 6 | Session restore | 0.5-1 d | **done**, `feat/session-restore` |
 
 The order is not arbitrary. Each phase leaves the app shippable, and phases 3
 and 4 are split specifically so the hard, testable half lands before the
-gesture half.
+gesture half. That split paid: phase 4 turned out to be a thin gesture layer
+over phase 3's methods, and the two things it hit that the design missed (the
+frame offset, and `QTabBar` needing a release) were both gesture-only.
 
 ### Phase 0: settings and close rework
 
@@ -491,6 +514,107 @@ promised. 562 tests, 27 of them new in `tests/test_pages_between_tabs.py`, and
 Reopen the tabs and windows that were open last time. Small, and it depends on
 everything above being stable.
 
+**What it did.** Done. `core/settings.py` grew `startup.restore_tabs` (off by
+default) and a `session.windows` block; `ui/session.py` holds the capture, the
+recorder and the restore; `DocumentView` learned to stand for a file it has not
+read. 589 tests, 26 of them new in `tests/test_session_restore.py`, and
+`tools/smoke_multi_window.py` grew a step 8 that runs the whole thing on the
+real platform, which is the only place the saved geometry and screen name are
+checked against a window manager that has an opinion.
+
+**The record.** Per window: geometry, screen name, the front tab, and its tabs
+as `{path, page, zoom, fit_mode}`. `zoom` is the view transform's scale, NOT
+`PDFCanvas._zoom`, which is the raster scale and is a fixed 1.5; the two were
+easy to confuse and only one of them is what the user changed. A fit mode and a
+zoom are both saved and only one is applied: a fit recomputes the scale from
+the window size the moment it lands, so the zoom only means anything when no
+fit was active.
+
+**It lives in the settings store, not a second file.** A second file is a
+second thing to find, to quarantine when it is corrupt, and to keep in step
+with the first. `core/settings.py` already does all three. `session.windows` is
+the first field in the schema that is a structure rather than a scalar, and
+`_as_session_windows` is its validator and its normaliser at once, so a
+hand-edited or half-written session reads back as "no session" exactly the way
+a nonsense `x_closes` reads back as `"window"`, and the restore path never has
+to check a type. Adding the two keys did NOT bump `schema_version`: adding a
+key is not a migration.
+
+**Only tabs with a real path come back, and that is the answer, not a
+limitation to work around.** An untitled or merged document exists only in
+memory. Writing it down means serialising the document into a cache directory,
+which brings a disk-space policy, a cleanup policy, and a restore path that can
+fail on a corrupt cache, all for a document the user has not named. It is
+skipped silently, in the coercer, so it holds however the record got there.
+
+**Unsaved annotation state is a deliberate non-goal.** The markup model already
+round-trips through the saved PDF (`_flush_annotations` /
+`_load_saved_annotations`), and an autosave-to-cache scheme here would be a
+second copy of that machinery aimed at one case: a crash with unsaved markup.
+That case is CRASH RECOVERY. It wants its own design and its own prompt on the
+way back in, because a restored tab that silently came up dirty with no way to
+say where the changes came from is worse than one that came up clean. Restored
+tabs are exactly what is on disk.
+
+**Tabs come back LAZY, and that is where the interactions are.**
+`DocumentView.stage_path` claims an empty view for a path without reading it;
+`ensure_loaded` opens it; `set_active` is what calls that. Eight A1 drawings
+read at once before the window paints would make startup feel broken, and
+opening big drawings fast is the whole pitch. Four things it touches, each
+found by writing the test for it:
+
+- **`set_active` had to load ABOVE its early return, not below it.** A view is
+  built with `_active` already True, so the first tab of a restored window is
+  made current without the flag ever changing, and a load hung off the flag
+  never runs for exactly the tab that has to load.
+- **`has_document()` stopped being the "is this tab free" question.** A pending
+  tab answers False and is spoken for. `is_empty()` is the new question and
+  every site that meant "free" now asks it: `_target_view`, `combine_paths`,
+  the `adopt` placeholder, `close_tab`, and the multiple-tabs close warning. On
+  `close_tab` in particular, asking `has_document()` made Ctrl+W a dead key on
+  every tab of a freshly restored window.
+- **`document_path()` answers with the pending path.** That is one line, and it
+  is what makes the tab label, the disambiguation that walks up the path on a
+  collision, the tooltip, `DocumentArea.index_of_path` and
+  `WindowRegistry.find_by_path` all work on a tab nobody has opened. An
+  Explorer double-click on a restored-but-unread file raises its tab, which
+  then opens it, rather than opening a second copy beside it.
+- **The dirty marker needed nothing.** A pending view has read nothing, so it
+  is not dirty, and `_refresh_dirty` already guards on `has_document()`. The
+  per-window undo stack needed nothing either: `_new_view` hands the stack over
+  at construction, well before any file is read.
+
+**Missing files are filtered before any tab is made.** A mapped drive that is
+offline takes every tab with it at once, so the check is one `os.path.isfile`
+per record up front and the whole answer is one status line: "3 files from the
+last session could not be found." A file that vanishes between the restore and
+the click still gets `open_path`'s message box, which is the right amount of
+noise for one tab the user just clicked.
+
+**When it is written, and which windows count.** On every window close and on
+`aboutToQuit`. The one decision is in `MainWindow._record_session`: a window
+closed while the application carries on drops out of the record, because the
+user closed it on purpose; a window closed as part of a shutdown stays in,
+because by `aboutToQuit` its views have been torn down and there is nothing
+left to read off them. "Part of a shutdown" is `_force_quit` (the Quit menu) or
+`_session_is_ending()` (Windows) or being the last window. Without that rule
+the Quit menu, which closes windows one at a time, records only the last one.
+
+**Two gates on the way in, both in `should_restore`.** The setting has to be
+on, and the launch has to have carried nothing. A PDF double-clicked in
+Explorer is a request to read that file; burying it under eight restored tabs
+is not what anyone meant, and the same goes for a `--combine` verb. `main.py`
+forwards a second launch and exits before this is asked, so it can only ever
+run in the primary.
+
+**`close.confirm_multiple_tabs` could reasonably default to false now, and it
+is deliberately left true.** The warning exists because closing a window of
+tabs loses your place, and session restore is the thing that gives your place
+back. But restore is OFF by default, so flipping the warning's default would
+take the safety net away from everybody who has not opted in. The honest
+sequence is: ship this, and revisit the default if and when restore becomes the
+default. Not in this phase.
+
 ## Design decisions
 
 ### `QTabBar` + `QStackedWidget`, not `QTabWidget`
@@ -600,7 +724,22 @@ before.
 Found while reading the source for this plan. None are caused by the tabs
 work; several get worse under it.
 
-### 1. Windows shutdown is blocked by an unconditional `event.ignore()`
+**Where they stand now that all six phases are in:**
+
+| # | What | Status |
+| --- | --- | --- |
+| 1 | Windows shutdown blocked by `event.ignore()` | **fixed** in phase 0/3, `_session_is_ending()` |
+| 2 | Relaunch while running does nothing | **fixed**, `InstanceServer._flush` + `route_open` |
+| 3 | `Ctrl+Q` / `Ctrl+W` dead, `File > Quit` shows "Exit" | **fixed** for Ctrl+Q and Ctrl+W. `Ctrl+F4` is still nothing, on purpose |
+| 4 | Encrypted PDFs open then throw on first render | **fixed** in phase 5 |
+| 5 | Deleting a page leaves a bookmark at page -1 | **fixed** in phase 5 |
+| 6 | The second switch into the Organizer throws | **fixed** in phase 3 |
+| 7 | A save that cannot overwrite silently writes a `.bak` | **fixed** in phase 3 |
+
+**Nothing on this list is still open**, with one deliberate exception noted
+under bug 3. What IS still open is in "What is not done", below.
+
+### 1. Windows shutdown is blocked by an unconditional `event.ignore()` - FIXED in phase 0/3
 
 `ui/main_window.py:1122`, `closeEvent`. If a document is open and
 `_force_quit` is false, the handler closes the document and then calls
@@ -610,7 +749,14 @@ refuses and the OS shows the "this app is preventing you from shutting down"
 block. Needs a `QSessionManager` check, or at minimum to accept the close when
 the app is being asked to quit rather than clicked.
 
-### 2. Relaunch while running does nothing
+**How it was fixed.** `_connect_session_manager` listens for
+`commitDataRequest`; `_session_is_ending()` reads that flag OR Qt's own
+`isSavingSession()`, because neither is reliable alone; and `closeEvent` takes
+that branch first, with no prompt and no `event.ignore()`. Phase 6 writes the
+session on the same branch, before the teardown, because everything that
+happens there is on Windows's clock.
+
+### 2. Relaunch while running does nothing - FIXED
 
 Double-clicking the shortcut while the app is already running should raise the
 existing window. It does nothing at all. Path:
@@ -625,7 +771,12 @@ existing window. It does nothing at all. Path:
 Net: the second process dies, the first never hears about it. The fix belongs
 in `_flush`: an empty batch should still emit a raise-and-focus.
 
-### 3. Ctrl+Q, Ctrl+W and Ctrl+F4 are all dead keys
+**How it was fixed, and it went exactly where the plan said.** `_flush` gates
+on `_pending_launch` rather than on `files`, so an empty batch still emits, and
+`WindowRegistry.route_open` treats a batch with no paths as "raising IS the
+job". `tests/test_single_instance_relaunch.py` covers it.
+
+### 3. Ctrl+Q and Ctrl+W were dead keys - FIXED. Ctrl+F4 still is, on purpose
 
 - `Ctrl+Q` and `Ctrl+W` appear nowhere in the source. The only hits are the
   Quit action at `ui/main_window.py:208` and a docstring at `:1118` that
@@ -641,6 +792,13 @@ in `_flush`: an empty batch should still emit a raise-and-focus.
 
 Under tabs this matters more, because `Ctrl+W` closing a tab is the thing
 everyone will reach for first.
+
+**How it was fixed.** `File > Quit` is spelled `"Ctrl+Q"` rather than
+`StandardKey.Quit`, so the menu shows a key that exists; `File > Close PDF` is
+`"Ctrl+W"` and closes the front TAB. `Ctrl+F4` is deliberately still unbound:
+`StandardKey.Close` resolving to it is a Windows convention for MDI child
+windows, this app has tabs rather than MDI children, and a second key for the
+same thing is worth less than one key everybody already knows.
 
 ### 4. Encrypted PDFs report a successful open, then throw on first render - FIXED in phase 5
 
@@ -916,16 +1074,67 @@ widgets.
 deflate=True` (lines 175 and 209), never incremental. Page moves do not make
 this worse; they just make it more likely someone notices.
 
+## What is not done
+
+Everything on the phase list shipped. This is what a reader coming to it cold
+should know is still missing or deliberately refused, so it is not rediscovered
+as a bug.
+
+**Deliberate, and settled. Do not "fix" these without reopening the decision.**
+
+- **Pages cannot be dragged between WINDOWS.** Two windows are two undo stacks
+  and there is no ordering of two stacks that undoes a cross-document move
+  without leaving a duplicate page. A whole document moves between windows
+  fine; a page does not. Refused at drop time.
+- **A document moved to another window loses its undo history.** `QUndoStack`
+  has no selective removal, so `release_view` drops the whole stack, and only
+  when the departing view is actually named in it. An unedited tab, which is
+  the ordinary tear-off, costs nothing.
+- **Untitled and merged documents are not restored**, and **unsaved markup is
+  not restored**. See phase 6 above for both, including why crash recovery is a
+  separate feature rather than a flag on this one.
+- **`Ctrl+F4` does nothing.** See known bug 3.
+- **`view.organizer_zoom_index` has no Preferences control.** Ctrl+wheel in the
+  Organizer is a better way to do the same thing.
+- **`close.confirm_multiple_tabs` still defaults to true.** The reasoning is at
+  the end of phase 6.
+
+**Genuinely outstanding.**
+
+- **Nothing has been released.** Version is still 1.5.0 and no installer has
+  been cut for any of this. See Standing constraints.
+- **`docs/architecture.md` and `docs/file-structure.md` still describe the
+  single-document app.** `architecture.md:83` still says `MainWindow` "builds
+  the two tabs", which now means the Editor/Organizer switcher inside a
+  `DocumentView`. `README.md` and `docs/shortcuts.md` were brought up to date
+  in phase 6; those two were not.
+- **A cross-document page move silently loses internal links and layers.** It
+  is REPORTED (the status line names what went), not fixed, because PyMuPDF
+  drops them inside `insert_pdf` and there is no hook. Same for form fields
+  being renamed, and for signatures, which every save already invalidates.
+- **Session restore does not remember the Editor/Organizer switcher.** A tab
+  restored into the Organizer comes back in the Editor. Nobody has asked for
+  it; it would be a fifth field on the tab record.
+- **The multiple-tabs close warning counts restored tabs that were never
+  opened.** That is on purpose (the warning is about losing your place) but it
+  means the count in the dialog can be higher than the number of documents the
+  app has actually read.
+
 ## Standing constraints
 
 - **No new version is published until the whole set of adjustments lands.**
   Lucas, 2026-08-29. Phases can merge to `main` as they finish, but nothing
-  gets a release tag or an installer until the set is done.
+  gets a release tag or an installer until the set is done. **The set is now
+  done, so this constraint is what is left to act on: the release is the next
+  decision, not a phase.**
 - **Phase 1 goes in a worktree, under a strict move-don't-change rule.** Move
   code, do not improve it. Improvements are a separate commit after the tests
-  are green.
+  are green. (Held. Phase 1 landed with no behaviour change.)
 - **The 201 existing tests must pass unmodified through phase 1.** A test that
   needs an edit means behaviour moved, not just code. Stop and find out why
-  before editing the test.
+  before editing the test. (Held. The only tests rewritten across the whole
+  set were the six in phase 5 that pinned the per-document undo stack, and one
+  in phase 6 that pins the schema's shape on purpose. None of them found a
+  bug; each was pinning a contract that had deliberately changed.)
 - **Do not put an OpenGL viewport on the canvas** without re-running the
   finding 2 reparent test. See the constraint box in that section.
