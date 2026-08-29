@@ -83,16 +83,44 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: deskto
 ; values planted in SHARED keys (.pdf\OpenWithProgids, RegisteredApplications)
 ; carry uninsdeletevalue, so uninstall removes exactly what was added.
 ;
+; 1.5.0 and earlier put the combine verb on the ProgID. It now lives under
+; SystemFileAssociations (see below); drop the old key on upgrade or the shell
+; merges both and shows "Combine with Rapid PDF" twice.
+Root: HKCU; Subkey: "Software\Classes\RapidPDF.Document\shell\combine"; ValueType: none; Flags: deletekey
+;
 ; ProgID with a clean "open" verb: right-click a .pdf > Open with Rapid PDF.
 Root: HKCU; Subkey: "Software\Classes\RapidPDF.Document"; ValueType: string; ValueData: "PDF Document"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\RapidPDF.Document\DefaultIcon"; ValueType: string; ValueData: "{app}\{#AppExeName},0"
 Root: HKCU; Subkey: "Software\Classes\RapidPDF.Document\shell\open"; ValueType: string; ValueData: "Open with {#AppName}"
+; Explicit, even though Document is what the shell infers for a command-line
+; verb: "open" makes a top-level window per item, so the 15-item cap is right.
+Root: HKCU; Subkey: "Software\Classes\RapidPDF.Document\shell\open"; ValueType: string; ValueName: "MultiSelectModel"; ValueData: "Document"
 Root: HKCU; Subkey: "Software\Classes\RapidPDF.Document\shell\open\command"; ValueType: string; ValueData: """{app}\{#AppExeName}"" ""%1"""
-; Distinct combine verb: select several PDFs > "Combine with Rapid PDF".
-; Explorer fires it once per selected file; the app's single-instance layer
-; aggregates the burst into one Combine dialog (core/single_instance.py).
-Root: HKCU; Subkey: "Software\Classes\RapidPDF.Document\shell\combine"; ValueType: string; ValueData: "Combine with {#AppName}"
-Root: HKCU; Subkey: "Software\Classes\RapidPDF.Document\shell\combine\command"; ValueType: string; ValueData: """{app}\{#AppExeName}"" --combine ""%1"""
+;
+; Combine verb: select several PDFs > "Combine with Rapid PDF".
+;
+; Registered under SystemFileAssociations\.pdf, NOT on our ProgID. A verb on
+; the ProgID only appears while Rapid PDF is the .pdf handler; the moment
+; Adobe or Edge takes the association back, the entry vanishes.
+; SystemFileAssociations verbs are merged into the menu for every .pdf
+; whatever owns the extension, which is what this verb wants. Keep it in
+; exactly ONE of the two places: the shell merges both, so registering it on
+; the ProgID as well would show "Combine with Rapid PDF" twice.
+;
+; MultiSelectModel=Player is load-bearing. Without it a command-line verb is
+; treated as Document, which the shell HIDES entirely past 15 selected files
+; (docs: "Employing the Verb Selection Model"). Player raises that to 100 and
+; matches what the verb actually does: one Combine dialog, any number of
+; inputs. Explorer still fires the command once per selected file; the app's
+; single-instance layer elects one primary and aggregates the burst into a
+; single Combine call (core/single_instance.py).
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations"; Flags: uninsdeletekeyifempty
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf"; Flags: uninsdeletekeyifempty
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell"; Flags: uninsdeletekeyifempty
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\RapidPDF.Combine"; ValueType: string; ValueName: "MUIVerb"; ValueData: "Combine with {#AppName}"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\RapidPDF.Combine"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#AppExeName},0"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\RapidPDF.Combine"; ValueType: string; ValueName: "MultiSelectModel"; ValueData: "Player"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\RapidPDF.Combine\command"; ValueType: string; ValueData: """{app}\{#AppExeName}"" --combine ""%1"""
 ; Offer the ProgID as a .pdf handler: shows in "Open with" and carries the
 ; verbs above. Never touches the user's chosen default.
 Root: HKCU; Subkey: "Software\Classes\.pdf\OpenWithProgids"; ValueType: string; ValueName: "RapidPDF.Document"; ValueData: ""; Flags: uninsdeletevalue
