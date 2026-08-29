@@ -91,11 +91,19 @@ def test_the_organizer_zoom_has_no_control(prefs):
     assert not hasattr(prefs, "_zoom_spin")
 
 
-def test_the_tab_confirmation_has_no_control(prefs):
-    """Kept in the schema, kept out of the dialog until tabs exist. Every
-    control on this page applies the moment it is touched, so a permanently
-    disabled one would be the only thing here that does nothing."""
-    assert not hasattr(prefs, "_confirm_tabs_check")
+def test_the_tab_confirmation_finally_has_a_control(prefs, store):
+    """CHANGED ON PURPOSE IN PHASE 2.
+
+    This asserted the opposite: the key was kept in the schema and out of the
+    dialog, because with no tabs a checkbox for it would have been the one
+    control on the page that does nothing. Tabs exist now, so it gets its
+    checkbox and, like everything else here, it writes the moment it is touched.
+    """
+    assert prefs._confirm_tabs_check.isChecked() is True   # the default
+    prefs._confirm_tabs_check.setChecked(False)
+    assert store.close.confirm_multiple_tabs is False
+    prefs._confirm_tabs_check.setChecked(True)
+    assert store.close.confirm_multiple_tabs is True
 
 
 # ---------------------------------------------------------------------------

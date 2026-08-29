@@ -48,7 +48,6 @@ THREE THINGS IN HERE ARE LOAD-BEARING, AND THE WORST ONE FAILS SILENTLY.
 
 import os
 
-import fitz
 from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QHBoxLayout, QMessageBox, QTabWidget, QVBoxLayout,
@@ -91,10 +90,19 @@ class DocumentView(QWidget):
     #: A line for the status bar.
     status_message = Signal(str)
 
-    #: This view has been asked to go away (File > Close PDF). Nothing acts on
-    #: it yet: the window holds exactly one view and it stays, emptied. Phase 2
-    #: is where the tab goes with it.
+    #: This view has been asked to go away (File > Close PDF). The document is
+    #: already closed by the time it goes out; what is left is the tab, and
+    #: whether the window goes with it. See MainWindow._on_view_close_requested.
     close_requested = Signal()
+
+    #: Files were chosen and want opening. The view does not open them itself
+    #: because where they land is a decision about TABS, which is the window's:
+    #: a file already open activates its tab, and anything else gets a new one.
+    paths_requested = Signal(list)
+
+    #: Files were chosen for a staged combine. Same reason: the merge lands in
+    #: a tab, and picking that tab is the window's job.
+    combine_requested = Signal(list)
 
     #: Republished from the canvas: the user zoomed manually, so no fit mode is
     #: active any more. The fit control is window chrome (see the module
@@ -234,6 +242,26 @@ class DocumentView(QWidget):
     def is_dirty(self) -> bool:
         return self._dirty
 
+    def fit_mode(self):
+        """The page-fit mode THIS canvas is actually in, or None.
+
+        Not the same thing as the remembered setting: a manual zoom breaks the
+        fit on one canvas and leaves the app-wide default alone. The window
+        reads this when a tab comes to the front, so the status bar shows the
+        mode the document on screen is in rather than the one that was chosen
+        for some other tab.
+        """
+        return self._canvas.fit_mode()
+
+    def refresh_chrome(self):
+        """Re-announce everything the window's chrome reads off this view.
+
+        Called when this view comes to the front, where the status line, the
+        page box and the title are all still showing the tab that just left.
+        One call because they already share one publisher.
+        """
+        self._update_status()
+
     def undo_stack(self):
         """The canvas's stack, which is this document's stack.
 
@@ -306,42 +334,34 @@ class DocumentView(QWidget):
     # ------------------------------------------------------------------
 
     def open_pdf(self):
+        """File > Open. Picks the files; the window decides where they land."""
         paths, _ = QFileDialog.getOpenFileNames(
-            self.window(), "Open / Combine PDFs", dialog_start_dir(self._doc.path),
+            self.window(), "Open PDFs", dialog_start_dir(self._doc.path),
             "PDF Files (*.pdf)"
         )
         if not paths:
             return
         remember_dialog_dir(paths[0])
-        self.open_paths(sorted(paths))  # combine in filename order
+        self.paths_requested.emit(sorted(paths))
 
-    def open_paths(self, paths: list):
-        """Open/append the given PDF paths (shared by the Open dialog and the
-        shell/CLI launch path)."""
-        if not paths:
-            return
-        # A document is already open → append the chosen PDFs to the end.
+    def open_path(self, path: str) -> bool:
+        """Open ONE file into this view, which must be empty.
+
+        THIS IS WHERE THE APPEND USED TO BE. `open_paths` took a list, and with
+        a document already open it merged every one of them onto the end of it.
+        Opening a second PDF silently changed the one you were reading, and the
+        next Save wrote that merge over the file. A second file is a second tab
+        now, so this takes one path and never touches an open document.
+
+        Appending still exists where somebody asked for it: the Organizer's
+        Add Pages, and the Combine dialog.
+        """
         if self._doc.doc:
-            added = self._append_pdfs(paths)
-            self._refresh_panel_thumbnails()
-            self._update_status(
-                f"Appended {added} page(s) from {len(paths)} file(s)"
-            )
-            return
-
-        # Multiple files with nothing open: stage the combine (Adobe-style)
-        # instead of merging blindly in filename order.
-        if len(paths) > 1:
-            self._combine_with_dialog(paths)
-            return
-
-        # No document yet → open the first file, then append any others.
-        if not self._doc.open(paths[0]):
-            QMessageBox.critical(self.window(), "Error", f"Could not open:\n{paths[0]}")
-            return
-        self._dirty = False  # freshly opened, in sync with disk (combine below re-dirties)
-        if len(paths) > 1:
-            self._append_pdfs(paths[1:])
+            return False
+        if not self._doc.open(path):
+            QMessageBox.critical(self.window(), "Error", f"Could not open:\n{path}")
+            return False
+        self._dirty = False           # freshly opened, in sync with disk
         self._canvas.set_document(self._doc)
         self._page_panel.set_document(self._doc)
         self._current_page = 0
@@ -349,23 +369,25 @@ class DocumentView(QWidget):
         self._search_hits = []
         self._search_index = -1
         self._search_term = None
-        if len(paths) == 1:
-            # A single freshly opened file may carry an editable model to restore.
-            self._load_saved_annotations()
+        # A freshly opened file may carry an editable model to restore.
+        self._load_saved_annotations()
         # Always rebuild the panel thumbnails from a markup-baked clone after open.
         # _load_saved_annotations already does this when it restores a model, but a
         # file with baked markup and no model (or none to restore) still needs the
         # panel re-rendered so it matches the page rather than the pre-strip doc.
         self._refresh_panel_thumbnails()
         self._apply_default_fit()
-        self._update_status(
-            f"Combined {len(paths)} files" if len(paths) > 1 else ""
-        )
+        self._update_status()
+        return True
 
     def combine_pdfs(self):
         """File > Combine PDFs: pick files, stage them as movable cards, merge
-        only when Combine is clicked. Any open document is closed first (with
-        the usual save prompt)."""
+        only when Combine is clicked.
+
+        The open document is no longer closed to make room. The merge is a new
+        document, so it gets a tab of its own and whatever was being read stays
+        where it was.
+        """
         paths, _ = QFileDialog.getOpenFileNames(
             self.window(), "Combine PDFs", dialog_start_dir(self._doc.path),
             "PDF Files (*.pdf)"
@@ -373,28 +395,13 @@ class DocumentView(QWidget):
         if not paths:
             return
         remember_dialog_dir(paths[0])
-        if self._doc.doc:
-            self.close_document()     # prompts to save; may be cancelled
-            if self._doc.doc:
-                return                # user backed out, keep the open doc
-        self._combine_with_dialog(sorted(paths))
+        self.combine_requested.emit(sorted(paths))
 
-    def handle_cli_files(self, files: list, combine: bool):
-        """One aggregated shell/CLI launch batch (see core.single_instance).
-
-        Several files together, or an explicit --combine verb, go to the
-        staged Combine dialog as whole-file cards; a lone file opens (or
-        appends, matching the Open menu's behavior). The window has already
-        pulled itself to the front by the time this runs.
-        """
-        if combine or len(files) > 1:
-            if self._doc.doc:
-                self.close_document()  # prompts to save; may be cancelled
-                if self._doc.doc:
-                    return
-            self._combine_with_dialog(files)
-        else:
-            self.open_paths(files)
+    def combine_paths(self, paths: list):
+        """Run the staged combine into this view, which must be empty."""
+        if self._doc.doc or not paths:
+            return
+        self._combine_with_dialog(list(paths))
 
     def _combine_with_dialog(self, paths: list):
         """Run the staged-combine dialog and adopt its merged output.
@@ -420,27 +427,6 @@ class DocumentView(QWidget):
         self._refresh_panel_thumbnails()
         self._apply_default_fit()
         self._update_status(f"Combined {len(paths)} files (not saved yet)")
-
-    def _append_pdfs(self, paths) -> int:
-        """Insert each PDF's pages at the end of the current doc. Returns pages added."""
-        total = 0
-        errors = []
-        for path in paths:
-            try:
-                src = fitz.open(path)
-                count = len(src)
-                src.close()
-                self._doc.insert_pdf(path, start_at=self._doc.page_count())
-                total += count
-            except Exception as e:
-                errors.append(f"{os.path.basename(path)}: {e}")
-        if total:
-            # A merge produces a derived document → untitled + unsaved.
-            self._mark_untitled()
-            self._mark_dirty()
-        if errors:
-            QMessageBox.critical(self.window(), "Insert Error", "\n".join(errors))
-        return total
 
     def copy_selection(self):
         """Copy the selected annotations into the in-app clipboard."""
@@ -1001,7 +987,7 @@ class DocumentView(QWidget):
             self._doc.delete_tagged_annotations(pn)
         self._canvas.load_annotation_model(model)
         self._canvas.reload_current_page()
-        # (The caller, open_paths, rebuilds the left-panel thumbnails from a clone
+        # (The caller, open_path, rebuilds the left-panel thumbnails from a clone
         # with these restored overlays baked in — so pages that aren't the current
         # one don't keep showing now-stripped squares, or miss restored ones.)
 

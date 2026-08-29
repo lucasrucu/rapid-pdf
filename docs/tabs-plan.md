@@ -180,7 +180,7 @@ implements it. No custom event handling needed.
 | --- | --- | --- | --- |
 | 0 | Settings module plus close rework | 1.5 d | in progress, `feat/settings-and-close` |
 | 1 | Extract `DocumentView` from `MainWindow` | 2-3 d | **riskiest phase**, done on `refactor/document-view` |
-| 2 | Tabs in one window | 1.5-2 d | |
+| 2 | Tabs in one window | 1.5-2 d | done on `feat/document-tabs` |
 | 3 | Multi-window via `WindowRegistry`, menu item only | 1.5-2 d | |
 | 4 | Tear-off drag gesture | 1-1.5 d | |
 | 5 | Pages between tabs | 4 d | |
@@ -265,9 +265,28 @@ an edit to pass, behaviour moved, not just code. Stop and find out why.
 
 ### Phase 2: tabs in one window
 
-`QTabBar` plus `QStackedWidget` of `DocumentView`s. Open a second file, get a
-second tab. Middle-click closes (finding 3). `open_paths` stops appending.
-`handle_cli_files` opens one tab per path instead of merging.
+Done. `ui/document_area.py` holds a `DocumentTabBar` over a `QStackedWidget`,
+index-parallel, asserted by `DocumentArea.check_invariant()`. `MainWindow` holds
+one of those instead of one `DocumentView` and `MainWindow.view` is the front
+one. Middle-click closes (finding 3, and it survived replacing Qt's own close
+button with the dirty-dot one). `open_paths` no longer appends: a second file is
+a second tab, and a file already open activates its tab. `handle_cli_files`
+decides by VERB, so `--combine` stages a combine whatever the file count and a
+plain open of N files opens N tabs.
+
+Rebound on a tab switch, all in `MainWindow._on_front_view_changed`: the five
+chrome signals (`_connect_view` / `_disconnect_view`), the Edit menu's Undo and
+Redo (rebuilt, because `createUndoAction` binds an action to one stack for its
+life), the page box and the title (`DocumentView.refresh_chrome`), and the fit
+group (`_sync_fit_group`, which reads the arriving CANVAS rather than the
+app-wide setting, since a manual zoom breaks the fit on one canvas only).
+
+`close.confirm_multiple_tabs` finally has a reader and a checkbox. It is skipped
+whenever any document is dirty, because the per-document save prompt is a better
+version of the same question and two dialogs in a row are worse than one.
+
+Not done here, on purpose: MRU `Ctrl+Tab` (phase 3), "Move to New Window"
+(phase 3), background-tab clone release (phase 3, see "Memory and cost").
 
 ### Phase 3: multi-window, menu-driven
 
@@ -551,6 +570,36 @@ roughly 27 MB before conversion.) Six of those is around 216 MB **for one
 document**.
 
 Ten tabs of A1 drawings could approach a gigabyte.
+
+### Measured with tabs actually open (phase 2)
+
+Numbers, not arithmetic. Measured on this install with the Windows working set
+(`GetProcessMemoryInfo`), A1 portrait at 1684 x 2384 pt.
+
+| Measured | Value |
+| --- | --- |
+| one A1 page cached at zoom 1.0 | 1684 x 2384 px, 32-bit, **15.3 MB** |
+| one A1 page cached at zoom 1.5 | 2526 x 3576 px, 32-bit, **34.5 MB** |
+| one document's full render cache (6 entries, zoom 1.5) | **207 MB** |
+| ten documents' full render caches | **2.02 GB** |
+| ten tabs open, one page viewed in each, default fit | **+345 MB** (about 35 MB a tab) |
+| ten live fitz documents PLUS twenty markup-baked clones, no renders | **+2 MB** |
+
+The estimate above was right about the ceiling and **wrong about where the
+weight is**, which changes what phase 3 should do first.
+
+**The clones are nearly free. The pixmap cache is the whole cost.** Ten live
+documents and their twenty clones came to two megabytes, because
+`clone_with_annotations` copies page content streams and a drawing is vector
+data. That cost scales with the FILE, so a 20 MB drawing clones to roughly
+20 MB, and even then it is an order of magnitude under the 207 MB of pixmaps
+that one document's render cache holds regardless of how big the file is.
+
+So the phase 3 rule to write first is **drop a backgrounded document's pixmap
+cache** (`invalidate_render_cache`, `core/pdf_document.py:88`), which is one
+call, cannot fail, and recovers 200 MB a tab. Releasing the render clones is
+still worth doing and it is still where the second-switch bug lives (known bug
+6), but on these numbers it is the smaller half of the job, not the headline.
 
 **Background tabs must release their render clones, and that is phase 3 work,
 not later.** The rules:
