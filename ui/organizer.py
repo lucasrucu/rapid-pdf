@@ -4,11 +4,12 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QLabel, QFileDialog, QMessageBox,
     QStyledItemDelegate, QStyle, QStyleOptionViewItem,
 )
-from PySide6.QtCore import Signal, Qt, QSize, QRect, QTimer, QPoint, QSettings
+from PySide6.QtCore import Signal, Qt, QSize, QRect, QTimer, QPoint
 from PySide6.QtGui import (
     QIcon, QColor, QPixmap, QPainter, QDrag, QShortcut, QKeySequence,
 )
 
+from core.settings import settings
 from ui.thumbnails import aspect_ratio_placeholder, draw_thumbnail
 from ui.theme import LIGHT
 from ui.scrolling import TrackpadScrollFilter
@@ -41,11 +42,10 @@ ITEM_H = 262
 ZOOM_STEPS = (0.5, 0.65, 0.8, 1.0, 1.25, 1.6, 2.0)
 DEFAULT_ZOOM_INDEX = ZOOM_STEPS.index(1.0)
 
-# Where the chosen zoom level is remembered, in the same store the page panel's
-# visibility and the light/dark choice already use.
-_SETTINGS_ORG = "Lucas"
-_SETTINGS_APP = "Rapid PDF"
-_ZOOM_SETTING = "ui/organizer_zoom_index"
+# The chosen zoom level is remembered in the settings file, alongside the page
+# panel's visibility and the light/dark choice (see core/settings.py). Writes
+# there are debounced, which matters here more than anywhere else: a Ctrl+wheel
+# spin steps the ladder several times a second and every step persists.
 
 # One wheel notch on an ordinary mouse. Accumulated rather than compared
 # directly, so a high-resolution wheel or a trackpad (many small deltas) takes
@@ -549,10 +549,8 @@ class PageOrganizer(QWidget):
         Anything unreadable (missing key, a string from an older build, an index
         from a longer ladder) falls back to the default rather than raising.
         """
-        raw = QSettings(_SETTINGS_ORG, _SETTINGS_APP).value(
-            _ZOOM_SETTING, DEFAULT_ZOOM_INDEX)
         try:
-            index = int(raw)
+            index = settings().view.organizer_zoom_index
         except (TypeError, ValueError):
             return DEFAULT_ZOOM_INDEX
         return max(0, min(index, len(ZOOM_STEPS) - 1))
@@ -584,7 +582,7 @@ class PageOrganizer(QWidget):
         if index == self._zoom_index:
             return False
         self._zoom_index = index
-        QSettings(_SETTINGS_ORG, _SETTINGS_APP).setValue(_ZOOM_SETTING, index)
+        settings().view.organizer_zoom_index = index
         self._adopt_zoom(anchor)
         return True
 

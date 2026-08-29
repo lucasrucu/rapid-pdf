@@ -4,8 +4,8 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QTabWidget,
     QFileDialog, QMessageBox, QStatusBar, QApplication, QPushButton,
 )
-from PySide6.QtCore import QSettings, QTimer, Qt
-from PySide6.QtGui import QAction, QKeySequence, QShortcut, QIcon
+from PySide6.QtCore import QTimer, Qt
+from PySide6.QtGui import QAction, QGuiApplication, QKeySequence, QShortcut, QIcon
 
 # Debounce for search-as-you-type: long enough that fast typing doesn't
 # re-scan the document per keystroke, short enough to feel live.
@@ -19,6 +19,7 @@ UPDATE_CHECK_DELAY_MS = 1500
 
 from core.pdf_document import PDFDocument
 from core.page_ops import is_permutation
+from core.settings import settings
 from core.resources import app_icon_path
 from core.ocr_worker import run_ocr_enhance
 from core.version import APP_VERSION
@@ -45,6 +46,7 @@ class MainWindow(QMainWindow):
         self._panel_render = None  # throwaway clone backing the left page panel's thumbnails
         self._dirty = False      # unsaved changes exist (annotations, page edits, merges)
         self._force_quit = False # Quit menu wants a real app quit, not "close PDF"
+        self._session_ending = False  # Windows is ending the session; never block it
         self._ocr_thread = None  # active OCR QThread, or None when idle
         self._ocr_worker = None  # keep a ref alive alongside the thread
         # Rows the page panel should end up with highlighted after the next
@@ -71,6 +73,7 @@ class MainWindow(QMainWindow):
         self._theme.theme_changed.connect(self._apply_theme_surfaces)
         # Optional Win11 Mica backdrop (silent no-op elsewhere).
         apply_mica(self, self._theme.is_dark)
+        self._connect_session_manager()
         # Ask GitHub whether there is a newer release. Off the GUI thread, and
         # after the window is up: see UPDATE_CHECK_DELAY_MS and
         # ui/update_notice.py. Offline this does nothing at all, silently.
@@ -198,14 +201,18 @@ class MainWindow(QMainWindow):
         fm = mb.addMenu("File")
         self._add_action(fm, "Open / Combine PDFs…", self.open_pdf, QKeySequence.StandardKey.Open)
         self._add_action(fm, "Combine PDFs…", self.combine_pdfs)
-        self._add_action(fm, "Close PDF", self.close_pdf)
+        self._add_action(fm, "Close PDF", self.close_pdf, "Ctrl+W")
         fm.addSeparator()
         self._add_action(fm, "Save", self.save_pdf, QKeySequence.StandardKey.Save)
         self._add_action(fm, "Save As…", self.save_pdf_as, "Ctrl+Shift+S")
         fm.addSeparator()
         self._add_action(fm, "Enhance for Search (OCR)…", self.enhance_for_search)
         fm.addSeparator()
-        self._add_action(fm, "Quit", self._quit_app, QKeySequence.StandardKey.Quit)
+        # Ctrl+Q spelled out, not QKeySequence.StandardKey.Quit. On Windows that
+        # standard key resolves to the hardware Exit media key, so the menu
+        # displayed "Exit" as its shortcut and Quit had no binding anybody could
+        # actually press.
+        self._add_action(fm, "Quit", self._quit_app, "Ctrl+Q")
 
         em = mb.addMenu("Edit")
         undo_act = self._canvas.undo_stack.createUndoAction(self, "Undo")
@@ -236,8 +243,7 @@ class MainWindow(QMainWindow):
         self._panel_action.setShortcut("Ctrl+B")
         self._panel_action.toggled.connect(self._on_panel_toggled)
         vm.addAction(self._panel_action)
-        panel_visible = QSettings("Lucas", "Rapid PDF").value(
-            "ui/page_panel_visible", True, type=bool)
+        panel_visible = settings().view.page_panel_visible
         self._panel_action.setChecked(panel_visible)
         self._page_panel.setVisible(panel_visible)   # setChecked(False) fires no toggle
         vm.addSeparator()
@@ -294,7 +300,7 @@ class MainWindow(QMainWindow):
 
     def _on_panel_toggled(self, checked: bool):
         self._page_panel.setVisible(checked)
-        QSettings("Lucas", "Rapid PDF").setValue("ui/page_panel_visible", checked)
+        settings().view.page_panel_visible = checked
 
     def _add_action(self, menu, label: str, slot, shortcut=None):
         action = QAction(label, self)
@@ -487,6 +493,15 @@ class MainWindow(QMainWindow):
             return
         if not self._maybe_save_before_close():
             return
+        self._clear_document()
+
+    def _clear_document(self):
+        """Drop the open document and return the window to its empty state.
+
+        The prompt is the caller's job: this runs after the decision to close
+        has been made, which is why both `close_pdf` and the X-closes-document
+        path in `closeEvent` can share it.
+        """
         self._close_org_render()
         self._close_panel_render()
         self._search_bar.hide()
@@ -1119,35 +1134,102 @@ class MainWindow(QMainWindow):
         self._force_quit = True
         self.close()
 
-    def closeEvent(self, event):
-        # The close button (X) closes an open PDF, not the app — only quitting
-        # when nothing is open. The Quit menu sets _force_quit to override that.
-        if self._doc.doc and not self._force_quit:
-            if self._maybe_save_before_close():
-                self._close_org_render()
-                self._close_panel_render()
-                self._search_bar.hide()
-                self._on_search_closed()
-                self._doc.close()
-                self._dirty = False
-                self._canvas.set_document(self._doc)
-                self._page_panel.set_document(self._doc)
-                # Also clear the Organizer grid (see close_pdf) so it doesn't
-                # keep showing the closed document's pages.
-                self._organizer.set_document(self._doc, None)
-                self._current_page = 0
-                self._update_status()
-            event.ignore()   # keep the app running
-            return
-        # Quit the app (Quit menu, or X with nothing open) — prompt to save first.
-        if not self._maybe_save_before_close():
-            self._force_quit = False
-            event.ignore()
-            return
+    # ------------------------------------------------------------------
+    # Closing
+    # ------------------------------------------------------------------
+
+    def _connect_session_manager(self):
+        """Listen for the session ending, if this platform reports one.
+
+        Not every platform build emits `commitDataRequest`, and a headless test
+        app has no session manager at all, so a missing signal is fine:
+        `_session_is_ending` falls back to `isSavingSession()`.
+        """
+        app = QGuiApplication.instance()
+        try:
+            app.commitDataRequest.connect(self._on_commit_data)
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+
+    def _on_commit_data(self, manager=None):
+        """Windows is ending the session (shutdown, restart, log off).
+
+        Qt raises `commitDataRequest` from WM_QUERYENDSESSION. Everything that
+        happens on this signal is on Windows's clock, so it does two things and
+        nothing else: remember that the close about to arrive is a session end,
+        and get the settings on disk while there is still a process to do it.
+        """
+        self._session_ending = True
+        try:
+            manager.setRestartHint(manager.RestartHint.RestartNever)
+        except (AttributeError, TypeError):
+            pass
+        settings().flush()
+
+    def _session_is_ending(self) -> bool:
+        """Whether the close now in flight is Windows shutting the session down.
+
+        Two independent reads because neither is reliable alone: the flag set by
+        `commitDataRequest`, and Qt's own `isSavingSession()` for the case where
+        the signal never reached us.
+        """
+        if self._session_ending:
+            return True
+        app = QGuiApplication.instance()
+        try:
+            return bool(app is not None and app.isSavingSession())
+        except (AttributeError, RuntimeError):
+            return False
+
+    def _teardown_for_quit(self):
+        """Release everything the process owns, on the way out for good."""
         self._close_org_render()
         self._close_panel_render()
         # A check thread still running when the window goes is a crash on
         # exit. Bounded wait, see UpdateNotice.shutdown().
         self._update_notice.shutdown()
         self._doc.close()
+        settings().flush()   # writes are debounced; the timer may never fire
+
+    def closeEvent(self, event):
+        """The X, Alt+F4, Ctrl+Q, and the session manager all land here.
+
+        Written so the tab work can extend it: the only decision that changes
+        with tabs is what `_clear_document` has to clear and whether more than
+        one document is open, and both sit behind the two branches below.
+        """
+        # Windows is shutting down. Anything that stalls here is what makes it
+        # put up "this app is preventing shutdown", so there is no prompt and,
+        # above all, no event.ignore(). An unsaved document is lost the same way
+        # it would be in any app that does not implement the full session
+        # protocol, which is the accepted trade for not blocking the machine.
+        if self._session_is_ending():
+            self._teardown_for_quit()
+            super().closeEvent(event)
+            event.accept()
+            return
+
+        # The X closes the window and the app. Setting close.x_closes to
+        # "document" restores the older behaviour: the PDF closes and an empty
+        # window stays up. The Quit menu (_force_quit) overrides either way.
+        close_document_only = (
+            bool(self._doc.doc)
+            and not self._force_quit
+            and settings().close.x_closes == "document"
+        )
+
+        # Unsaved changes are prompted for first and the answer overrides the
+        # setting: Cancel aborts the close outright, whichever branch it was
+        # heading for.
+        if not self._maybe_save_before_close():
+            self._force_quit = False
+            event.ignore()
+            return
+
+        if close_document_only:
+            self._clear_document()
+            event.ignore()      # the window stays, empty
+            return
+
+        self._teardown_for_quit()
         super().closeEvent(event)

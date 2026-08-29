@@ -13,17 +13,12 @@ a genuine QWheelEvent. Everything either side of that is the real widget.
 
 import pytest
 
-from PySide6.QtCore import Qt, QPoint, QPointF, QSettings
+from PySide6.QtCore import Qt, QPoint, QPointF
 from PySide6.QtGui import QPixmap, QWheelEvent
 from PySide6.QtWidgets import QApplication
 
-from ui import organizer as organizer_mod
+from core.settings import Settings, set_settings, settings
 from ui.organizer import PageOrganizer, ZOOM_STEPS, DEFAULT_ZOOM_INDEX, THUMB_W
-
-# Settings the tests are allowed to scribble on, so a run never disturbs the
-# zoom level Lucas actually chose in the app.
-_TEST_ORG = "Lucas"
-_TEST_APP = "Rapid PDF Tests"
 
 
 class _FakeDoc:
@@ -54,13 +49,19 @@ def qt_app():
 
 
 @pytest.fixture(autouse=True)
-def isolated_settings(monkeypatch):
-    """Point the remembered-zoom key at a throwaway store, and start empty."""
-    monkeypatch.setattr(organizer_mod, "_SETTINGS_ORG", _TEST_ORG)
-    monkeypatch.setattr(organizer_mod, "_SETTINGS_APP", _TEST_APP)
-    QSettings(_TEST_ORG, _TEST_APP).clear()
-    yield
-    QSettings(_TEST_ORG, _TEST_APP).clear()
+def isolated_settings(tmp_path):
+    """Point the settings store at a throwaway file, so a run never disturbs
+    the zoom level Lucas actually chose in the app.
+
+    Writes go through undebounced (debounce_ms=0), because a QTimer needs an
+    event loop turn to fire and these tests assert on the file straight after
+    the zoom changes.
+    """
+    store = Settings(tmp_path / "settings.json", debounce_ms=0,
+                     migrate_legacy=False)
+    previous = set_settings(store)
+    yield store
+    set_settings(previous)
 
 
 @pytest.fixture
@@ -278,8 +279,7 @@ def test_the_zoom_level_is_remembered_for_the_next_run(qt_app, org):
     org.zoom_in()
     org.zoom_in()
     chosen = org.zoom_index()
-    assert QSettings(_TEST_ORG, _TEST_APP).value(
-        organizer_mod._ZOOM_SETTING, type=int) == chosen
+    assert settings().view.organizer_zoom_index == chosen
     fresh = PageOrganizer()
     try:
         assert fresh.zoom_index() == chosen
@@ -288,10 +288,12 @@ def test_the_zoom_level_is_remembered_for_the_next_run(qt_app, org):
         fresh.deleteLater()
 
 
-def test_a_junk_setting_falls_back_to_the_default(qt_app):
-    QSettings(_TEST_ORG, _TEST_APP).setValue(organizer_mod._ZOOM_SETTING, "banana")
+def test_a_junk_setting_falls_back_to_the_default(qt_app, isolated_settings):
+    # Written straight into the file's dict, since the typed accessor would
+    # reject "banana" at the setter. This is the hand-edited-file case.
+    isolated_settings.raw()["view"] = {"organizer_zoom_index": "banana"}
     assert PageOrganizer._load_zoom_index() == DEFAULT_ZOOM_INDEX
-    QSettings(_TEST_ORG, _TEST_APP).setValue(organizer_mod._ZOOM_SETTING, 999)
+    isolated_settings.view.organizer_zoom_index = 999
     assert PageOrganizer._load_zoom_index() == len(ZOOM_STEPS) - 1
 
 

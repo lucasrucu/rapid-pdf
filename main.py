@@ -5,6 +5,7 @@ from PySide6.QtGui import QIcon
 from ui.main_window import MainWindow
 from ui.theme import apply_theme
 from core.resources import app_icon_path
+from core.settings import settings
 from core.single_instance import InstanceServer, forward_to_primary, parse_cli
 
 
@@ -24,6 +25,12 @@ def main():
     # the running instance aggregates them (see core/single_instance.py).
     if forward_to_primary(files, combine):
         sys.exit(0)
+
+    # Settings live in %LOCALAPPDATA%\Rapid PDF\settings.json (see
+    # core/settings.py). Built here, after the org/app names are set, because
+    # those decide the path. Writes are debounced, so a last flush on the way
+    # out catches a change made in the final quarter-second.
+    app.aboutToQuit.connect(settings().flush)
 
     icon_path = app_icon_path()
     if icon_path:

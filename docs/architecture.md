@@ -14,6 +14,7 @@ main.py                 entry point
        └─ ui/organizer.py    page reorder/delete/add grid (Organizer tab)
   core/pdf_document.py   PyMuPDF wrapper used by every UI piece
   core/page_ops.py       pure page-order arithmetic (no Qt, no PyMuPDF)
+  core/settings.py       the one settings store, read by the shell and the UI
 ```
 
 The UI never touches `fitz` directly for document mutations: it goes through `core/PDFDocument`, which owns the live `fitz.Document`, the render cache, the save lifecycle, and the embedded annotation model. The canvas does read `self._doc.doc` for read-only page geometry (image rects, rotation), but all structural and content changes route through `PDFDocument` methods so cache invalidation stays centralized.
@@ -31,6 +32,35 @@ The single wrapper over PyMuPDF. Responsibilities:
 - **Writing markup** `write_annotations` converts the canvas's annotation dicts into real PDF annotation objects (tagged `rapid-pdf` so they can be found and stripped again).
 - **The image-lift primitive** `remove_image_placement`, which deletes one image's content-stream placement without leaving a hole.
 - **`clone_with_annotations`** produces a throwaway copy with unsaved markup baked in, used to render thumbnails without mutating the live document.
+
+### `core/settings.py`: `Settings`
+
+Everything the app remembers between runs, in one JSON file at
+`%LOCALAPPDATA%\Rapid PDF\settings.json`. It replaced four inline
+`QSettings("Lucas", "Rapid PDF")` constructions that wrote three registry keys
+with no schema and no shared defaults; those keys are read once on the first run
+without a settings file and then left alone.
+
+Values come out through typed section accessors (`settings().close.x_closes`),
+so a typo raises at the call site instead of resolving to `None` further down.
+Reads are forgiving and writes are not: a hand-edited `"x_closes": "banana"`
+reads back as the default, while setting the same value from inside the app is a
+`ValueError`, because that would be a bug.
+
+Three behaviours worth knowing about:
+
+- **Writes are atomic and debounced.** `settings.json.tmp` then `os.replace`,
+  the same reasoning as the in-place PDF save, on 250 ms of quiet so a
+  Ctrl+wheel zoom burst is one write rather than one per notch. The close path
+  and `aboutToQuit` both flush by hand, since the process may not outlive the
+  timer.
+- **Nothing about settings can stop the app starting.** An unparseable file is
+  moved to `settings.json.bad` and defaults take over.
+- **Forward compatibility is explicit.** Missing keys resolve to defaults
+  without bumping `schema_version`, unknown keys survive a write cycle, and a
+  file written by a newer build loads read-only against defaults so this build
+  cannot damage settings it does not understand. `MIGRATIONS` maps a
+  from-version to the function that lifts the data one step.
 
 ### `ui/canvas.py`: `PDFCanvas` and the annotation items
 
@@ -52,6 +82,7 @@ The shell that wires everything together and owns the document lifecycle:
 
 - Builds the two tabs and connects toolbar signals to canvas slots.
 - Owns **open / combine** (multiple files append in filename order), **save / save-as**, **close**, and **quit**, including the unsaved-changes prompt and the dirty/untitled state shown in the window title.
+- **The close decision**, in `closeEvent`, in strict order: a session end (Windows shutting down) is accepted immediately and never prompted for or ignored, because either would show up as Rapid PDF preventing the shutdown; then unsaved changes are prompted for and Cancel aborts; then `close.x_closes` decides whether the window goes or only the document does. `Ctrl+W` closes the document, `Ctrl+Q` quits.
 - Coordinates **the flush → save → strip** sequence (see Save lifecycle).
 - Keeps the page panel and organizer thumbnails in sync by rebuilding them from a markup-baked clone after edits.
 

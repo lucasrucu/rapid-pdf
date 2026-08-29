@@ -77,6 +77,10 @@ class InstanceServer(QObject):
         super().__init__(parent)
         self._pending_files: list[str] = []
         self._pending_combine = False
+        # Whether any launch at all landed in this window. Kept separately from
+        # the file list because a launch with NO files is the ordinary case of
+        # double-clicking the shortcut, and it still has to raise the window.
+        self._pending_launch = False
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.setInterval(AGGREGATE_MS)
@@ -95,6 +99,7 @@ class InstanceServer(QObject):
         the current aggregation window."""
         self._pending_files.extend(f for f in files if f)
         self._pending_combine = self._pending_combine or combine
+        self._pending_launch = True
         self._timer.start()   # restart: extend the window for stragglers
 
     def _on_connection(self):
@@ -123,6 +128,13 @@ class InstanceServer(QObject):
             self.add_launch(list(msg.get("files", [])), bool(msg.get("combine")))
 
     def _flush(self):
+        # A launch that carried no files still counts. Double-clicking the
+        # shortcut while Rapid PDF is already running forwards an empty payload;
+        # gating the emit on `files` meant the second process handed that over
+        # and exited, the primary did nothing with it, and the app looked like
+        # it had simply failed to start. An empty batch raises the window.
+        if not self._pending_launch:
+            return
         files = [f for f in self._pending_files if os.path.exists(f)]
         # De-duplicate while keeping order (the same file forwarded twice).
         seen = set()
@@ -130,8 +142,8 @@ class InstanceServer(QObject):
         combine = self._pending_combine
         self._pending_files = []
         self._pending_combine = False
-        if files:
-            self.batch_ready.emit(files, combine)
+        self._pending_launch = False
+        self.batch_ready.emit(files, combine)
 
 
 def parse_cli(argv: list) -> tuple[list, bool]:
