@@ -9,6 +9,7 @@ from PySide6.QtGui import (
     QIcon, QColor, QPixmap, QPainter, QDrag, QShortcut, QKeySequence,
 )
 
+from core.pdf_document import source_is_readable
 from core.settings import dialog_start_dir, remember_dialog_dir, settings
 from ui.thumbnails import aspect_ratio_placeholder, draw_thumbnail
 from ui.theme import LIGHT
@@ -689,6 +690,19 @@ class PageOrganizer(QWidget):
         self._render = render
         self.refresh()
 
+    def release_render_source(self, render):
+        """The host is about to close this clone. Stop naming it, and do not
+        rebuild anything.
+
+        Only when the grid is actually on THAT clone: a refresh may already
+        have swapped a newer one in, and clearing that would blank thumbnails
+        a render has just produced. Whatever is already drawn stays drawn, and
+        any cell scrolled into view afterwards falls back to the live document,
+        which is still open. See known bug 6 in docs/tabs-plan.md.
+        """
+        if render is not None and self._render is render:
+            self._render = None
+
     def _render_source(self):
         """Doc to rasterise thumbnails from: the markup-baked clone if present,
         else the live document (same source the page panel uses)."""
@@ -723,7 +737,7 @@ class PageOrganizer(QWidget):
         src = self._render_source()
         self._list.blockSignals(True)
         self._list.clear()
-        if src and src.doc:
+        if source_is_readable(src):
             for i in range(src.page_count()):
                 item = QListWidgetItem(QIcon(self._placeholder_for(i)), f"Page {i + 1}")
                 item.setSizeHint(self._cell)
@@ -744,8 +758,13 @@ class PageOrganizer(QWidget):
         Each thumbnail is pulled from its _SRC_ID page in the render doc, NOT its
         current row: a drag reorders only the live doc, so a cell scrolled into
         view after a reorder must still render its original clone page."""
+        # `source_is_readable` rather than `if not src.doc`, which is the line
+        # known bug 6 actually raised from: PyMuPDF's Document defines __len__,
+        # so truth-testing a CLOSED document raises "document closed" instead
+        # of answering False. This runs from a queued timer, which is precisely
+        # where a document can have gone since the call was scheduled.
         src = self._render_source()
-        if not src or not src.doc:
+        if not source_is_readable(src):
             return
         vp = self._list.viewport().rect().adjusted(0, -PREFETCH_PX, 0, PREFETCH_PX)
         for i in range(self._list.count()):

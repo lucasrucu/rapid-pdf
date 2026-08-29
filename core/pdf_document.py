@@ -34,6 +34,35 @@ MODEL_EMBED_NAME = "rapid_pdf_model.json"
 RENDER_CACHE_MAX = 6
 
 
+def source_is_readable(source) -> bool:
+    """Whether pages can still be pulled out of this render source.
+
+    THE QUESTION `if source.doc:` DOES NOT ANSWER, and getting that wrong is
+    known bug 6 in docs/tabs-plan.md. PyMuPDF's `Document` defines `__len__`,
+    so truth-testing a CLOSED document raises "document closed" rather than
+    returning False. Every lazy thumbnail render in the app is scheduled on a
+    zero timer and run later, which is exactly the window in which the clone it
+    was scheduled against can have been closed, so each of them has to ask this
+    instead of trusting a truth test.
+
+    Takes any render source, not just a PDFDocument: the page panel and the
+    Organizer are both handed stand-ins whose `.doc` is not a fitz document at
+    all, and one of those has no opinion about being closed, so it is taken at
+    its word.
+    """
+    if source is None:
+        return False
+    doc = getattr(source, "doc", None)
+    if doc is None:
+        return False
+    try:
+        return not doc.is_closed
+    except AttributeError:
+        return True          # not a fitz document; it cannot have been closed
+    except Exception:
+        return False         # anything a closed document raises means no
+
+
 class PDFDocument:
     def __init__(self):
         self.doc: fitz.Document | None = None
@@ -117,6 +146,13 @@ class PDFDocument:
         self.doc = None
         self.path = None
         self.invalidate_render_cache()
+
+    def is_open(self) -> bool:
+        """Whether there is a document here that can still be read.
+
+        NOT the same question as `if pdf.doc:`. See `source_is_readable`.
+        """
+        return source_is_readable(self)
 
     def page_count(self) -> int:
         return len(self.doc) if self.doc else 0

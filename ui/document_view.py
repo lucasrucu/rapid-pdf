@@ -36,10 +36,16 @@ THREE THINGS IN HERE ARE LOAD-BEARING, AND THE WORST ONE FAILS SILENTLY.
        _org_render    made by _refresh_organizer         closed by _close_org_render
        _panel_render  made by _refresh_panel_thumbnails  closed by _close_panel_render
 
-   Each refresher closes the previous render as its FIRST statement, before it
-   makes another, and `teardown()` closes both. That pairing is the whole
-   defence: `_refresh_organizer` runs on every switch into the Organizer tab,
-   so a missing close leaks a full fitz document per switch.
+   Every clone is closed exactly once, and `teardown()` closes both. That
+   pairing is the whole defence: `_refresh_organizer` runs on every switch into
+   the Organizer tab, so a missing close leaks a full fitz document per switch.
+
+   THE ORDER WITHIN A REBUILD IS ALSO LOAD-BEARING, and that was known bug 6.
+   Build the new clone, hand it over, THEN close the old one; never close first
+   and build after, because both widgets rasterise from a queued zero timer and
+   anything pumped in between is a render against a closed document. When a
+   clone is being released rather than replaced, the widget's pointer at it is
+   dropped first (`release_render_source`).
 
 3. Undo stack ownership. `PDFCanvas.set_document` clears the undo stack, so one
    canvas can only ever serve one document. This widget owns its canvas
@@ -865,23 +871,60 @@ class DocumentView(QWidget):
 
     def _refresh_organizer(self):
         """Load the Organizer with current pages, baking unsaved markup into the
-        thumbnails via a throwaway clone (so the live document isn't mutated)."""
-        self._close_org_render()
+        thumbnails via a throwaway clone (so the live document isn't mutated).
+
+        KNOWN BUG 6 IS FIXED HERE, and the fix is the ORDER. This method used
+        to close the previous clone as its first statement and only build the
+        replacement several lines later, with a `processEvents()` in between.
+        `PageOrganizer.refresh` queues `_render_visible` on a zero timer, so
+        that pump ran a render against a fitz document that had just been
+        closed and PyMuPDF raised "document closed" from inside a queued Qt
+        callback, where PySide prints it to stderr and carries on. The first
+        switch into the Organizer was clean because there was no previous clone
+        to close, which is why nothing noticed for so long; the second broke
+        every time there was still a render queued.
+
+        Build, hand over, THEN close. The Organizer is pointing at a live
+        document at every instant, so it no longer matters what runs during the
+        pump.
+        """
         if not self._doc.doc:
             self._organizer.set_document(self._doc, None)
+            self._close_org_render()
             return
         self.status_message.emit("Loading organizer…")
+        # Safe here: the Organizer is still rendering from the PREVIOUS clone,
+        # which is still open, and stays open until the swap below is done.
         QApplication.processEvents()
-        self._org_render = self._make_markup_baked_render()
+        previous, self._org_render = self._org_render, None
+        try:
+            self._org_render = self._make_markup_baked_render()
+        except Exception:
+            # Nothing was handed over, so put the grid's source back rather
+            # than leaving it pointing at a clone about to be closed.
+            self._org_render = previous
+            raise
         self._organizer.set_document(self._doc, self._org_render)
+        self._close_render(previous)
         self._update_status()
 
-    def _close_org_render(self):
-        if self._org_render is not None and self._org_render.doc is not None:
+    @staticmethod
+    def _close_render(render):
+        """Close one throwaway clone. The caller has already made sure nothing
+        is still rendering from it."""
+        if render is not None and render.doc is not None:
             try:
-                self._org_render.doc.close()
+                render.doc.close()
             except Exception:
                 pass
+
+    def _close_org_render(self):
+        # The pointer goes before the document does. The Organizer renders on a
+        # queued zero timer, so closing the clone while the grid still names it
+        # is exactly known bug 6; releasing (rather than replacing) the source
+        # leaves the grid on the live document, which is still open.
+        self._organizer.release_render_source(self._org_render)
+        self._close_render(self._org_render)
         self._org_render = None
 
     def _refresh_panel_thumbnails(self, current_page: int | None = None,
@@ -905,11 +948,13 @@ class DocumentView(QWidget):
                                            select=select)
 
     def _close_panel_render(self):
-        if self._panel_render is not None and self._panel_render.doc is not None:
-            try:
-                self._panel_render.doc.close()
-            except Exception:
-                pass
+        # Same ordering as _close_org_render, and for the same reason: the
+        # panel renders its thumbnails on a queued zero timer too, so it has to
+        # stop naming the clone before the clone is closed. It has never bitten
+        # here because the only caller is the rebuild directly above, which
+        # closes and re-hands-over with nothing pumped in between.
+        self._page_panel.release_render_source(self._panel_render)
+        self._close_render(self._panel_render)
         self._panel_render = None
 
     def _on_organizer_page_activated(self, page_num: int):

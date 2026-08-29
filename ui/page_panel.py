@@ -10,6 +10,7 @@ from ui.thumbnails import aspect_ratio_placeholder, draw_thumbnail, fit_size
 from ui.theme import LIGHT
 from ui.scrolling import TrackpadScrollFilter
 from core.page_ops import move_rows
+from core.pdf_document import source_is_readable
 
 
 # Reference cell proportions. The ACTUAL cell width is derived from the list
@@ -363,6 +364,20 @@ class PagePanel(QWidget):
         self._setup_ui()
         self.setFixedWidth(PANEL_W)
 
+    def release_render_source(self, render):
+        """The host is about to close this clone. Stop naming it, and rebuild
+        nothing.
+
+        The counterpart of `set_render_source(None)`, which rebuilds every
+        thumbnail off the live document. That is the wrong move when the panel
+        is being backgrounded, which is the whole point of backgrounding it.
+        Only clears when the panel is actually on THAT clone; anything drawn
+        stays drawn and later rows fall back to the live document. Same rule as
+        PageOrganizer.release_render_source, and the same bug behind it.
+        """
+        if render is not None and self._render is render:
+            self._render = None
+
     def _render_source(self):
         """Doc to rasterise thumbnails from: the markup-baked clone if present,
         else the live document."""
@@ -572,6 +587,13 @@ class PagePanel(QWidget):
         """Render real thumbnails for any not-yet-rendered rows in (or near) view."""
         if not self._doc:
             return
+        # This runs from a queued zero timer, so the clone it was scheduled
+        # against can have been closed since. `source_is_readable` and not
+        # `if src.doc`, because PyMuPDF's Document defines __len__ and
+        # truth-testing a closed one raises rather than answering. Known bug 6.
+        source = self._render_source()
+        if not source_is_readable(source):
+            return
         vp = self._list.viewport().rect().adjusted(0, -PREFETCH_PX, 0, PREFETCH_PX)
         for i in range(self._list.count()):
             if i in self._rendered:
@@ -579,8 +601,7 @@ class PagePanel(QWidget):
             item = self._list.item(i)
             if item is None or not self._list.visualItemRect(item).intersects(vp):
                 continue
-            thumb = self._render_source().render_thumbnail(
-                i, max_width=self._render_width(i))
+            thumb = source.render_thumbnail(i, max_width=self._render_width(i))
             item.setIcon(QIcon(thumb))
             self._rendered.add(i)
 
