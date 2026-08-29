@@ -2,8 +2,8 @@ import sys
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QIcon
 
-from ui.main_window import MainWindow
 from ui.theme import apply_theme
+from ui.window_registry import WindowRegistry
 from core.resources import app_icon_path
 from core.settings import settings
 from core.single_instance import (
@@ -23,6 +23,14 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Rapid PDF")
     app.setOrganizationName("Lucas")
+
+    # App lifetime moves to the WindowRegistry (see ui/window_registry.py).
+    # Qt's own rule counts every top-level widget, which is the wrong count in
+    # both directions once there is more than one window: a Preferences dialog
+    # or a message box left over from a closing window keeps the app alive with
+    # nothing to look at, and a window that exists but has not been shown does
+    # not count at all. The registry quits when the last WINDOW leaves it.
+    app.setQuitOnLastWindowClosed(False)
 
     # Single instance. Explorer context-menu verbs fire once per selected
     # file, so a multi-select "Combine with Rapid PDF" becomes several rapid
@@ -63,9 +71,15 @@ def main():
     # Fusion style + palette + global QSS; returns the manager for the window.
     theme = apply_theme(app)
 
-    window = MainWindow(theme=theme)
+    registry = WindowRegistry.instance()
+    registry.set_theme(theme)
+    window = registry.create_window(theme=theme, show=False)
 
-    server.batch_ready.connect(window.handle_cli_files)
+    # Not window.handle_cli_files. A launch is aimed at the APPLICATION, and
+    # with several windows open the question of which one it lands in is the
+    # registry's: a file already open anywhere raises its own tab, and anything
+    # else goes to the window last touched. See WindowRegistry.route_open.
+    server.batch_ready.connect(registry.route_open)
     server.arm()      # nothing is emitted until the window is wired up
 
     window.show()

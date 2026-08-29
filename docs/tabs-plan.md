@@ -156,6 +156,16 @@ destination, with no `setParent(None)` anywhere. Result:
 Nothing reloaded, nothing was recreated, the undo history survived. This is
 the whole reason tear-off is a gesture layer rather than a rebuild.
 
+**Re-verified in phase 3 across the real path.** The table above was a bare
+canvas moved between two layouts. `MainWindow.adopt` is what the menu item and
+(later) the gesture actually call, and every identity in it survives that too:
+run `tools/smoke_multi_window.py` with no `QT_QPA_PLATFORM` set and it prints
+the same list, `internalWinId()` included, against genuine Windows handles.
+Confirmed on 2026-08-29, PySide6 6.11.1, Windows 11: same scene, same undo
+stack, same viewport, same `fitz` document, page unchanged, `internalWinId()`
+0 before and after on both the canvas and the `DocumentView`.
+`tests/test_multi_window.py` asserts the same set offscreen.
+
 **It works because the canvas is a raster `QGraphicsView`.** `PDFCanvas`
 subclasses `QGraphicsView` at `ui/canvas.py:676`, and `OpenGL`, `QOpenGL` and
 `setViewport` appear nowhere in the repo. The viewport is a plain `QWidget`,
@@ -181,7 +191,7 @@ implements it. No custom event handling needed.
 | 0 | Settings module plus close rework | 1.5 d | in progress, `feat/settings-and-close` |
 | 1 | Extract `DocumentView` from `MainWindow` | 2-3 d | **riskiest phase**, done on `refactor/document-view` |
 | 2 | Tabs in one window | 1.5-2 d | done on `feat/document-tabs` |
-| 3 | Multi-window via `WindowRegistry`, menu item only | 1.5-2 d | |
+| 3 | Multi-window via `WindowRegistry`, menu item only | 1.5-2 d | done on `feat/multi-window` |
 | 4 | Tear-off drag gesture | 1-1.5 d | |
 | 5 | Pages between tabs | 4 d | |
 | 6 | Session restore | 0.5-1 d | |
@@ -285,33 +295,99 @@ app-wide setting, since a manual zoom breaks the fit on one canvas only).
 whenever any document is dirty, because the per-document save prompt is a better
 version of the same question and two dialogs in a row are worse than one.
 
-Not done here, on purpose: MRU `Ctrl+Tab` (phase 3), "Move to New Window"
-(phase 3), background-tab clone release (phase 3, see "Memory and cost").
+Not done here, on purpose: MRU `Ctrl+Tab`, "Move to New Window" and
+background-tab clone release all went to phase 3. Of those, phase 3 shipped the
+last two; **MRU `Ctrl+Tab` is still not done**. The registry keeps an activation
+order for WINDOWS, which is a different list from a visit history for TABS, and
+nothing keeps the second one yet. `step_current` remains positional.
 
 ### Phase 3: multi-window, menu-driven
 
-A `WindowRegistry` that tracks every open `MainWindow`, owns app lifetime
-(quit when the last one goes), and moves a `DocumentView` from one window to
-another. Driven by a **"Move to New Window" menu item**. No dragging in this
-phase.
+Done. `ui/window_registry.py` tracks every open `MainWindow` in activation
+order, owns app lifetime, and answers "where does this file go". `main.py` sets
+`setQuitOnLastWindowClosed(False)` and the decision moves into
+`WindowRegistry.unregister`: one place decides, so a torn-off window closing
+while its parent lives and the parent closing while the child lives are the
+same code path. Ownership is weak, a plain list dropped in `unregister`, with
+`destroyed` connected to a `shiboken6.isValid` purge as the backstop.
 
-This is the key insight of the whole plan: **phase 3 builds every mechanism
-the tear-off needs, and it is fully testable headless.** Window creation,
-adoption of a live view, undo-stack handover, source-window teardown, close
-semantics with N windows open, app-quit rules. A menu item can be driven by a
-test; a mouse gesture across two top-level windows mostly cannot.
+`MainWindow.adopt` / `DocumentArea.adopt` take a live view out of another
+window; `DocumentArea.detach` gives one up without tearing it down. Driven by
+the tab menu's **Move to New Window** and **File > New Window** (`Ctrl+Shift+N`).
+No dragging: that is phase 4, and keeping it out is what makes all of this
+testable.
 
-The payoff is that phase 4 becomes a thin gesture layer that can be switched
-off without losing multi-window. If phase 4 is going badly, ship phase 3 and
-the feature still works.
+`batch_ready` now goes to `WindowRegistry.route_open` rather than one window's
+`handle_cli_files`: a path already open anywhere raises its own tab, anything
+else lands in the window last touched, no windows means make one, and
+`--combine` still stages the dialog on the active window.
 
-Background-tab memory release is phase 3 work, not later. See "Memory and
-cost" below.
+**Per-window chrome, and the third case is the one that was not obvious.** The
+QSS and the QPalette are set on the `QApplication`, so those cover every window
+for free. Two do not: `apply_mica` works on the HWND and a new top-level gets a
+fresh one, so it is reapplied in `showEvent` (the call in `__init__` runs before
+there is a handle to apply it to and is a no-op on every window); and the
+code-drawn surfaces, which is why each window connects `theme_changed` for
+itself. The third is the UPDATE STRIP, and it went the other way: it is one
+check per APPLICATION, so `_should_check_for_updates` lets only the first window
+run it. Three windows would otherwise make three GitHub requests, show three
+strips for the same release, and race to stage the same download.
+
+OS file drop is here too, which did not exist anywhere in the app before. A PDF
+dropped on a window opens as a new tab IN THAT WINDOW, never appended to the
+document on screen. Discriminated on `hasUrls()`, which is only ever true for a
+shell drag, so it cannot collide with either internal page drag.
+
+**Phase 3 built every mechanism the tear-off needs and all of it is testable
+headless.** Window creation, adoption of a live view, undo-stack handover,
+source-window teardown, close semantics with N windows open, app-quit rules. A
+menu item can be driven by a test; a mouse gesture across two top-level windows
+mostly cannot. Phase 4 is now a thin gesture layer that can be switched off
+without losing multi-window.
+
+`tools/smoke_multi_window.py` runs the whole path outside pytest with a real
+event loop, on offscreen or on the real Windows platform. Re-run it natively
+after anything that touches window creation, adoption or app lifetime: it is
+where the reparent invariants below are checked against real window handles.
 
 ### Phase 4: the tear-off drag gesture
 
 Roughly 400 lines in one file. It calls into phase 3's registry and does
 nothing else. Detail in "Design decisions" below.
+
+**What phase 3 changed about it.** Less than expected, which was the goal.
+
+- The gesture has exactly two calls to make: `MainWindow.move_view_to_window`
+  for a drop onto an existing window, and something very close to
+  `move_view_to_new_window` for a drop on empty desktop. Both already handle
+  the source window emptying and closing behind them, and both already keep the
+  order the reparent depends on.
+- `move_view_to_new_window` builds the destination with `show=False`, sizes and
+  positions it, shows it, and only then moves the view. That is exactly the
+  "create the real window immediately on crossing the tear threshold" decision
+  below, so the gesture should call the same method rather than reimplement the
+  sequence with a position of its own. Give it a `geometry` argument rather
+  than a second code path.
+- **The tab index has to be captured before the adopt, not after.**
+  `DocumentArea.detach` takes an optional index for this reason: `insertWidget`
+  on the destination reparents the view, and Qt removes a reparented widget
+  from the old layout on its own, so by the time the source tidies up its stack
+  no longer knows where the tab was. This is the one place the bar/stack
+  invariant is briefly false, and it is re-asserted at the end of `detach`.
+- **Do not disconnect a moving view's signals with a bare
+  `signal.disconnect()`.** The destination is connected before the source lets
+  go, so a blanket disconnect cuts the destination's wiring too. Every
+  per-view connection in `DocumentArea` is a bound method for exactly this
+  reason (see `_view_wiring`), and `MainWindow._disconnect_view` is guarded on
+  which view is actually wired rather than merely tolerating a failure, because
+  Qt answers an unmatched disconnect with a `RuntimeWarning` on stderr, not an
+  exception.
+- A view arriving in a window whose only tab is empty replaces that tab. The
+  gesture gets that for free from `MainWindow.adopt`.
+- Dropping the LAST tab out of a window is a no-op worth refusing in the
+  gesture as well: the menu item is disabled at one tab, and the tear-off
+  should have a threshold that never fires there rather than closing and
+  recreating the window the user is dragging from.
 
 ### Phase 5: pages between tabs
 
@@ -513,7 +589,7 @@ It survives the save, so the file we write has a broken bookmark in it. Same
 applies to `delete_pages` (`:405`). The fix is to drop TOC entries whose
 target went to `-1` after any deletion.
 
-### 6. The SECOND switch into the Organizer throws, and loses the clone
+### 6. The SECOND switch into the Organizer throws, and loses the clone — FIXED in phase 3
 
 Found during phase 1, and measured on `main` at `ab0506a` before the split, so
 it is not something the split introduced. `_refresh_organizer` closes the old
@@ -537,12 +613,81 @@ because there is no previous clone to close, which is why nothing has noticed.
 It only bites when the Organizer has a render queued at that moment, so it is
 intermittent by hand and reliable from a test that switches out and back.
 
-Two candidate fixes, neither taken in phase 1 (move-don't-change): clear the
-Organizer's render source before closing the clone
-(`set_document(self._doc, None)` first), or build the new clone before closing
-the old one and swap. **This matters for phase 3**, where backgrounded tabs
-release their render clones and rebuild them on activation: that is exactly
-this sequence, run far more often.
+Two candidate fixes were written up here, and phase 3 took the second one plus
+a narrowed version of the first, because they answer different halves:
+
+- **`_refresh_organizer` builds, hands over, THEN closes.** The old clone stays
+  open, and stays the grid's source, until the new one has been handed to it.
+  The `processEvents()` is still there and no longer matters, because the
+  Organizer is pointing at a live document at every instant.
+- **`release_render_source(clone)` on both the Organizer and the page panel.**
+  For the other caller, `_close_org_render` / `_close_panel_render`, which
+  genuinely are closing a clone and not replacing it (backgrounding, and
+  clearing the document). It drops the pointer WITHOUT a refresh, and only when
+  the grid is still on that clone: `set_document(doc, None)` would rebuild every
+  thumbnail off the live document, which is the opposite of what backgrounding
+  is for. Anything already drawn stays drawn and later cells fall back to the
+  live document, which is still open.
+
+**And the line it actually raised from is worth keeping**, because it reads as
+a null check and is not:
+
+```python
+if not src or not src.doc:      # ui/organizer.py, ui/page_panel.py
+```
+
+PyMuPDF's `Document` defines `__len__`, so truth-testing a CLOSED document
+raises `ValueError: document closed` rather than answering False.
+`core.pdf_document.source_is_readable` is the question that can be asked
+safely, and every lazy renderer asks it now. It takes any render source rather
+than a `PDFDocument`, because both widgets are handed stand-ins in tests whose
+`.doc` is not a fitz document at all.
+
+**One correction to the description above, found while fixing it.** The
+exception does not unwind out of `_refresh_organizer` on the current code: it
+is raised inside a queued Qt callback, and PySide prints it to stderr and
+carries on, so `_org_render` IS reassigned and the only symptom is a stack
+trace nobody reads plus thumbnails that quietly stop updating. That is worse,
+not better, and it is why `tests/test_organizer_clone_lifecycle.py` asserts on
+the state every render saw when it started rather than waiting for an exception
+to arrive somewhere it can be caught. Those tests fail against the pre-fix
+ordering (verified by reverting it).
+
+### 7. A save that cannot overwrite silently writes a `.bak` — FIXED in phase 3
+
+Found in phase 3, because multi-window is what makes it ordinary. `save()`
+writes an in-place save to a temp file beside the target and swaps it over with
+`os.replace`. When that swap fails (the file is open in Acrobat, read-only,
+held by a sync client, or open in a second Rapid PDF window), the new content is
+salvaged as `<name>.pdf.bak` so no work is lost. That part is right.
+
+The salvage was **silent**. `save()` returned False, the window said "Could not
+save the PDF", and `self.path` was left naming the original. Four things then
+disagreed: the live document was the `.bak`, the title bar and the tab named the
+original, the original on disk still held the old content, and the next Save
+would write to whichever of them the path said. The user had every reason to
+believe their edits were in the file they opened.
+
+**What was chosen, and why.** Both ends are closed rather than one:
+
+- **The `.bak` is adopted as the document's path.** The live document IS that
+  file, so letting `path` name the original is exactly what makes the app
+  describe a file it is not holding. Everything downstream follows the path, so
+  the title bar and the tab now read `drawing.pdf.bak` and the next Save writes
+  there. The label being ugly is the point: it is visible.
+- **`PDFDocument.last_save_error` carries the reason** and the window shows it
+  verbatim instead of "Could not save the PDF". It names both files and says
+  what to do (close whatever is holding the original, then Save As over it).
+
+The alternative considered and rejected was to keep `path` on the original and
+just warn. That leaves the divergence in place and relies on the user reading
+one dialog; the next Save would then attempt the same doomed swap on a document
+whose content had already moved.
+
+The dirty flag is untouched, because `save()` still returns False, so the
+document is still unsaved as far as every close path is concerned and Save As
+is the escape hatch. `tests/test_save_failure.py` pins the wording, the adopted
+path, and that the original on disk is left byte-for-byte as it was.
 
 ## Memory and cost
 
@@ -602,7 +747,7 @@ still worth doing and it is still where the second-switch bug lives (known bug
 6), but on these numbers it is the smaller half of the job, not the headline.
 
 **Background tabs must release their render clones, and that is phase 3 work,
-not later.** The rules:
+not later.** The rules, all now implemented in `DocumentView.set_active`:
 
 - A backgrounded `DocumentView` closes `_org_render` and `_panel_render` and
   rebuilds them on activation. The closers already exist (`:873`, `:901`) and
@@ -611,6 +756,33 @@ not later.** The rules:
   `invalidate_render_cache` (`core/pdf_document.py:88`).
 - The live `fitz` document and the canvas scene stay. Those are what make a
   tab switch instant and what finding 2 proved survive a move.
+
+### Measured after phase 3 shipped it
+
+`tools/measure_tab_memory.py`, six A1 tabs, every page turned to in each so
+every cache is full, Windows working set, two subprocesses so the two
+configurations cannot contaminate each other:
+
+| | Growth over baseline |
+| --- | --- |
+| holding everything, as before phase 3 | **+1249 MB** |
+| releasing on background | **+387 MB** |
+| saved | **863 MB, about 173 MB a backgrounded tab** |
+
+**173 and not 207, and the difference is the useful part.** The canvas scene
+holds the page currently on screen as its background item, and `QPixmap` is
+implicitly shared, so the cache entry for that page and the scene item are the
+same memory. Dropping the cache frees the five entries nobody else is holding
+and leaves the sixth alone.
+
+**The corollary caught the first attempt at this measurement, so write it
+down.** A tab where only ONE page has ever been rendered saves NOTHING: its one
+cache entry is the page the scene is holding. Ten tabs each opened and left on
+page 1 measured +355 MB with the release and +355 MB without it. The saving is
+real for the case it is about, which is someone paging through a set of
+drawings, and it is zero for someone who opens ten files and looks at the first
+page of each. Both are worth knowing; the second is why "recovers 200 MB a tab"
+was too strong as written.
 
 ## What comes along with a page when it moves between documents
 

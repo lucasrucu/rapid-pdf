@@ -647,15 +647,31 @@ def test_duplicate_tab_opens_a_second_independent_document(win, area, three_page
     assert area.bar().tabText(1) == "three (2)"
 
 
-def test_the_tab_menu_leaves_move_to_new_window_out(win, area, three_pages):
-    """Phase 3. There is no second window to move to until the registry that
-    owns them exists."""
+def test_the_tab_menu_offers_move_to_new_window(win, area, three_pages):
+    """Phase 3 put it in. It was left out of phase 2 because there was no
+    registry owning second windows to move a document into yet."""
     win.open_paths([three_pages])
     labels = [a.text() for a in area.build_tab_menu(0).actions() if a.text()]
-    assert "Move to New Window" not in labels
     assert labels == ["Close", "Close Others", "Close to the Right",
-                      "Duplicate Tab", "Copy Full Path",
+                      "Move to New Window", "Duplicate Tab", "Copy Full Path",
                       "Open Containing Folder"]
+
+
+def test_move_to_new_window_is_dead_on_the_only_tab(win, area, three_pages,
+                                                    one_page):
+    """Moving the last document out of a window and closing the window behind
+    it lands you back where you started, minus the window's position and size.
+    Every browser greys it out for the same reason."""
+    win.open_paths([three_pages])
+
+    def move_action(index):
+        return next(a for a in area.build_tab_menu(index).actions()
+                    if a.text() == "Move to New Window")
+
+    assert not move_action(0).isEnabled()
+    win.open_paths([one_page])
+    assert move_action(0).isEnabled()
+    assert move_action(1).isEnabled()
 
 
 # ---------------------------------------------------------------------------

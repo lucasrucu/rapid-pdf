@@ -36,14 +36,34 @@ THREE THINGS IN HERE ARE LOAD-BEARING, AND THE WORST ONE FAILS SILENTLY.
        _org_render    made by _refresh_organizer         closed by _close_org_render
        _panel_render  made by _refresh_panel_thumbnails  closed by _close_panel_render
 
-   Each refresher closes the previous render as its FIRST statement, before it
-   makes another, and `teardown()` closes both. That pairing is the whole
-   defence: `_refresh_organizer` runs on every switch into the Organizer tab,
-   so a missing close leaks a full fitz document per switch.
+   Every clone is closed exactly once, and `teardown()` closes both. That
+   pairing is the whole defence: `_refresh_organizer` runs on every switch into
+   the Organizer tab, so a missing close leaks a full fitz document per switch.
+
+   THE ORDER WITHIN A REBUILD IS ALSO LOAD-BEARING, and that was known bug 6.
+   Build the new clone, hand it over, THEN close the old one; never close first
+   and build after, because both widgets rasterise from a queued zero timer and
+   anything pumped in between is a render against a closed document. When a
+   clone is being released rather than replaced, the widget's pointer at it is
+   dropped first (`release_render_source`).
 
 3. Undo stack ownership. `PDFCanvas.set_document` clears the undo stack, so one
    canvas can only ever serve one document. This widget owns its canvas
    outright and never shares it.
+
+PHASE 3 ADDED BACKGROUNDING, and it is where the memory goes. `set_active` is
+called by the tab bar on every switch, and a view that is no longer in front
+drops its render cache and both markup clones. Phase 2's numbers say which half
+matters: one document's six-entry pixmap cache is 207 MB, and ten live
+documents plus twenty markup clones came to 2 MB between them. So
+`invalidate_render_cache` is the saving and the clones are tidiness. The live
+fitz document and the canvas scene stay, because those are what make a switch
+back instant and what phase 1's finding 2 proved survive a move between
+windows.
+
+Releasing a clone on every tab switch is also what made known bug 6 fire
+reliably rather than intermittently, which is why it was fixed in the same
+phase. See `_refresh_organizer`.
 """
 
 import os
@@ -125,6 +145,10 @@ class DocumentView(QWidget):
         self._panel_render = None  # throwaway clone backing the left page panel's thumbnails
         self._dirty = False      # unsaved changes exist (annotations, page edits, merges)
         self._dirty_announced = False  # last value dirty_changed went out with
+        # Front tab or background tab. True to start: a view is built to be
+        # shown, and the only thing this flag gates is the RELEASE, so nothing
+        # is gained by making a brand new view rebuild what it has not built.
+        self._active = True
         self._ocr_thread = None  # active OCR QThread, or None when idle
         self._ocr_worker = None  # keep a ref alive alongside the thread
         # Rows the page panel should end up with highlighted after the next
@@ -322,6 +346,62 @@ class DocumentView(QWidget):
         replaces.
         """
         self._dirty = False
+
+    def is_active(self) -> bool:
+        """Whether this is the front tab of its window."""
+        return self._active
+
+    def set_active(self, active: bool):
+        """Front tab, or backgrounded. Driven by DocumentArea on every switch.
+
+        This is the memory rule from phase 3 of docs/tabs-plan.md, and phase 2's
+        measurements decided its order of importance. Backgrounding drops:
+
+          - THE PIXMAP CACHE, which is where the cost is. One document's six
+            entries at A1 and zoom 1.5 measured 207 MB, and ten open documents
+            measured 2.02 GB of caches against 2 MB of everything else. It is
+            one call and it cannot fail. Measured saving, six A1 tabs with
+            every cache full: 1249 MB down to 387 MB, about 173 MB a tab. It is
+            173 and not 207 because the canvas scene holds the page currently
+            on screen as its background item and QPixmap is implicitly shared,
+            so that one entry is not freed by dropping the cache. The corollary
+            is that a tab where only one page was ever rendered saves nothing.
+          - THE TWO MARKUP CLONES, worth about a megabyte, released because
+            leaving them is a slow leak rather than because it is a saving.
+
+        What deliberately stays: the live fitz document and the canvas scene.
+        Those are what make a tab switch instant, and what finding 2 in the
+        plan proved survive a move between windows.
+        """
+        if active == self._active:
+            return
+        self._active = active
+        if active:
+            self._on_activated()
+        else:
+            self._on_backgrounded()
+
+    def _on_backgrounded(self):
+        """Give back what a document nobody is looking at does not need."""
+        if not self._doc.doc:
+            return
+        self._doc.invalidate_render_cache()
+        self._close_org_render()
+        self._close_panel_render()
+
+    def _on_activated(self):
+        """Rebuild what backgrounding released. Idempotent, and cheap.
+
+        Only the panel is rebuilt unconditionally: it is on screen the moment
+        the tab is. The Organizer is rebuilt only when it is the tab being
+        shown, because `_on_tab_changed` already rebuilds it on the way in and
+        doing it here as well would clone the document twice for one switch.
+        """
+        if not self._doc.doc:
+            return
+        self._refresh_panel_thumbnails(current_page=self._current_page)
+        if self._tabs.currentIndex() == 1:
+            self._refresh_organizer()
 
     def teardown(self):
         """Release everything this view owns, on the way out for good."""
@@ -530,7 +610,7 @@ class DocumentView(QWidget):
         if self._doc.save():
             self._after_successful_save("Saved")
             return True
-        QMessageBox.critical(self.window(), "Save Error", "Could not save the PDF.")
+        self._report_failed_save()
         return False
 
     def save_pdf_as(self) -> bool:
@@ -546,8 +626,25 @@ class DocumentView(QWidget):
         if self._doc.save(path):  # save() adopts `path` as the new canonical path
             self._after_successful_save(f"Saved to {path}")
             return True
-        QMessageBox.critical(self.window(), "Save Error", "Could not save the PDF.")
+        self._report_failed_save()
         return False
+
+    def _report_failed_save(self):
+        """Say what went wrong, in the words PDFDocument put together.
+
+        It used to say "Could not save the PDF" whatever had happened, which
+        was actively misleading for the one failure that does not lose the
+        work: an in-place save whose swap over the original fails writes the
+        new content to a `.bak` beside it and adopts that file. The user has to
+        be told, because the document in front of them is now a different file
+        from the one they opened. The title and the tab label both follow the
+        path, so both are re-read here.
+        """
+        QMessageBox.critical(
+            self.window(), "Save Error",
+            self._doc.last_save_error or "Could not save the PDF.")
+        self.title_changed.emit()
+        self._update_status()
 
     def enhance_for_search(self):
         """Run OCR once, on demand, over every page that doesn't already have
@@ -865,23 +962,60 @@ class DocumentView(QWidget):
 
     def _refresh_organizer(self):
         """Load the Organizer with current pages, baking unsaved markup into the
-        thumbnails via a throwaway clone (so the live document isn't mutated)."""
-        self._close_org_render()
+        thumbnails via a throwaway clone (so the live document isn't mutated).
+
+        KNOWN BUG 6 IS FIXED HERE, and the fix is the ORDER. This method used
+        to close the previous clone as its first statement and only build the
+        replacement several lines later, with a `processEvents()` in between.
+        `PageOrganizer.refresh` queues `_render_visible` on a zero timer, so
+        that pump ran a render against a fitz document that had just been
+        closed and PyMuPDF raised "document closed" from inside a queued Qt
+        callback, where PySide prints it to stderr and carries on. The first
+        switch into the Organizer was clean because there was no previous clone
+        to close, which is why nothing noticed for so long; the second broke
+        every time there was still a render queued.
+
+        Build, hand over, THEN close. The Organizer is pointing at a live
+        document at every instant, so it no longer matters what runs during the
+        pump.
+        """
         if not self._doc.doc:
             self._organizer.set_document(self._doc, None)
+            self._close_org_render()
             return
         self.status_message.emit("Loading organizer…")
+        # Safe here: the Organizer is still rendering from the PREVIOUS clone,
+        # which is still open, and stays open until the swap below is done.
         QApplication.processEvents()
-        self._org_render = self._make_markup_baked_render()
+        previous, self._org_render = self._org_render, None
+        try:
+            self._org_render = self._make_markup_baked_render()
+        except Exception:
+            # Nothing was handed over, so put the grid's source back rather
+            # than leaving it pointing at a clone about to be closed.
+            self._org_render = previous
+            raise
         self._organizer.set_document(self._doc, self._org_render)
+        self._close_render(previous)
         self._update_status()
 
-    def _close_org_render(self):
-        if self._org_render is not None and self._org_render.doc is not None:
+    @staticmethod
+    def _close_render(render):
+        """Close one throwaway clone. The caller has already made sure nothing
+        is still rendering from it."""
+        if render is not None and render.doc is not None:
             try:
-                self._org_render.doc.close()
+                render.doc.close()
             except Exception:
                 pass
+
+    def _close_org_render(self):
+        # The pointer goes before the document does. The Organizer renders on a
+        # queued zero timer, so closing the clone while the grid still names it
+        # is exactly known bug 6; releasing (rather than replacing) the source
+        # leaves the grid on the live document, which is still open.
+        self._organizer.release_render_source(self._org_render)
+        self._close_render(self._org_render)
         self._org_render = None
 
     def _refresh_panel_thumbnails(self, current_page: int | None = None,
@@ -905,11 +1039,14 @@ class DocumentView(QWidget):
                                            select=select)
 
     def _close_panel_render(self):
-        if self._panel_render is not None and self._panel_render.doc is not None:
-            try:
-                self._panel_render.doc.close()
-            except Exception:
-                pass
+        # Same ordering as _close_org_render, and for the same reason: the
+        # panel renders its thumbnails on a queued zero timer too, so it has to
+        # stop naming the clone before the clone is closed. It never bit here
+        # because the only caller was the rebuild directly above, which closes
+        # and re-hands-over with nothing pumped in between. Backgrounding calls
+        # it on its own, which is where it would have.
+        self._page_panel.release_render_source(self._panel_render)
+        self._close_render(self._panel_render)
         self._panel_render = None
 
     def _on_organizer_page_activated(self, page_num: int):

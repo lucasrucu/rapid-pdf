@@ -38,14 +38,40 @@ WHAT IS REBOUND ON A TAB SWITCH, which is where the bugs in this phase live.
   - the fit group, which follows the arriving CANVAS rather than the remembered
     setting, because a manual zoom breaks the fit on one canvas only
     (`_sync_fit_group`).
+
+PHASE 3: THERE ARE SEVERAL OF THESE NOW. A window joins the WindowRegistry on
+the way up and leaves it in `closeEvent`, and that registry owns three things
+this class used to assume it was alone in deciding:
+
+  - APP LIFETIME. `main.py` turns Qt's own quit-on-last-window off and the
+    registry quits when its count reaches zero, so a torn-off window closing
+    while its parent lives, and the parent closing while the child lives, are
+    the same code path.
+  - WHERE A FILE LANDS. `handle_cli_files` is still the "this window" verb, but
+    the shell now goes through `WindowRegistry.route_open`, which can raise a
+    tab in a different window entirely.
+  - MOVING A DOCUMENT BETWEEN WINDOWS. `adopt` and `move_view_to_window` are
+    the mechanism; the tab menu's "Move to New Window" and File > New Window
+    are the only two things driving it. No gesture: phase 4.
+
+PER-WINDOW CHROME, WHICH IS THE THING THAT DOES NOT COME FREE. The QSS and the
+QPalette are set on the QApplication, so those cover every window at once. Two
+things do not, because they are properties of one native window: the Mica
+backdrop (`apply_mica` works on the HWND, and a new top-level gets a fresh one,
+so it has to be reapplied per window and AFTER show()), and the code-drawn
+surfaces, which is why each window connects `theme_changed` for itself. The
+update strip is the third case and it went the other way: it is one check per
+APPLICATION, so only the first window runs it. See `_should_check_for_updates`.
 """
+
+import os
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QMessageBox, QStatusBar, QApplication,
     QToolButton, QButtonGroup,
 )
-from PySide6.QtCore import QTimer, Qt, QSize, Signal
+from PySide6.QtCore import QEvent, QPoint, QTimer, Qt, QSize, Signal
 from PySide6.QtGui import QAction, QGuiApplication, QKeySequence, QShortcut, QIcon
 
 # How long after the window is up before the update check goes out. Nothing
@@ -53,6 +79,11 @@ from PySide6.QtGui import QAction, QGuiApplication, QKeySequence, QShortcut, QIc
 # and the first PDF load should have the machine to themselves; an update is
 # never urgent enough to compete with them.
 UPDATE_CHECK_DELAY_MS = 1500
+
+# How far a new window is offset from the one that spawned it. Enough that the
+# title bar and the tab bar of the window underneath stay clickable, which is
+# what makes it read as a second window rather than a redraw of the first.
+NEW_WINDOW_OFFSET = 32
 
 # The status bar's view-mode group: (mode, qtawesome id, tooltip, text fallback).
 # The mode names match ui.canvas.FIT_MODES and core.settings' default_fit_mode.
@@ -73,6 +104,7 @@ from ui.document_view import DocumentView
 from ui.preferences_dialog import PreferencesDialog
 from ui.page_jump import PageJump
 from ui.theme import ThemeManager, apply_mica, themed_icon, qtawesome_available, LIGHT
+from ui.window_registry import WindowRegistry
 
 
 class MainWindow(QMainWindow):
@@ -84,6 +116,7 @@ class MainWindow(QMainWindow):
     def __init__(self, theme: ThemeManager | None = None):
         super().__init__()
         self._prefs_dialog = None  # the one Preferences window, while it is open
+        self._connected_view = None  # the view currently driving this chrome
         # Theme: use the passed-in manager, or stand one up (e.g. tests/smoke).
         self._theme = theme or ThemeManager(QApplication.instance())
         # Every open document in this window, one tab each. Empty for now: the
@@ -95,8 +128,15 @@ class MainWindow(QMainWindow):
         self._area.new_tab_requested.connect(self.new_tab)
         self._area.duplicate_requested.connect(self._duplicate_tab)
         self._area.tab_close_requested.connect(self.close_tab)
+        self._area.move_to_new_window_requested.connect(self.move_view_to_new_window)
         self._force_quit = False # Quit menu wants a real app quit, not "close PDF"
         self._session_ending = False  # Windows is ending the session; never block it
+        self._mica_applied = False  # the backdrop needs an HWND, so it waits for show()
+        # Joined BEFORE anything that asks the registry a question. In
+        # particular _should_check_for_updates counts the windows already in it,
+        # so a window that has not joined would think it was the first.
+        self._registry = WindowRegistry.instance()
+        self.setAcceptDrops(True)   # PDFs dragged from Explorer: see dropEvent
         self.setMinimumSize(1100, 720)
         icon_path = app_icon_path()
         if icon_path:
@@ -110,13 +150,30 @@ class MainWindow(QMainWindow):
         # Code-drawn surfaces (the canvas page backdrop) follow the theme too.
         self._apply_theme_surfaces(self._theme.palette)
         self._theme.theme_changed.connect(self._apply_theme_surfaces)
-        # Optional Win11 Mica backdrop (silent no-op elsewhere).
+        # Optional Win11 Mica backdrop (silent no-op elsewhere). Repeated in
+        # showEvent, which is the call that actually takes on Windows: this one
+        # runs before the window has an HWND to apply anything to.
         apply_mica(self, self._theme.is_dark)
         self._connect_session_manager()
-        # Ask GitHub whether there is a newer release. Off the GUI thread, and
-        # after the window is up: see UPDATE_CHECK_DELAY_MS and
-        # ui/update_notice.py. Offline this does nothing at all, silently.
-        QTimer.singleShot(UPDATE_CHECK_DELAY_MS, self._update_notice.start_check)
+        # This window joins the app. Last, so a registry listener that reaches
+        # back into it finds it finished.
+        self._registry.register(self)
+        if self._should_check_for_updates():
+            # Ask GitHub whether there is a newer release. Off the GUI thread,
+            # and after the window is up: see UPDATE_CHECK_DELAY_MS and
+            # ui/update_notice.py. Offline this does nothing at all, silently.
+            QTimer.singleShot(UPDATE_CHECK_DELAY_MS, self._update_notice.start_check)
+
+    def _should_check_for_updates(self) -> bool:
+        """Only the first window checks. One update, one strip, one prompt.
+
+        Every window builds its own UpdateNotice because the strip is drawn in
+        the window, but the CHECK is about the application: three windows would
+        make three GitHub requests, show three "update available" strips for
+        the same release, and race each other to stage the same download. The
+        one that opened first owns it.
+        """
+        return self._registry.count() <= 1
 
     @property
     def view(self) -> DocumentView:
@@ -164,6 +221,232 @@ class MainWindow(QMainWindow):
                 themed_icon("mdi6.weather-sunny" if dark else "mdi6.weather-night",
                             palette.text))
         apply_mica(self, self._theme.is_dark)
+
+    # ------------------------------------------------------------------
+    # Being one window of several
+    # ------------------------------------------------------------------
+
+    def showEvent(self, event):
+        """Apply the Mica backdrop once the window actually exists.
+
+        `apply_mica` reaches through to the HWND, and a top-level widget has no
+        HWND until it is shown. The call in `__init__` is therefore a no-op on
+        the first window and, more to the point, on every window opened after
+        it: a new top-level gets a fresh handle and inherits nothing from the
+        window it was torn off. So it is applied here, on the first show, which
+        is the earliest moment there is anything to apply it to.
+        """
+        super().showEvent(event)
+        if not self._mica_applied:
+            self._mica_applied = True
+            apply_mica(self, self._theme.is_dark)
+
+    def changeEvent(self, event):
+        """Tell the registry when this window comes to the front.
+
+        The only thing that keeps `WindowRegistry.active_window` honest, and
+        therefore the only thing that makes a file opened from Explorer land in
+        the window being read rather than the oldest one.
+        """
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.ActivationChange and self.isActiveWindow():
+            self._registry.note_activated(self)
+
+    def raise_and_focus(self):
+        """Un-minimize, raise and focus. What an Explorer launch or a drop
+        deserves, and the one thing a bare relaunch does on its own."""
+        self.setWindowState((self.windowState() & ~Qt.WindowState.WindowMinimized)
+                            | Qt.WindowState.WindowActive)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self._registry.note_activated(self)
+
+    def activate_view(self, view) -> bool:
+        """Bring one of this window's tabs to the front, and the window with it.
+
+        The routing rule "a file already open activates that tab" ends here,
+        which is why raising the window is part of it: the tab being current in
+        a window behind three others is not what anybody meant by activating it.
+        """
+        index = self._area.index_of(view)
+        if index < 0:
+            return False
+        self._area.set_current_index(index)
+        self.raise_and_focus()
+        return True
+
+    # ------------------------------------------------------------------
+    # Moving a document between windows
+    # ------------------------------------------------------------------
+
+    def adopt(self, view, at: int = -1) -> int:
+        """Take a live DocumentView from another window into this one.
+
+        Rewires the two signals `_new_view` binds for the life of a view, since
+        both of them are decisions about TABS and the tabs are now this
+        window's. The chrome signals are not touched here: those follow
+        whichever view is in front, and `DocumentArea.adopt` makes this one
+        current, which fires `_on_front_view_changed` and binds them.
+
+        The view is reparented by `insertWidget` alone. Never `setParent(None)`
+        anywhere on this path: see DocumentArea.adopt.
+        """
+        view.paths_requested.connect(self.open_paths)
+        view.combine_requested.connect(self.combine_paths)
+        view.set_page_panel_visible(self._panel_action.isChecked())
+        view.apply_palette(self._theme.palette)
+        # A brand new window comes up holding one empty tab, and a document
+        # arriving in it should REPLACE that placeholder rather than sit beside
+        # it: a window with one document and one blank tab next to it is not
+        # what "move this to a new window" means. Same rule `_target_view`
+        # applies when a file is opened into an empty front tab, and it is
+        # deliberately narrow: only a window whose ONLY tab is empty has a
+        # placeholder to give up.
+        placeholder = None
+        if self._area.count() == 1 and not self._area.view_at(0).has_document():
+            placeholder = self._area.view_at(0)
+        index = self._area.adopt(view, at)
+        if placeholder is not None:
+            spare = self._area.index_of(placeholder)
+            if spare >= 0:
+                self._area.remove_view(spare)
+                index = self._area.index_of(view)
+        return index
+
+    def release_view(self, view):
+        """Cut this window's wiring to a view that is leaving, alive.
+
+        Not `remove_view`, which destroys what it removes. Everything here is
+        tolerant of a connection that was never made: a background tab has
+        never had the chrome signals bound.
+        """
+        for signal, slot in ((view.paths_requested, self.open_paths),
+                             (view.combine_requested, self.combine_paths)):
+            try:
+                signal.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
+        self._disconnect_view(view)
+
+    def move_view_to_window(self, view, target: "MainWindow") -> bool:
+        """Move one open document from this window into another one.
+
+        THE ORDER IS THE WHOLE THING, and it is the order phase 1's reparenting
+        test was measured with:
+
+        1. the destination window already exists and is shown, so the view has
+           somewhere real to land;
+        2. this window stops listening to the view;
+        3. the destination ADOPTS it, which is the `insertWidget` that
+           reparents it. Qt drops the view from this window's stacked layout on
+           its own as a result, which is why the tab index is read before;
+        4. only now does this window drop the tab that is left over;
+        5. and only then, if nothing is left here, does this window close.
+
+        Do 5 before 3 and the view is destroyed with its parent, which is the
+        failure this sequence exists to avoid. There is no `setParent(None)`
+        anywhere in it: on Windows that promotes the widget to a top-level with
+        a real HWND, and reparenting it back destroys the HWND and the widget's
+        native resources with it.
+        """
+        if view is None or target is None or target is self:
+            return False
+        index = self._area.index_of(view)
+        if index < 0:
+            return False
+        self.release_view(view)
+        target.adopt(view)
+        self._area.detach(view, index)
+        if self._area.count() == 0:
+            self.close()
+        target.raise_and_focus()
+        return True
+
+    def move_view_to_new_window(self, view=None) -> "MainWindow | None":
+        """Tab menu > Move to New Window. The user-facing half of phase 3.
+
+        Offset from this window rather than placed exactly on top of it, so the
+        document that just moved is visibly somewhere else.
+        """
+        if view is None:
+            view = self.view
+        if view is None or self._area.index_of(view) < 0:
+            return None
+        target = self._registry.create_window(theme=self._theme, show=False)
+        target.resize(self.size())
+        target.move(self.pos() + QPoint(NEW_WINDOW_OFFSET, NEW_WINDOW_OFFSET))
+        target.show()               # real, and on screen, BEFORE anything leaves
+        if not self.move_view_to_window(view, target):
+            target.close()
+            return None
+        return target
+
+    def new_window(self) -> "MainWindow":
+        """File > New Window (Ctrl+Shift+N). An empty second window."""
+        window = self._registry.create_window(theme=self._theme, show=False)
+        window.resize(self.size())
+        window.move(self.pos() + QPoint(NEW_WINDOW_OFFSET, NEW_WINDOW_OFFSET))
+        window.show()
+        window.raise_and_focus()
+        return window
+
+    # ------------------------------------------------------------------
+    # Files dropped on the window from the shell
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def dropped_pdfs(mime) -> list:
+        """The PDF paths in a drag, or [] if it is not carrying any.
+
+        `hasUrls()` is what keeps this from colliding with the two internal
+        page drags, and it is a stronger guarantee than it looks: a drag
+        started inside the app carries item-model data and no urls at all, and
+        `text/uri-list` only ever appears on a drag that came from the shell.
+        So the three gestures in the plan's table stay separate without anybody
+        having to check where the drag started.
+        """
+        if mime is None or not mime.hasUrls():
+            return []
+        paths = []
+        for url in mime.urls():
+            if not url.isLocalFile():
+                continue
+            # normpath because QUrl hands back forward slashes even on Windows,
+            # and every path in the app is compared against one that came from
+            # a file dialog or a command line.
+            path = os.path.normpath(url.toLocalFile())
+            if os.path.splitext(path)[1].lower() == ".pdf" and os.path.isfile(path):
+                paths.append(path)
+        return paths
+
+    def dragEnterEvent(self, event):
+        if self.dropped_pdfs(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if self.dropped_pdfs(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        """A PDF dropped from Explorer opens as a NEW TAB in this window.
+
+        Never appended to the document on screen. That is the same rule
+        `open_paths` enforces for every other way a file arrives, and it is the
+        rule this gesture would break most easily: dropping a file onto a page
+        looks like it should go into that page.
+        """
+        paths = self.dropped_pdfs(event.mimeData())
+        if not paths:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self.raise_and_focus()
+        self.open_paths(sorted(paths))
 
     # ------------------------------------------------------------------
     # UI setup
@@ -216,22 +499,29 @@ class MainWindow(QMainWindow):
 
     def _connect_view(self, view: DocumentView):
         """Wire the front document view to the window chrome it drives."""
+        if view is self._connected_view:
+            return
         for signal, slot in self._CHROME_SIGNALS:
             getattr(view, signal).connect(getattr(self, slot))
+        self._connected_view = view
 
     def _disconnect_view(self, view: DocumentView):
         """Unwire a view that is no longer in front.
 
-        Tolerant of a connection that is not there: a view can leave the front
-        without ever having reached it (a tab closed while another was
-        current), and a missing disconnect is not worth an exception on a
-        switch.
+        Guarded on which view is actually wired, rather than just tolerating a
+        failure. A move asks twice (`release_view` on the way out, then the
+        front-view change the detach raises), and Qt answers a disconnect that
+        was never connected with a RuntimeWarning on stderr rather than an
+        exception, so "tolerant" was not the same as quiet.
         """
+        if view is not self._connected_view:
+            return
         for signal, slot in self._CHROME_SIGNALS:
             try:
                 getattr(view, signal).disconnect(getattr(self, slot))
             except (RuntimeError, TypeError):
                 pass
+        self._connected_view = None
 
     def _on_front_view_changed(self, previous, current):
         """A different document came to the front. Rebind everything it drives."""
@@ -347,6 +637,10 @@ class MainWindow(QMainWindow):
 
         fm = mb.addMenu("File")
         self._add_action(fm, "New Tab", self.new_tab, "Ctrl+T")
+        # Ctrl+Shift+N, which is what every browser and every editor on this
+        # machine uses for it. The tab menu's "Move to New Window" is the other
+        # way to get a second window, and it is the one that carries a document.
+        self._add_action(fm, "New Window", self.new_window, "Ctrl+Shift+N")
         # Was "Open / Combine PDFs…". Opening several files is N tabs now, not
         # a merge, so the one verb no longer covers both and Combine has to be
         # asked for by name.
@@ -697,7 +991,7 @@ class MainWindow(QMainWindow):
         self.view.send_to_back()
 
     def handle_cli_files(self, files: list, combine: bool):
-        """One aggregated shell/CLI launch batch (see core.single_instance).
+        """One aggregated shell/CLI launch batch, landing in THIS window.
 
         Decided by VERB, not by how many files arrived. `--combine` is the
         Explorer verb that means merge, and it opens the staged Combine dialog
@@ -705,13 +999,15 @@ class MainWindow(QMainWindow):
         tabs, because that is what opening N files means now; it used to close
         whatever was open and stage a Combine as soon as the count passed one,
         which made "open these three drawings" destroy the document on screen.
+
+        `main.py` no longer wires `batch_ready` here. It goes to
+        `WindowRegistry.route_open`, which decides WHICH window first (a file
+        already open anywhere wins, then the last window touched) and then does
+        this. This stayed as the single-window verb underneath it, and as what
+        every existing test drives.
         """
         # Un-minimize and raise: the user just acted in Explorer.
-        self.setWindowState((self.windowState() & ~Qt.WindowState.WindowMinimized)
-                            | Qt.WindowState.WindowActive)
-        self.show()
-        self.raise_()
-        self.activateWindow()
+        self.raise_and_focus()
         if not files:
             return
         if combine:
@@ -835,9 +1131,22 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"Rapid PDF — {name}[*]")
 
     def _quit_app(self):
-        """Quit menu / Ctrl+Q → actually quit, even with a PDF open."""
-        self._force_quit = True
-        self.close()
+        """Quit menu / Ctrl+Q. Quits the APPLICATION, not this window.
+
+        Every window is asked, and the first one to refuse (a cancelled save
+        prompt) stops the whole thing and leaves what is still open exactly as
+        it was, including the `_force_quit` flags, which are put back. Closing
+        the last one is what actually ends the process; the registry does that,
+        not this method, which is why there is no `app.quit()` here.
+        """
+        for window in self._registry.windows():
+            window._force_quit = True
+            if not window.close():
+                # Cancelled. The flag goes back on the one that refused; every
+                # window after it was never told, and every one before it has
+                # already gone.
+                window._force_quit = False
+                return
 
     # ------------------------------------------------------------------
     # Closing
@@ -934,6 +1243,7 @@ class MainWindow(QMainWindow):
         # protocol, which is the accepted trade for not blocking the machine.
         if self._session_is_ending():
             self._teardown_for_quit()
+            self._registry.unregister(self)
             super().closeEvent(event)
             event.accept()
             return
@@ -973,4 +1283,8 @@ class MainWindow(QMainWindow):
             return
 
         self._teardown_for_quit()
+        # Leaving the registry is what ends the application when this was the
+        # last window. Nothing here decides that: `main.py` turns Qt's own
+        # quit-on-last-window off precisely so one place does.
+        self._registry.unregister(self)
         super().closeEvent(event)

@@ -34,10 +34,43 @@ MODEL_EMBED_NAME = "rapid_pdf_model.json"
 RENDER_CACHE_MAX = 6
 
 
+def source_is_readable(source) -> bool:
+    """Whether pages can still be pulled out of this render source.
+
+    THE QUESTION `if source.doc:` DOES NOT ANSWER, and getting that wrong is
+    known bug 6 in docs/tabs-plan.md. PyMuPDF's `Document` defines `__len__`,
+    so truth-testing a CLOSED document raises "document closed" rather than
+    returning False. Every lazy thumbnail render in the app is scheduled on a
+    zero timer and run later, which is exactly the window in which the clone it
+    was scheduled against can have been closed, so each of them has to ask this
+    instead of trusting a truth test.
+
+    Takes any render source, not just a PDFDocument: the page panel and the
+    Organizer are both handed stand-ins whose `.doc` is not a fitz document at
+    all, and one of those has no opinion about being closed, so it is taken at
+    its word.
+    """
+    if source is None:
+        return False
+    doc = getattr(source, "doc", None)
+    if doc is None:
+        return False
+    try:
+        return not doc.is_closed
+    except AttributeError:
+        return True          # not a fitz document; it cannot have been closed
+    except Exception:
+        return False         # anything a closed document raises means no
+
+
 class PDFDocument:
     def __init__(self):
         self.doc: fitz.Document | None = None
         self.path: str | None = None
+        # Why the last save() returned False, in words fit to show a user, or
+        # None. Set on every failure and cleared at the top of every save, so
+        # the caller reads it immediately after a False and never later.
+        self.last_save_error: str | None = None
         # LRU cache of rendered page pixmaps keyed by (page_num, zoom_key).
         # A cache hit makes a repeated render_page of the same page+zoom free
         # (the lift re-render, reload-after-strip, organizer/page round-trips).
@@ -118,6 +151,13 @@ class PDFDocument:
         self.path = None
         self.invalidate_render_cache()
 
+    def is_open(self) -> bool:
+        """Whether there is a document here that can still be read.
+
+        NOT the same question as `if pdf.doc:`. See `source_is_readable`.
+        """
+        return source_is_readable(self)
+
     def page_count(self) -> int:
         return len(self.doc) if self.doc else 0
 
@@ -155,7 +195,29 @@ class PDFDocument:
         return self._render_page_at_zoom(page, zoom)
 
     def save(self, path: str | None = None) -> bool:
+        """Write the document. False means nothing was written where it was asked.
+
+        A False ALWAYS leaves `last_save_error` set to something worth showing
+        the user, and the in-place path has one failure mode that needs saying
+        out loud. If the finished file cannot be swapped over the original (it
+        is open in Acrobat, it is read-only, a sync client has it locked, or
+        another Rapid PDF window is holding it), the new content is salvaged
+        next to it as `<name>.pdf.bak` so no work is lost.
+
+        THAT SALVAGE USED TO BE SILENT. `save()` returned False, the window
+        said "Could not save the PDF", and `self.path` was left naming the
+        original. Four things then disagreed: the live document was the .bak,
+        the title bar and the tab named the original, the original on disk
+        still held the old content, and the next Save wrote to whichever of
+        them the path said. Two windows can now hold the same file, which makes
+        a losing swap ordinary rather than exotic, so it is closed from both
+        ends: the .bak is ADOPTED as the document's path, so everything
+        downstream names the file that actually holds the work, and the reason
+        goes in `last_save_error` for the caller to show.
+        """
+        self.last_save_error = None
         if not self.doc or not (self.path or path):
+            self.last_save_error = "There is no document to save."
             return False
         target = path or self.path
         # An untitled (merged) doc has no current path → it's never an in-place save.
@@ -193,6 +255,20 @@ class PDFDocument:
                     try:
                         os.replace(tmp_path, bak)
                         self.doc = fitz.open(bak)
+                        # Adopt it. The live document IS this file now, so
+                        # letting `path` keep naming the original is what makes
+                        # the two diverge without anybody being told.
+                        self.path = bak
+                        raise RuntimeError(
+                            f"Could not overwrite:\n{target}\n\n"
+                            f"Your work was saved to:\n{bak}\n\n"
+                            "That file is now the open document. The original "
+                            "is unchanged. Close whatever is holding it (another "
+                            "window, Acrobat, a sync client) and use Save As to "
+                            "put this back over it."
+                        ) from move_err
+                    except RuntimeError:
+                        raise
                     except Exception as bak_err:
                         print(f"Save recovery error: {bak_err}")
                         # Last resort: try reopening the original (unchanged on disk).
@@ -200,10 +276,12 @@ class PDFDocument:
                             self.doc = fitz.open(target)
                         except Exception:
                             pass
-                    raise RuntimeError(
-                        f"Could not overwrite the original file.\n"
-                        f"Your work was saved to: {bak}"
-                    ) from move_err
+                        raise RuntimeError(
+                            f"Could not overwrite:\n{target}\n\n"
+                            "The edits could not be written anywhere and are "
+                            "still only in this window. Use Save As to put them "
+                            "somewhere writable before closing it."
+                        ) from move_err
                 # Reopen the freshly written file as the live document.
                 self.doc = fitz.open(target)
             else:
@@ -213,6 +291,11 @@ class PDFDocument:
             return True
         except Exception as e:
             print(f"Save error: {e}")
+            # The window shows this verbatim, so a RuntimeError raised above
+            # carries its own wording and anything else gets a line built here.
+            self.last_save_error = (
+                str(e) if isinstance(e, RuntimeError)
+                else f"Could not save:\n{target}\n\n{e}")
             # If the temp file was written but never renamed into place (the swap
             # succeeds by renaming it away, and the .bak path renames it too), it's
             # orphaned next to the target — clean it up so failed saves don't litter.

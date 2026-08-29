@@ -15,11 +15,22 @@ directly. The price is that the two can drift, so the invariant
 `bar.count() == stack.count()` is asserted in `check_invariant()` and the tests
 call it after every operation.
 
-WHAT IS DELIBERATELY NOT HERE. "Move to New Window" is phase 3, so the tab
-context menu does not offer it. MRU Ctrl+Tab ordering is phase 3 too: the
-next/previous shortcuts are positional and this class holds no visit history.
-Background tabs keep their render clones; releasing them is phase 3 and the
-clone lifecycle stays inside DocumentView where phase 1 put it.
+PHASE 3 ADDED THE OTHER HALF OF THE MOVE. `adopt` takes a LIVE view out of
+another window's stack and `detach` gives one up, and between them they are
+what "Move to New Window" is made of. The rule that makes it work is that
+neither ever calls `setParent(None)`: `insertWidget` on the destination
+reparents the view straight across, and on Windows a trip through top-level
+would create a real HWND and destroy it again on the way back, taking the
+view's native resources with it.
+
+Background tabs also stop holding what nobody is looking at, which is why
+`_set_current_view` tells the leaving view it is no longer active. The
+releasing itself is DocumentView's, where phase 1 put the clone lifecycle.
+
+WHAT IS STILL DELIBERATELY NOT HERE. MRU Ctrl+Tab ordering: the next/previous
+shortcuts are positional and this class holds no visit history. The tear-off
+gesture is phase 4, and it will drive `detach`/`adopt` rather than replace
+them.
 """
 
 from __future__ import annotations
@@ -328,6 +339,10 @@ class DocumentArea(QWidget):
     #: context menu. The window decides what closing means; see close_tab.
     tab_close_requested = Signal(int)
 
+    #: (view,) - the context menu's Move to New Window. The window owns the
+    #: move because it needs the registry to make the destination.
+    move_to_new_window_requested = Signal(object)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._current_view = None
@@ -428,6 +443,44 @@ class DocumentArea(QWidget):
     # Adding and removing
     # ------------------------------------------------------------------
 
+    #: The per-view wiring this area owns, for the whole life of the view
+    #: rather than only while it is in front: the tab label and its unsaved dot
+    #: have to keep up with a document nobody is looking at.
+    #:
+    #: Every one of them is a BOUND METHOD, not a lambda, and that is
+    #: load-bearing for phase 3. A view being moved is connected to its
+    #: destination area BEFORE it is disconnected from its source, so the
+    #: source has to be able to drop exactly its own connections and leave the
+    #: destination's alone. `signal.disconnect(bound_method)` does that;
+    #: `signal.disconnect()` with no argument would cut both.
+    def _view_wiring(self, view) -> tuple:
+        return (
+            (view.title_changed, self._refresh_titles),
+            (view.dirty_changed, self._refresh_dirty),
+            (view.close_requested, self._on_view_closed),
+        )
+
+    def _connect_view(self, view):
+        for signal, slot in self._view_wiring(view):
+            signal.connect(slot)
+
+    def _disconnect_view(self, view):
+        for signal, slot in self._view_wiring(view):
+            try:
+                signal.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
+
+    def _on_view_closed(self):
+        """A view announced that it has been asked to go.
+
+        `sender()` rather than a captured view, so the slot is one object this
+        area can disconnect by reference. See `_view_wiring`.
+        """
+        view = self.sender()
+        if view is not None:
+            self.view_close_requested.emit(view)
+
     def add_view(self, view, activate: bool = True) -> int:
         """Take ownership of a DocumentView and give it a tab.
 
@@ -435,15 +488,33 @@ class DocumentArea(QWidget):
         immediately, and the handler for that reaches into the stack for the
         widget it is switching to.
         """
-        index = self._stack.count()
+        return self._insert_view(view, self._stack.count(), activate)
+
+    def adopt(self, view, at: int = -1) -> int:
+        """Take a LIVE view out of another window and give it a tab here.
+
+        The move that "Move to New Window" is made of, and the one phase 4's
+        tear-off will drive. Two things about it are not negotiable:
+
+        NEVER `setParent(None)`. `insertWidget` reparents the view straight
+        from the source stack into this one. On Windows, promoting a widget to
+        a top-level creates a real HWND and reparenting it back destroys that
+        HWND along with the widget's native resources; phase 1's measurement
+        (the scene, the undo stack and the viewport all surviving, with
+        `internalWinId()` never leaving 0) was made with exactly this order and
+        does not hold without it.
+
+        DESTINATION FIRST. This runs while the view is still in the source's
+        tab bar, and the source only tidies up afterwards (see `detach`). The
+        other order closes the source window while it is still the view's
+        parent, and the view dies with it.
+        """
+        index = self._stack.count() if at < 0 else max(0, min(at, self._stack.count()))
+        return self._insert_view(view, index, activate=True)
+
+    def _insert_view(self, view, index: int, activate: bool) -> int:
         self._stack.insertWidget(index, view)
-        # Per-view wiring, for the whole life of the view rather than only
-        # while it is in front: the tab label and its unsaved dot have to keep
-        # up with a document nobody is looking at.
-        view.title_changed.connect(self._refresh_titles)
-        view.dirty_changed.connect(self._refresh_dirty)
-        view.close_requested.connect(
-            lambda v=view: self.view_close_requested.emit(v))
+        self._connect_view(view)
         self._bar.insertTab(index, "")
         self._bar.install_close_button(index)
         self._refresh_titles()
@@ -452,6 +523,44 @@ class DocumentArea(QWidget):
         self._sync_header_visibility()
         self.check_invariant()
         return index
+
+    def detach(self, view, index: int | None = None):
+        """Give up a view's tab WITHOUT tearing the view down.
+
+        The source half of a move. `remove_view` is the other thing that takes
+        a tab away and it destroys what was in it; this one hands the view over
+        alive, so it does no `teardown()`, no `deleteLater()` and above all no
+        `setParent(None)`.
+
+        `index` is passed in by a caller that already adopted the view
+        somewhere else, because by then the widget has been reparented and this
+        stack no longer knows where its tab was. Qt removes a reparented widget
+        from the old layout on its own, so the stack may already be one short
+        of the bar; that is the one moment the invariant is allowed to be
+        false, and it is re-asserted at the end.
+        """
+        if index is None:
+            index = self.index_of(view)
+        if not (0 <= index < self._bar.count()):
+            return None
+        if view is self._current_view:
+            # Same reason as remove_view: announce the departure while the
+            # connections still exist, so the window unbinds cleanly.
+            self._current_view = None
+            self.current_view_changed.emit(view, None)
+        self._syncing = True
+        try:
+            self._bar.removeTab(index)
+            if self._stack.indexOf(view) >= 0:
+                self._stack.removeWidget(view)
+        finally:
+            self._syncing = False
+        self._disconnect_view(view)
+        self._refresh_titles()
+        self._sync_header_visibility()
+        self._resync_current()
+        self.check_invariant()
+        return view
 
     def remove_view(self, index: int):
         """Drop a tab and the view under it, and release what the view held.
@@ -475,12 +584,7 @@ class DocumentArea(QWidget):
             self._stack.removeWidget(view)
         finally:
             self._syncing = False
-        for signal in (view.title_changed, view.dirty_changed,
-                       view.close_requested):
-            try:
-                signal.disconnect()
-            except (RuntimeError, TypeError):
-                pass
+        self._disconnect_view(view)
         view.teardown()
         view.setParent(None)
         view.deleteLater()
@@ -516,12 +620,7 @@ class DocumentArea(QWidget):
         if self._syncing:
             return
         self._stack.setCurrentIndex(index)
-        new = self.view_at(index)
-        if new is self._current_view:
-            return
-        previous = self._current_view
-        self._current_view = new
-        self.current_view_changed.emit(previous, new)
+        self._set_current_view(self.view_at(index))
 
     def _resync_current(self):
         """Put the stack and the remembered front view back on the bar's tab.
@@ -532,12 +631,29 @@ class DocumentArea(QWidget):
         """
         index = self._bar.currentIndex()
         self._stack.setCurrentIndex(index)
-        new = self.view_at(index)
+        self._set_current_view(self.view_at(index))
+
+    def _set_current_view(self, new):
+        """One place a different document becomes the front one.
+
+        Two things happen here and the order matters. The view LEAVING is told
+        first, because backgrounding is what releases its render cache and its
+        markup clones, and doing that before the arriving view rebuilds its own
+        keeps the peak at one document's worth rather than two. Phase 2
+        measured the numbers that make this the headline: one document's
+        six-entry pixmap cache is 207 MB, and ten live documents plus twenty
+        markup clones are 2 MB between them.
+        """
         if new is self._current_view:
-            return
+            return False
         previous = self._current_view
         self._current_view = new
+        if previous is not None:
+            previous.set_active(False)
+        if new is not None:
+            new.set_active(True)
         self.current_view_changed.emit(previous, new)
+        return True
 
     def _on_tab_moved(self, frm: int, to: int):
         """A tab was dragged along the bar; the stack follows it.
@@ -623,10 +739,9 @@ class DocumentArea(QWidget):
     def build_tab_menu(self, index: int) -> QMenu:
         """The per-tab context menu.
 
-        No "Move to New Window": there is no second window to move to until
-        phase 3 builds the registry that owns them. No pinning either; a pinned
-        tab is a promise about ordering that the drag reordering above already
-        breaks.
+        "Move to New Window" is here now, and it is the whole user-facing half
+        of phase 3. No pinning; a pinned tab is a promise about ordering that
+        the drag reordering above already breaks.
         """
         view = self.view_at(index)
         menu = QMenu(self)
@@ -642,6 +757,18 @@ class DocumentArea(QWidget):
         right = menu.addAction("Close to the Right")
         right.setEnabled(index < self.count() - 1)
         right.triggered.connect(lambda: self.close_to_the_right(index))
+
+        menu.addSeparator()
+
+        # Disabled on a lone tab: moving the only document out of a window and
+        # closing the window behind it produces the window you started with,
+        # having thrown away its position and size on the way. Every browser
+        # greys it out for the same reason. File > New Window is what to reach
+        # for when an empty second window is actually what is wanted.
+        move_out = menu.addAction("Move to New Window")
+        move_out.setEnabled(self.count() > 1)
+        move_out.triggered.connect(
+            lambda: self.move_to_new_window_requested.emit(view))
 
         menu.addSeparator()
 

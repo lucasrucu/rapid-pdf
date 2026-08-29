@@ -31,3 +31,28 @@ def _settings_off_the_real_file(tmp_path_factory):
     previous = set_settings(store)
     yield store
     set_settings(previous)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_window_registry():
+    """Every test gets its own WindowRegistry, and none of them ends the run.
+
+    Two separate problems, one fixture. From phase 3 a MainWindow joins the
+    registry as it is built, so without this every window any test ever made
+    would pile up in one process-wide list and a later test's routing would
+    reach into a widget the test that made it has finished with.
+
+    And the registry QUITS THE APPLICATION when its last window leaves, which
+    is exactly right in the app and would be a shot at the test runner here.
+    It is disarmed by default; the one test that asserts on it turns it back on
+    and watches `QApplication.quit` rather than letting it fire.
+
+    Windows built before the reset keep a reference to the OLD registry object
+    and unregister from that, which is what makes the swap safe mid-suite.
+    """
+    from ui.window_registry import WindowRegistry
+
+    WindowRegistry.reset_instance()
+    WindowRegistry.instance().quit_on_last_window = False
+    yield
+    WindowRegistry.reset_instance()
