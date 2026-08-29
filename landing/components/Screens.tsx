@@ -9,7 +9,7 @@ export function Screens() {
         <div className="max-w-2xl">
           <Eyebrow>A look inside</Eyebrow>
           <h2 className="mt-6 text-3xl font-semibold tracking-tight text-foreground sm:text-4xl">
-            Two tabs. Nothing in your way.
+            Two views. Nothing in your way.
           </h2>
         </div>
 

@@ -1101,8 +1101,9 @@ as a bug.
 
 **Genuinely outstanding.**
 
-- **Nothing has been released.** Version is still 1.5.0 and no installer has
-  been cut for any of this. See Standing constraints.
+- **Not released yet.** All three version inputs read 1.6.0 and the notes are
+  in `docs/CHANGELOG.md`, but no installer has been cut and no tag pushed. See
+  Standing constraints.
 - **`docs/architecture.md` and `docs/file-structure.md` still describe the
   single-document app.** `architecture.md:83` still says `MainWindow` "builds
   the two tabs", which now means the Editor/Organizer switcher inside a
