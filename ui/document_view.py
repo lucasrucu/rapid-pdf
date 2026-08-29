@@ -403,6 +403,26 @@ class DocumentView(QWidget):
         if self._tabs.currentIndex() == 1:
             self._refresh_organizer()
 
+    def rerender_for_screen_change(self):
+        """Redraw after the window landed on a monitor at a different scale.
+
+        Cached page pixmaps are DEVICE-dependent. Rendered for a 1.0 screen and
+        shown on a 1.5 one they are soft, and the panel thumbnails go with
+        them. Nothing about the document changed, so this is a cache drop and a
+        redraw, the same three calls the OCR path makes for the same reason.
+
+        Phase 4 needs it because the tear-off can put a document on another
+        monitor in one gesture. `MainWindow._on_screen_changed` covers every
+        later move of the window; the gesture checks the ratio itself on the
+        drop, which is the one move that happens before there is a window to
+        have listened to.
+        """
+        if not self._doc.doc:
+            return
+        self._doc.invalidate_render_cache()
+        self._canvas.reload_current_page()
+        self._refresh_panel_thumbnails(current_page=self._current_page)
+
     def teardown(self):
         """Release everything this view owns, on the way out for good."""
         self._close_org_render()
