@@ -97,13 +97,21 @@ def test_the_written_file_carries_the_schema_version(store):
 
 
 def test_the_defaults_match_the_documented_schema():
-    """The v1 shape, spelled out so a change to it is a deliberate edit here."""
-    assert set(DEFAULTS) == {"schema_version", "close", "appearance", "files", "view"}
+    """The v1 shape, spelled out so a change to it is a deliberate edit here.
+
+    `startup` and `session` arrived with phase 6 and did NOT bump the version:
+    adding a key is not a migration, because a file from a build with fewer
+    settings is simply a file with fewer keys.
+    """
+    assert set(DEFAULTS) == {"schema_version", "close", "appearance", "files",
+                             "view", "startup", "session"}
     assert set(DEFAULTS["close"]) == {"x_closes", "confirm_multiple_tabs"}
     assert set(DEFAULTS["appearance"]) == {"theme"}
     assert set(DEFAULTS["files"]) == {"default_folder_mode", "default_folder"}
     assert set(DEFAULTS["view"]) == {
         "page_panel_visible", "default_fit_mode", "organizer_zoom_index"}
+    assert set(DEFAULTS["startup"]) == {"restore_tabs"}
+    assert set(DEFAULTS["session"]) == {"windows"}
     assert DEFAULTS["schema_version"] == SCHEMA_VERSION == 1
 
 

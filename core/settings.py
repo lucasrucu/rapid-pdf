@@ -69,6 +69,12 @@ WRITE_DEBOUNCE_MS = 250
 # asserts the two agree so they cannot drift apart silently.
 _DEFAULT_ORGANIZER_ZOOM_INDEX = 3
 
+# Every page-fit mode the status-bar group offers. Same reason as the constant
+# above: these are ui.canvas.FIT_MODES' keys and core/ cannot import ui/, so
+# test_preferences.py asserts the two sets stay equal. Used by both
+# view.default_fit_mode and the per-tab fit carried in a saved session.
+FIT_MODE_NAMES = ("fit_page", "fit_width", "fit_height", "actual")
+
 DEFAULTS: dict = {
     "schema_version": SCHEMA_VERSION,
     "close": {
@@ -86,6 +92,16 @@ DEFAULTS: dict = {
         "page_panel_visible": True,
         "default_fit_mode": "fit_page",
         "organizer_zoom_index": _DEFAULT_ORGANIZER_ZOOM_INDEX,
+    },
+    "startup": {
+        "restore_tabs": False,
+    },
+    # Not a preference: the record of what was open last time, written on the
+    # way out and read once on the way in. It lives here rather than in a file
+    # of its own because a second file is a second thing to find, quarantine
+    # when it is corrupt, and keep in step with this one. See SessionSection.
+    "session": {
+        "windows": [],
     },
 }
 
@@ -168,6 +184,90 @@ def _as_str(raw) -> str:
     if isinstance(raw, str):
         return raw
     raise TypeError(raw)
+
+
+def _clean_int(raw, fallback: int, low: int | None = None) -> int:
+    """An int out of the file, or the fallback. Never raises.
+
+    The session block is the one setting that is a structure rather than a
+    scalar, so its parts are cleaned one at a time and a bad part costs its own
+    value rather than the whole session.
+    """
+    try:
+        value = _as_int(raw)
+    except (TypeError, ValueError):
+        return fallback
+    if low is not None and value < low:
+        return fallback
+    return value
+
+
+def _clean_float(raw, fallback: float) -> float:
+    if isinstance(raw, bool):
+        return fallback
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return fallback
+    if value != value or value in (float("inf"), float("-inf")) or value <= 0:
+        return fallback           # NaN, infinity, and a zoom of zero
+    return value
+
+
+def _as_session_tab(raw) -> dict | None:
+    """One saved tab, or None for anything that cannot be restored.
+
+    ONLY A TAB WITH A REAL PATH SURVIVES. An untitled or merged document lives
+    only in memory, so writing it down would mean serialising the document
+    itself into a cache directory, which brings a disk-space policy, a cleanup
+    policy and a restore path that can fail on a corrupt cache. It is dropped
+    here, silently, both on the way out and on the way in.
+    """
+    if not isinstance(raw, dict):
+        return None
+    path = raw.get("path")
+    if not isinstance(path, str) or not path.strip():
+        return None
+    fit = raw.get("fit_mode")
+    return {
+        "path": path,
+        "page": _clean_int(raw.get("page"), 0, low=0),
+        "zoom": _clean_float(raw.get("zoom"), 0.0),
+        "fit_mode": fit if fit in FIT_MODE_NAMES else None,
+    }
+
+
+def _as_session_windows(raw) -> list:
+    """The saved session, normalised. Anything unusable is dropped, not raised.
+
+    A window with no restorable tab left in it is not a window worth reopening,
+    so it goes too. The result is what the restore path walks, which means the
+    restore path never has to ask whether a field is the right type.
+    """
+    if not isinstance(raw, list):
+        raise TypeError(raw)
+    windows = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        tabs = [t for t in (_as_session_tab(item)
+                            for item in entry.get("tabs") or []) if t]
+        if not tabs:
+            continue
+        geometry = entry.get("geometry")
+        if (not isinstance(geometry, list) or len(geometry) != 4
+                or not all(isinstance(n, int) and not isinstance(n, bool)
+                           for n in geometry)
+                or geometry[2] <= 0 or geometry[3] <= 0):
+            geometry = None
+        screen = entry.get("screen")
+        windows.append({
+            "geometry": geometry,
+            "screen": screen if isinstance(screen, str) else None,
+            "current": _clean_int(entry.get("current"), 0, low=0) % len(tabs),
+            "tabs": tabs,
+        })
+    return windows
 
 
 class _Field:
@@ -260,9 +360,28 @@ class ViewSection(_Section):
     # this tuple while ui.canvas.FIT_MODES has carried it all along, so choosing
     # Fit height and setting it as the default silently fell back to fit_page.
     # test_preferences.py asserts the two sets stay equal.
-    default_fit_mode = _Field(
-        _as_str, allowed=("fit_page", "fit_width", "fit_height", "actual"))
+    default_fit_mode = _Field(_as_str, allowed=FIT_MODE_NAMES)
     organizer_zoom_index = _Field(_as_int)
+
+
+class StartupSection(_Section):
+    _name = "startup"
+
+    # Off by default. Reopening eight drawings nobody asked for is a worse
+    # first impression than an empty window, so this is opt-in and the
+    # Preferences checkbox is where it is opted into.
+    restore_tabs = _Field(_as_bool)
+
+
+class SessionSection(_Section):
+    _name = "session"
+
+    # The one field in the schema that is a structure rather than a scalar.
+    # `_as_session_windows` is both the validator and the normaliser, so a
+    # hand-edited or half-written session reads back as "no session" exactly
+    # the way a nonsense `x_closes` reads back as "window", and the restore
+    # path can trust every field it touches.
+    windows = _Field(_as_session_windows)
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +411,8 @@ class Settings:
         self.appearance = AppearanceSection(self)
         self.files = FilesSection(self)
         self.view = ViewSection(self)
+        self.startup = StartupSection(self)
+        self.session = SessionSection(self)
 
         self.load(migrate_legacy=migrate_legacy)
 
@@ -316,7 +437,8 @@ class Settings:
     def as_dict(self) -> dict:
         """Effective values for every section, defaults folded in."""
         out = {"schema_version": self.schema_version}
-        for section in (self.close, self.appearance, self.files, self.view):
+        for section in (self.close, self.appearance, self.files, self.view,
+                        self.startup, self.session):
             out[section._name] = section.as_dict()
         return out
 
