@@ -14,8 +14,9 @@ STRUCTURE (so it ports cleanly)
                      Two instances ship: LIGHT (default) and DARK.
 - `build_qss()`    : turns a Palette into one global stylesheet string.
 - `ThemeManager`   : holds the current mode, applies the QSS to a QApplication,
-                     toggles light<->dark, persists the choice via QSettings, and
-                     emits `theme_changed` so widgets can re-tint code-drawn bits
+                     toggles light<->dark, persists the choice through a settings
+                     store, and emits `theme_changed` so widgets can re-tint
+                     code-drawn bits
                      (icons, scene backgrounds, canvas selection chrome) that QSS
                      can't reach.
 - `apply_theme()`  : one-line convenience for `main.py`.
@@ -74,7 +75,7 @@ from __future__ import annotations
 from dataclasses import dataclass, fields
 from enum import Enum
 
-from PySide6.QtCore import QObject, Signal, QSettings
+from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QColor, QIcon, QPalette
 from PySide6.QtWidgets import QApplication, QWidget, QGraphicsDropShadowEffect
 
@@ -526,6 +527,17 @@ def apply_mica(window: QWidget, dark: bool) -> bool:
 # ---------------------------------------------------------------------------
 # ThemeManager: the public entry point.
 # ---------------------------------------------------------------------------
+def _default_store():
+    """rapid-pdf's settings store, imported here rather than at module scope.
+
+    A late import keeps `ui/theme.py` copyable into another PySide6 app: the
+    dependency on core/settings.py only materialises for callers that let the
+    default apply, and passing your own `store=` never reaches this line.
+    """
+    from core.settings import settings
+    return settings().appearance
+
+
 class ThemeManager(QObject):
     """Applies the QSS to a QApplication, toggles light/dark, persists the choice,
     and signals when the mode changes so code-drawn surfaces can re-tint.
@@ -540,15 +552,18 @@ class ThemeManager(QObject):
     theme_changed = Signal(object)  # emits the new Palette
 
     def __init__(self, app: QApplication | None = None,
-                 settings_org: str = "Lucas", settings_app: str = "Rapid PDF",
+                 store=None,
                  default: ThemeMode = ThemeMode.LIGHT):
         super().__init__(app)
         self._app = app or QApplication.instance()
-        self._settings = QSettings(settings_org, settings_app)
-        saved = self._settings.value("theme/mode", default.value)
+        # `store` is anything carrying a readable/writable `theme` string, which
+        # in rapid-pdf is core.settings.settings().appearance. Holding it to that
+        # one attribute is what keeps this module droppable into another app:
+        # pass a two-line shim rather than dragging core/settings.py along.
+        self._store = store if store is not None else _default_store()
         try:
-            self._mode = ThemeMode(saved)
-        except ValueError:
+            self._mode = ThemeMode(self._store.theme)
+        except (ValueError, AttributeError):
             self._mode = default
 
     # -- state -----------------------------------------------------------
@@ -579,7 +594,10 @@ class ThemeManager(QObject):
         if mode == self._mode:
             return
         self._mode = mode
-        self._settings.setValue("theme/mode", mode.value)
+        try:
+            self._store.theme = mode.value
+        except (AttributeError, ValueError):
+            pass          # a theme that cannot be remembered still applies
         self.apply()
         self.theme_changed.emit(self.palette)
 

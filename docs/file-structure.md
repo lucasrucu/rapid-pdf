@@ -10,7 +10,8 @@ rapid-pdf/
 ├── smoke_test.py
 ├── core/
 │   ├── __init__.py
-│   └── pdf_document.py
+│   ├── pdf_document.py
+│   └── settings.py
 ├── ui/
 │   ├── __init__.py
 │   ├── main_window.py
@@ -49,6 +50,7 @@ rapid-pdf/
 | `core/__init__.py` | Package marker. |
 | `core/pdf_document.py` | `PDFDocument`, the one wrapper over PyMuPDF (`fitz`). Owns the live document, the LRU page-pixmap render cache, the integrity-first save lifecycle, structural page ops (reorder/delete/insert, plus the `extract_pages`/`restore_pages` stash that makes a delete undoable), the editable embedded-JSON annotation model, markup writing, and the no-hole `remove_image_placement` image-lift primitive. |
 | `core/page_ops.py` | The page-order arithmetic on its own, with no Qt and no PyMuPDF: where a dragged multi-selection lands, the permutation that undoes a reorder, and the re-keying a page edit forces on anything filed by page index. Pure functions, so the awkward cases are testable without a widget or a PDF. |
+| `core/settings.py` | The settings store: one JSON file at `%LOCALAPPDATA%\Rapid PDF\settings.json`, read through typed section accessors (`settings().close.x_closes`). Atomic writes on a 250 ms debounce, a versioned schema with a migrations table, and defaults for everything, so a corrupt, truncated or newer-than-this-build file degrades instead of stopping the app. Also carries the three pre-1.6 `QSettings` registry keys over on first run. |
 
 ## `ui/`: interface layer
 

@@ -173,6 +173,10 @@ class InstanceServer(QObject):
         self._launches = 0
         self._armed = False
         self._window = QElapsedTimer()
+        # Whether any launch at all landed in this window. Kept separately from
+        # the file list because a launch with NO files is the ordinary case of
+        # double-clicking the shortcut, and it still has to raise the window.
+        self._pending_launch = False
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.setInterval(AGGREGATE_MS)
@@ -208,6 +212,7 @@ class InstanceServer(QObject):
         self._pending_files.extend(f for f in files if f)
         self._pending_combine = self._pending_combine or combine
         self._launches += 1
+        self._pending_launch = True
         self._timer.start(self._interval())   # restart: wait for stragglers
 
     def _interval(self) -> int:
@@ -248,6 +253,13 @@ class InstanceServer(QObject):
             # Nothing is listening yet; hold the batch rather than lose it.
             self._timer.start(AGGREGATE_MS)
             return
+        # A launch that carried no files still counts. Double-clicking the
+        # shortcut while Rapid PDF is already running forwards an empty payload;
+        # gating the emit on `files` meant the second process handed that over
+        # and exited, the primary did nothing with it, and the app looked like
+        # it had simply failed to start. An empty batch raises the window.
+        if not self._pending_launch:
+            return
         files = [f for f in self._pending_files if os.path.exists(f)]
         # De-duplicate while keeping order (the same file forwarded twice).
         seen = set()
@@ -257,8 +269,8 @@ class InstanceServer(QObject):
         self._pending_combine = False
         self._launches = 0
         self._window.invalidate()
-        if files:
-            self.batch_ready.emit(files, combine)
+        self._pending_launch = False
+        self.batch_ready.emit(files, combine)
 
 
 def parse_cli(argv: list) -> tuple[list, bool]:

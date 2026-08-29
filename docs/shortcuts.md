@@ -73,6 +73,14 @@ strip keeps its own size.
 | `Ctrl+O` | Open / combine PDFs |
 | `Ctrl+S` | Save |
 | `Ctrl+Shift+S` | Save As |
+| `Ctrl+W` | Close the PDF, leaving the window open |
+| `Ctrl+Q` | Quit |
+
+The window's X closes the app. To have it close the PDF and leave an empty
+window instead (which is what Rapid PDF did up to 1.5.0), set `close.x_closes`
+to `"document"` in `%LOCALAPPDATA%\Rapid PDF\settings.json`. Either way,
+unsaved changes are prompted for first and cancelling the prompt cancels the
+close.
 
 ## Mouse
 
