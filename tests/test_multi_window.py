@@ -366,7 +366,6 @@ def test_adopting_a_view_reparents_it_and_recreates_nothing(win, alpha, beta):
     canvas = moving._canvas
     before = {
         "scene": canvas.scene(),
-        "undo": canvas.undo_stack,
         "viewport": canvas.viewport(),
         "items": len(canvas.scene().items()),
         "page": moving.current_page(),
@@ -379,8 +378,12 @@ def test_adopting_a_view_reparents_it_and_recreates_nothing(win, alpha, beta):
     target = win.move_view_to_new_window(moving)
 
     assert canvas.scene() is before["scene"]
-    assert canvas.undo_stack is before["undo"]
     assert canvas.viewport() is before["viewport"]
+    # NOT the undo stack, and phase 5 is why. It is the WINDOW's now, shared by
+    # every tab in it, so a view arriving in another window necessarily joins
+    # that window's history (ui/undo.py). Everything else finding 2 measured
+    # still has to survive, which is what the rest of this list is.
+    assert canvas.undo_stack is target.undo_stack()
     assert len(canvas.scene().items()) == before["items"]
     assert moving.current_page() == before["page"] == 1
     assert moving._doc.doc is before["fitz"]

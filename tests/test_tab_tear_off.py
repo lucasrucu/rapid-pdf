@@ -212,7 +212,7 @@ def test_crossing_the_threshold_creates_a_window_with_the_document_intact(
     bar = area.bar()
     moving = area.view_at(1)
     canvas = moving._canvas
-    scene, stack, doc = canvas.scene(), canvas.undo_stack, moving._doc.doc
+    scene, doc = canvas.scene(), moving._doc.doc
 
     start = _tab_point(bar, 1)
     _press(bar, start)
@@ -230,7 +230,9 @@ def test_crossing_the_threshold_creates_a_window_with_the_document_intact(
 
     # Finding 2, re-verified through the gesture rather than the menu item.
     assert canvas.scene() is scene
-    assert canvas.undo_stack is stack
+    # The stack is the WINDOW's since phase 5, so a torn-off view joins the
+    # torn window's history rather than carrying its own across (ui/undo.py).
+    assert canvas.undo_stack is torn.undo_stack()
     assert moving._doc.doc is doc
     assert canvas.internalWinId() == 0
     assert moving.window() is torn

@@ -569,6 +569,7 @@ class DocumentArea(QWidget):
             (view.title_changed, self._refresh_titles),
             (view.dirty_changed, self._refresh_dirty),
             (view.close_requested, self._on_view_closed),
+            (view.activation_requested, self._on_activation_requested),
         )
 
     def _connect_view(self, view):
@@ -591,6 +592,23 @@ class DocumentArea(QWidget):
         view = self.sender()
         if view is not None:
             self.view_close_requested.emit(view)
+
+    def _on_activation_requested(self):
+        """A view is about to be changed and wants to be watched while it is.
+
+        Phase 5: one undo stack per window, so Ctrl+Z can reach a document in
+        another tab. The command asks for its tab first, and this is what
+        brings it up. `sender()` rather than a captured view, for the same
+        reason as `_on_view_closed`: one object this area can disconnect by
+        reference. Ignored while an MRU walk is in flight, which is the one
+        time the front tab is deliberately not the one the user is settling on.
+        """
+        view = self.sender()
+        if view is None or view is self._current_view:
+            return
+        index = self.index_of(view)
+        if index >= 0 and not self.is_walking_mru():
+            self.set_current_index(index)
 
     def add_view(self, view, activate: bool = True) -> int:
         """Take ownership of a DocumentView and give it a tab.

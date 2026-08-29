@@ -296,13 +296,21 @@ def test_a_file_that_is_already_open_activates_its_tab(win, area, tmp_path):
     assert win.view.document_path() == a
 
 
-def test_the_two_views_hold_two_documents_and_two_undo_stacks(
+def test_the_two_views_hold_two_documents_and_share_the_window_stack(
         win, area, three_pages, one_page):
+    """Two documents, two canvases, ONE history.
+
+    Phase 5 moved the stack from the canvas to the window. A page dragged from
+    one tab into another is one action with two document-level effects, and no
+    pair of stacks can undo that without leaving a duplicate behind: undo on
+    the destination re-inserts the page into the source while the source's own
+    stack still thinks nothing happened. See ui/undo.py."""
     win.open_paths([three_pages, one_page])
     first, second = area.views()
     assert first._doc is not second._doc
     assert first._canvas is not second._canvas
-    assert first.undo_stack() is not second.undo_stack()
+    assert first.undo_stack() is second.undo_stack()
+    assert first.undo_stack() is win.undo_stack()
 
 
 def test_each_tab_keeps_its_own_page(win, area, tmp_path):
@@ -642,7 +650,8 @@ def test_duplicate_tab_opens_a_second_independent_document(win, area, three_page
     copy = area.view_at(1)
     assert copy.document_path() == three_pages
     assert copy._doc is not original._doc
-    assert copy.undo_stack() is not original.undo_stack()
+    # Same window, so the same history: phase 5 put one stack on the window.
+    assert copy.undo_stack() is original.undo_stack()
     assert area.bar().tabText(0) == "three"
     assert area.bar().tabText(1) == "three (2)"
 
@@ -678,12 +687,19 @@ def test_move_to_new_window_is_dead_on_the_only_tab(win, area, three_pages,
 # 5. What gets rebound on a switch
 # ---------------------------------------------------------------------------
 
-def test_undo_is_rebuilt_on_a_switch_and_only_touches_the_front_document(
+def test_undo_is_the_windows_history_and_switches_to_what_it_undoes(
         win, area, three_pages, one_page):
-    """THE ONE PHASE 1 CALLED OUT. `createUndoAction` binds an action to ONE
-    stack for the life of that action, and there is one stack per document
-    (PDFCanvas.set_document clears it), so the menu entry has to be rebuilt on
-    every switch. Miss it and Ctrl+Z keeps undoing the document you left."""
+    """PHASE 5 INVERTED THIS TEST, ON PURPOSE.
+
+    It used to assert that Undo was rebuilt on every switch and reached only
+    the front document. There is one stack per WINDOW now, because a page
+    dragged between two tabs is one action touching two documents and no pair
+    of stacks can undo it without leaving a duplicate (ui/undo.py). So Ctrl+Z
+    means "the last thing I did in this window", wherever it was.
+
+    The cost is that undo can change a tab you are not looking at, and the
+    mitigation is the second half of this test: the command brings its own tab
+    to the front FIRST, so the edit is watched rather than discovered."""
     win.open_paths([three_pages, one_page])
     marked = area.view_at(0)
     other = area.view_at(1)
@@ -694,17 +710,13 @@ def test_undo_is_rebuilt_on_a_switch_and_only_touches_the_front_document(
     assert _undo_action(win).isEnabled()
 
     area.set_current_index(1)
-    # The other document has an empty history, so its Undo is dead. If the
-    # action were still the first document's it would be live here.
-    assert not _undo_action(win).isEnabled()
-
-    _undo_action(win).trigger()
-    assert len(_items(marked)) == 1, "undo reached the background document"
-
-    area.set_current_index(0)
+    # One window, one history: the edit made in the other tab is still the
+    # last thing that happened here, so Undo is live.
     assert _undo_action(win).isEnabled()
+
     _undo_action(win).trigger()
-    assert len(_items(marked)) == 0
+
+    assert len(_items(marked)) == 0, "the window's last edit was not undone"
     assert len(_items(other)) == 0
 
 

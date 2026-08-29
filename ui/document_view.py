@@ -67,6 +67,7 @@ phase. See `_refresh_organizer`.
 """
 
 import os
+import uuid
 
 from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (
@@ -81,7 +82,9 @@ from core.settings import dialog_start_dir, remember_dialog_dir, settings
 from ui.canvas import PDFCanvas
 from ui.combine_dialog import CombineDialog
 from ui.organizer import PageOrganizer
-from ui.page_commands import DeletePagesCommand, ReorderPagesCommand
+from ui.page_commands import (
+    DeletePagesCommand, ReorderPagesCommand, TransferPagesCommand,
+)
 from ui.page_panel import PagePanel
 from ui.search_bar import SearchBar
 from ui.theme import ThemeManager
@@ -90,6 +93,27 @@ from ui.toolbar import ToolBar
 # Debounce for search-as-you-type: long enough that fast typing doesn't
 # re-scan the document per keystroke, short enough to feel live.
 SEARCH_DEBOUNCE_MS = 220
+
+
+def _transfer_note(warnings: dict) -> str:
+    """The one line that says what a page move quietly lost or renamed.
+
+    PyMuPDF reports none of it: an internal link whose target did not come
+    along is dropped, layers are flattened, and a colliding form-field name is
+    rewritten to `name [27]`. All three are silent, and none of them has a
+    generic repair, so the honest thing is to say it once where the user is
+    already looking. Empty when nothing was lost, which is the normal case.
+    """
+    parts = []
+    links = warnings.get("links", 0)
+    if links:
+        parts.append(f"{links} internal link{'s' if links > 1 else ''} dropped")
+    if warnings.get("layers"):
+        parts.append("layers flattened")
+    widgets = warnings.get("widgets", 0)
+    if widgets:
+        parts.append(f"{widgets} form field{'s' if widgets > 1 else ''} may be renamed")
+    return f"  ({', '.join(parts)})" if parts else ""
 
 
 class DocumentView(QWidget):
@@ -134,6 +158,13 @@ class DocumentView(QWidget):
     #: so the view asks rather than does.
     default_fit_requested = Signal()
 
+    #: This document is about to be changed by something the user did while
+    #: looking at ANOTHER tab, so bring it to the front first. Phase 5: one undo
+    #: stack per window means Ctrl+Z can reach across tabs, and an edit you
+    #: cannot see being undone is worse than no undo at all. DocumentArea
+    #: switches to it; see _view_wiring.
+    activation_requested = Signal()
+
     def __init__(self, theme: ThemeManager, parent=None):
         super().__init__(parent)
         # The theme is the window's, borrowed: this widget re-tints its own
@@ -145,6 +176,23 @@ class DocumentView(QWidget):
         self._panel_render = None  # throwaway clone backing the left page panel's thumbnails
         self._dirty = False      # unsaved changes exist (annotations, page edits, merges)
         self._dirty_announced = False  # last value dirty_changed went out with
+        # A stable name for THIS document, carried in a page drag's payload so
+        # the drop can find its source in the live registry without holding a
+        # reference to a widget that may be gone by the time the drop lands.
+        self._doc_id = uuid.uuid4().hex
+        # DIRTY IS A REVISION COUNTER NOW, not QUndoStack.isClean(). One stack
+        # serves the whole window (see ui/undo.py), so its clean index cannot
+        # answer the question for three documents at once. Every command that
+        # touches this document bumps _rev on redo and drops it on undo; a save
+        # records the value it was saved at; dirty is "they differ". A
+        # _saved_rev of None means the saved state sat in a redo branch that has
+        # since been thrown away and can never be returned to.
+        self._rev = 0
+        self._saved_rev = 0
+        # Dirt that no command produced and no undo can take back: an Organizer
+        # merge, a page delete that had to clear the history. OR'd into dirty
+        # and cleared by a save.
+        self._forced_dirty = False
         # Front tab or background tab. True to start: a view is built to be
         # shown, and the only thing this flag gates is the RELEASE, so nothing
         # is gained by making a brand new view rebuild what it has not built.
@@ -192,9 +240,11 @@ class DocumentView(QWidget):
         self._canvas = PDFCanvas()
         self._canvas.annotation_changed.connect(self._on_annotation_changed)
         self._canvas.page_changed.connect(self._on_canvas_page_changed)
-        # Keep the title/modified indicator in sync whenever the undo stack crosses
-        # the clean boundary (e.g. Ctrl+Z back to saved state clears the * marker).
-        self._canvas.undo_stack.cleanChanged.connect(self._on_clean_changed)
+        # The canvas's edits move THIS document's revision counter, which is
+        # what the modified marker is read off now. No cleanChanged connection:
+        # the stack is about to become the whole window's (see set_undo_stack),
+        # and one stack's clean index cannot speak for three documents.
+        self._canvas.set_revision_owner(self)
 
         # Search bar sits above the canvas, hidden until Ctrl+F.
         self._search_bar = SearchBar()
@@ -287,13 +337,66 @@ class DocumentView(QWidget):
         self._update_status()
 
     def undo_stack(self):
-        """The canvas's stack, which is this document's stack.
+        """The stack this view's edits go on: the WINDOW's, once it is in one.
 
-        The Edit menu's Undo/Redo actions are built from it. One canvas per
-        document is forced by PDFCanvas.set_document (it clears the stack), so
-        this is per view and phase 2 has to rebind the menu on a tab switch.
+        Phase 5 moved it. A cross-document page move is one action with two
+        document-level effects, and there is no ordering of two stacks that
+        undoes it without leaving a duplicate, so the window owns one stack and
+        every tab in it shares it. `MainWindow` hands it over in `_new_view`
+        and `adopt`; until then this is the canvas's own, which is what lets a
+        DocumentView still be built with no window at all. See ui/undo.py.
         """
         return self._canvas.undo_stack
+
+    def set_undo_stack(self, stack):
+        """Join a window's shared history (or leave one, by passing None)."""
+        self._canvas.set_undo_stack(stack)
+
+    def doc_id(self) -> str:
+        """A stable name for this document, for a page drag's payload."""
+        return self._doc_id
+
+    def transfer_label(self) -> str:
+        """What to call this document in the other one's close prompt."""
+        return self.document_name() or "an untitled document"
+
+    def request_activation(self):
+        """Ask to be brought to the front, before something changes under me."""
+        self.activation_requested.emit()
+
+    # -- dirty, as a revision counter -----------------------------------
+
+    def note_revision(self, delta: int):
+        """One command touching this document was applied (+1) or undone (-1)."""
+        self._rev += int(delta)
+        self._sync_dirty()
+
+    def note_branch_dropped(self):
+        """A redo branch is about to be thrown away by a new edit.
+
+        If this document's last save lives in that branch, the counter can
+        never come back to it, so the marker is retired and the document stays
+        dirty until it is saved again. Same rule QUndoStack applies to its own
+        clean index, scoped to one document.
+        """
+        if self._saved_rev is not None and self._saved_rev > self._rev:
+            self._saved_rev = None
+
+    def _sync_dirty(self):
+        """Recompute the modified state and announce it if it moved."""
+        self._dirty = bool(
+            self._forced_dirty
+            or self._saved_rev is None
+            or self._rev != self._saved_rev
+        )
+        self._update_title()
+
+    def _reset_revisions(self):
+        """Back to "in sync with disk", for a fresh open or a close."""
+        self._rev = 0
+        self._saved_rev = 0
+        self._forced_dirty = False
+        self._dirty = False
 
     # ------------------------------------------------------------------
     # What the shell does to this view
@@ -345,6 +448,8 @@ class DocumentView(QWidget):
         strip). Deliberately does not touch the title: neither did the line it
         replaces.
         """
+        self._forced_dirty = False
+        self._saved_rev = self._rev
         self._dirty = False
 
     def is_active(self) -> bool:
@@ -466,7 +571,7 @@ class DocumentView(QWidget):
                 self.window(), "Error",
                 self._doc.last_open_error or f"Could not open:\n{path}")
             return False
-        self._dirty = False           # freshly opened, in sync with disk
+        self._reset_revisions()       # freshly opened, in sync with disk
         self._canvas.set_document(self._doc)
         self._page_panel.set_document(self._doc)
         self._current_page = 0
@@ -598,7 +703,7 @@ class DocumentView(QWidget):
         self._search_bar.hide()
         self._on_search_closed()
         self._doc.close()
-        self._dirty = False
+        self._reset_revisions()
         self._canvas.set_document(self._doc)
         self._page_panel.set_document(self._doc)
         # Closing the doc must also clear the Organizer (it holds its own page
@@ -615,8 +720,15 @@ class DocumentView(QWidget):
         dirty/clean state, strip the baked markup back out of the live doc,
         drop baked image overlays, and re-sync the panel to the saved page.
         """
+        # Ctrl+Z back to here won't prompt to save. Not setClean(): the stack
+        # is the whole window's, so its clean index cannot mean "B is saved"
+        # without also claiming it for A and C. This document remembers the
+        # revision it was written at instead, and the ledger of pages it swapped
+        # with another tab is settled by the same write.
+        self._forced_dirty = False
+        self._saved_rev = self._rev
         self._dirty = False
-        self._canvas.undo_stack.setClean()   # Ctrl+Z back here won't prompt to save
+        self._doc.clear_transfer_ledger()
         self._strip_baked_annotations()
         self._canvas.drop_baked_image_items()  # avoid re-baking images on the next save
         self._refresh_panel_thumbnails()  # keep panel in sync with the saved page state
@@ -920,6 +1032,64 @@ class DocumentView(QWidget):
         self._update_status(
             f"Moved {count} page{'s' if count > 1 else ''}  (Ctrl+Z to undo)")
 
+    def transfer_pages_from(self, src_view, rows: list, at: int,
+                            copy: bool = False) -> bool:
+        """Take pages out of another open document into this one, undoably.
+
+        The document half of dragging a page from one tab into another. The
+        drop handler has already decided this is a genuine cross-document move
+        (a drop back into the source is routed to the plain reorder instead),
+        and the window has already refused a cross-WINDOW one; what is left is
+        the edit.
+
+        ONE COMMAND, on the WINDOW's stack, because it changes two documents
+        and has to come back as one. See ui/undo.py and TransferPagesCommand.
+        """
+        if src_view is None or src_view is self or not self._doc.doc:
+            return False
+        if not src_view.has_document():
+            return False
+        rows = sorted({int(r) for r in rows if 0 <= int(r) < src_view.page_count()})
+        if not rows:
+            return False
+        if not copy and src_view.page_count() - len(rows) < 1:
+            # Matches the delete guard: a document has to keep a page. Refused
+            # at dragMoveEvent time as well, so the user is not left holding a
+            # drag that can never land.
+            self._update_status("A document has to keep at least one page")
+            return False
+        command = TransferPagesCommand(self, src_view, rows, at, copy=copy)
+        self.undo_stack().push(command)
+        count = len(rows)
+        pages = f"{count} page{'s' if count > 1 else ''}"
+        verb = "Copied" if copy else "Moved"
+        note = _transfer_note(command.warnings())
+        self._update_status(
+            f"{verb} {pages} from {src_view.transfer_label()}{note}"
+            "  (Ctrl+Z to undo)")
+        return True
+
+    def transfer_warning(self) -> str:
+        """What an unsaved cross-document move means for THIS document's close.
+
+        Save is per document and is never atomic across two, deliberately: this
+        is a field tool and the user has to know exactly what got written. So
+        the close prompt says what is actually at stake rather than offering a
+        "save both" button that would hide it.
+        """
+        lines = []
+        for count, name in self._doc.transfers_sent:
+            pages = f"{count} page{'s' if count > 1 else ''}"
+            lines.append(
+                f"{pages} moved out of here into {name}. Discarding leaves "
+                f"{'them' if count > 1 else 'it'} in this file AND in {name}.")
+        for count, name in self._doc.transfers_taken:
+            pages = f"{count} page{'s' if count > 1 else ''}"
+            lines.append(
+                f"{pages} moved here from {name}. Discarding loses "
+                f"{'them' if count > 1 else 'it'}.")
+        return "\n\n".join(lines)
+
     def after_page_structure_change(self):
         """Re-sync the view around a page delete or reorder, in either direction.
 
@@ -927,7 +1097,10 @@ class DocumentView(QWidget):
         markup; this is everything that hangs off that. Called by both redo() and
         undo(), so an undo lands the app in exactly the state a fresh edit would.
         """
-        self._mark_dirty()   # cleanChanged corrects this if we land back on saved
+        # Not _mark_dirty(): a page command moves the revision counter on both
+        # its redo and its undo, so undoing back to the saved state has to be
+        # able to land clean again.
+        self._sync_dirty()
         self._current_page = self._canvas.current_page()
         select = self._pending_page_selection
         self._pending_page_selection = None
@@ -953,7 +1126,7 @@ class DocumentView(QWidget):
         # Page deletion renumbers/removes items the undo stack still references;
         # clear it so a later undo can't replay against stale page indices.
         # (Mirrors _on_pages_deleted — the Organizer delete path.)
-        self._canvas.undo_stack.clear()
+        self._canvas.clear_own_history()
         self._refresh_panel_thumbnails()
         new_page = min(self._current_page, self._doc.page_count() - 1)
         self._current_page = new_page
@@ -1085,7 +1258,7 @@ class DocumentView(QWidget):
         # Reorder re-bases every item's page_num; the undo stack's commands still
         # reference the old numbering, so undo would land items on the wrong page.
         # Structural page ops are incompatible with the item-level undo stack — clear it.
-        self._canvas.undo_stack.clear()
+        self._canvas.clear_own_history()
         self._refresh_panel_thumbnails()
         self._current_page = self._canvas._current_page
         self._page_panel.set_current_page(self._current_page)
@@ -1099,7 +1272,7 @@ class DocumentView(QWidget):
             self._canvas.remove_page_annotations(row)
         # Page deletion is structurally irreversible — the undo stack holds references
         # to items on pages that no longer exist. Clear it to prevent corrupted undos.
-        self._canvas.undo_stack.clear()
+        self._canvas.clear_own_history()
         self._refresh_panel_thumbnails()
         if self._doc.doc:
             new_page = min(self._current_page, self._doc.page_count() - 1)
@@ -1174,8 +1347,7 @@ class DocumentView(QWidget):
         # Keep the left page panel's thumbnail of the current page in sync with edits.
         # Derive dirty from the undo stack so that undoing back to the saved state clears
         # the modified flag automatically (via the cleanChanged signal connection).
-        self._dirty = not self._canvas.undo_stack.isClean()
-        self._update_title()
+        self._sync_dirty()
         self._refresh_current_thumb()
 
     def _refresh_current_thumb(self):
@@ -1227,18 +1399,16 @@ class DocumentView(QWidget):
             self._dirty_announced = self._dirty
             self.dirty_changed.emit(self._dirty)
 
-    def _on_clean_changed(self, clean: bool):
-        """Fired by QUndoStack when the stack crosses the clean boundary.
-
-        `clean=True` means we've undone back to the last-saved state;
-        `clean=False` means we've moved away from it.  Sync _dirty and the title.
-        """
-        self._dirty = not clean
-        self._update_title()
-
     def _mark_dirty(self):
-        self._dirty = True
-        self._update_title()
+        """Dirt no command produced and no undo can take back.
+
+        An Organizer merge, an OCR pass, a page delete that had to clear the
+        history: all of them change the document outside the undo stack, so
+        they set a flag that only a save clears. Everything that IS undoable
+        goes through the revision counter instead (see note_revision).
+        """
+        self._forced_dirty = True
+        self._sync_dirty()
 
     def _mark_untitled(self):
         """A merge produced a derived document with no source file → force Save As."""
@@ -1253,9 +1423,11 @@ class DocumentView(QWidget):
         """Prompt to save unsaved changes. Returns True if it's safe to proceed."""
         if not self._doc.doc or not self._dirty:
             return True
+        warning = self.transfer_warning()
         reply = QMessageBox.question(
             self.window(), "Unsaved Changes",
-            "This document has unsaved changes. Save before closing?",
+            "This document has unsaved changes. Save before closing?"
+            + (f"\n\n{warning}" if warning else ""),
             QMessageBox.StandardButton.Save
             | QMessageBox.StandardButton.Discard
             | QMessageBox.StandardButton.Cancel,
