@@ -269,6 +269,35 @@ QPushButton#tool:checked:pressed {{
     border: 1px solid {p.accent_press};
 }}
 
+/* status-bar view-mode group: one segmented control, not four loose buttons.
+   The container carries the outline; the buttons inside carry only their state,
+   and the active mode is the accent (the same language as the tool rail). */
+QWidget#fitGroup {{
+    background-color: {p.surface_raised};
+    border: 1px solid {p.border};
+    border-radius: 6px;
+}}
+QToolButton#fitmode {{
+    background-color: transparent;
+    border: none;
+    border-radius: 5px;
+    color: {p.text_dim};
+    padding: 3px 6px;
+    font-size: 10px;
+    text-align: center;
+}}
+QToolButton#fitmode:hover {{
+    background-color: {p.surface_hover};
+    color: {p.text};
+}}
+QToolButton#fitmode:checked {{
+    background-color: {p.accent};
+    color: {p.accent_text};
+}}
+QToolButton#fitmode:checked:pressed {{
+    background-color: {p.accent_press};
+}}
+
 /* ---- tool buttons (color dropdowns, opacity) ----------------------- */
 QToolButton {{
     background-color: {p.surface_raised};

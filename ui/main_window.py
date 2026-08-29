@@ -2,9 +2,10 @@ import os
 import fitz
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QTabWidget,
-    QFileDialog, QMessageBox, QStatusBar, QApplication, QPushButton,
+    QFileDialog, QMessageBox, QStatusBar, QApplication,
+    QToolButton, QButtonGroup,
 )
-from PySide6.QtCore import QSettings, QTimer, Qt
+from PySide6.QtCore import QSettings, QTimer, Qt, QSize
 from PySide6.QtGui import QAction, QKeySequence, QShortcut, QIcon
 
 # Debounce for search-as-you-type: long enough that fast typing doesn't
@@ -16,6 +17,15 @@ SEARCH_DEBOUNCE_MS = 220
 # and the first PDF load should have the machine to themselves; an update is
 # never urgent enough to compete with them.
 UPDATE_CHECK_DELAY_MS = 1500
+
+# The status bar's view-mode group: (mode, qtawesome id, tooltip, text fallback).
+# The mode names match ui.canvas.FIT_MODES and core.settings' default_fit_mode.
+_FIT_CONTROLS = [
+    ("fit_page",   "mdi6.fit-to-page-outline",     "Fit page",           "Pg"),
+    ("fit_width",  "mdi6.arrow-expand-horizontal", "Fit width",          "W"),
+    ("fit_height", "mdi6.arrow-expand-vertical",   "Fit height",         "H"),
+    ("actual",     "mdi6.percent-outline",         "100% (actual size)", "100"),
+]
 
 from core.pdf_document import PDFDocument
 from core.page_ops import is_permutation
@@ -31,7 +41,7 @@ from ui.organizer import PageOrganizer
 from ui.page_jump import PageJump
 from ui.search_bar import SearchBar
 from ui.combine_dialog import CombineDialog
-from ui.theme import ThemeManager, apply_mica, themed_icon
+from ui.theme import ThemeManager, apply_mica, themed_icon, qtawesome_available, LIGHT
 
 
 class MainWindow(QMainWindow):
@@ -85,6 +95,7 @@ class MainWindow(QMainWindow):
         self._organizer.apply_palette(palette)
         self._toolbar.apply_palette(palette)
         self._update_notice.apply_palette(palette)
+        self._retint_fit_icons(palette)
         if hasattr(self, "_theme_action"):
             dark = self._theme.is_dark
             self._theme_action.setText("Light Mode" if dark else "Dark Mode")
@@ -177,20 +188,52 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self._status)
         self._status.showMessage("Open a PDF to start  (Ctrl+O)")
 
-        # Page box, immediately left of the Fit button. Permanent widgets are laid
+        # Page box, immediately left of the fit group. Permanent widgets are laid
         # out left to right in the order they're added, so this one is added first.
         self._page_jump = PageJump()
         self._page_jump.page_requested.connect(self._on_page_jump)
         self._status.addPermanentWidget(self._page_jump)
 
-        self._fit_btn = QPushButton("Fit")
-        self._fit_btn.setCheckable(True)
-        self._fit_btn.setFixedWidth(40)
-        self._fit_btn.setFlat(True)
-        self._fit_btn.setToolTip("Fit page to view (toggle)")
-        self._fit_btn.toggled.connect(self._on_fit_toggled)
+        self._status.addPermanentWidget(self._build_fit_group())
         self._canvas.fit_mode_broken.connect(self._on_fit_mode_broken)
-        self._status.addPermanentWidget(self._fit_btn)
+
+    def _build_fit_group(self) -> QWidget:
+        """The view-mode control: one icon per mode, exactly one of them active.
+
+        Was a single text "Fit" button that only ever meant fit-page. The four
+        modes are siblings, so they read as a group of icons with the mode named
+        in the tooltip rather than a lone word that has to stand for all of them.
+        """
+        box = QWidget()
+        box.setObjectName("fitGroup")
+        row = QHBoxLayout(box)
+        row.setContentsMargins(2, 2, 2, 2)
+        row.setSpacing(1)
+
+        self._fit_group = QButtonGroup(self)
+        self._fit_group.setExclusive(True)
+        self._fit_btns: dict[str, QToolButton] = {}
+        for mode, icon, tip, fallback in _FIT_CONTROLS:
+            btn = QToolButton()
+            btn.setObjectName("fitmode")
+            btn.setCheckable(True)
+            btn.setToolTip(tip)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            glyph = themed_icon(icon, LIGHT.text_dim) if qtawesome_available() else QIcon()
+            if glyph.isNull():
+                # No icon font on this machine, or a glyph id this version of the
+                # font doesn't carry: a short label beats an invisible button.
+                # Same fallback the page strip and the toolbar use.
+                btn.setText(fallback)
+                btn.setStyleSheet("font-size: 10px;")
+            else:
+                btn.setIcon(glyph)
+                btn.setIconSize(QSize(15, 15))
+            btn.clicked.connect(lambda _, m=mode: self._on_fit_clicked(m))
+            self._fit_group.addButton(btn)
+            self._fit_btns[mode] = btn
+            row.addWidget(btn)
+        return box
 
     def _setup_menu(self):
         mb = self.menuBar()
@@ -304,7 +347,8 @@ class MainWindow(QMainWindow):
         menu.addAction(action)
 
     def _setup_shortcuts(self):
-        for key, tool in [("v", "select"), ("r", "rect"), ("l", "line"), ("t", "text")]:
+        for key, tool in [("v", "select"), ("h", "pan"), ("r", "rect"),
+                          ("l", "line"), ("t", "text")]:
             sc = QShortcut(key, self)
             sc.activated.connect(lambda t=tool: self._toolbar.trigger_tool(t))
 
@@ -1048,14 +1092,33 @@ class MainWindow(QMainWindow):
             self._status.showMessage(extra or "Open a PDF to start  (Ctrl+O)")
             self._page_jump.set_total(0)
 
-    def _on_fit_toggled(self, checked: bool):
-        self._canvas.set_fit_mode(checked)
+    def _on_fit_clicked(self, mode: str):
+        self._canvas.set_fit_mode(mode)
+        self._retint_fit_icons(self._theme.palette)
+
+    def _retint_fit_icons(self, palette):
+        """The active mode sits on an accent fill, so its glyph has to flip to the
+        on-accent color. Qt won't swap a QIcon by QSS state, so it happens here."""
+        if not qtawesome_available() or not hasattr(self, "_fit_btns"):
+            return
+        icons = {mode: icon for mode, icon, _, _ in _FIT_CONTROLS}
+        for mode, btn in self._fit_btns.items():
+            if btn.icon().isNull():
+                continue          # this one fell back to a text label
+            color = palette.accent_text if btn.isChecked() else palette.text_dim
+            btn.setIcon(themed_icon(icons[mode], color))
 
     def _on_fit_mode_broken(self):
-        # User zoomed manually — turn the button off without re-triggering the signal.
-        self._fit_btn.blockSignals(True)
-        self._fit_btn.setChecked(False)
-        self._fit_btn.blockSignals(False)
+        # User zoomed manually, so no mode is active any more. An exclusive
+        # QButtonGroup refuses to leave every button unchecked, so exclusivity
+        # comes off for the one call that clears it.
+        checked = self._fit_group.checkedButton()
+        if checked is None:
+            return
+        self._fit_group.setExclusive(False)
+        checked.setChecked(False)
+        self._fit_group.setExclusive(True)
+        self._retint_fit_icons(self._theme.palette)
 
     # ------------------------------------------------------------------
     # Unsaved-changes (dirty) + untitled (merged) state
