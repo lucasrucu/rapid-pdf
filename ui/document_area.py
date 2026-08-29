@@ -977,7 +977,7 @@ class DocumentArea(QWidget):
         """One empty tab is what "no document open" looks like, and a bar with
         a single blank tab on it is worse than no bar at all."""
         views = self.views()
-        show = len(views) > 1 or (len(views) == 1 and views[0].has_document())
+        show = len(views) > 1 or (len(views) == 1 and not views[0].is_empty())
         self._header.setVisible(show)
         self._chevron.setVisible(len(views) > 1)
 

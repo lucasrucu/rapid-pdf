@@ -1220,6 +1220,28 @@ class PDFCanvas(QGraphicsView):
     def fit_mode(self):
         return self._fit_mode
 
+    def view_scale(self) -> float:
+        """How far the view is zoomed, as the scale on its transform.
+
+        NOT `self._zoom`, which is the RASTER scale the page was rendered at
+        and is a fixed 1.5. This is the number a fit mode sets and Ctrl+wheel
+        changes, so it is the one worth remembering between runs.
+        """
+        return self.transform().m11()
+
+    def set_view_scale(self, scale: float):
+        """Put the view back at a remembered zoom.
+
+        Deliberately does not touch `_fit_mode`: session restore applies the
+        saved fit when there was one and this when there was not, and a caller
+        that wants both would be asking for two different things.
+        """
+        if scale <= 0:
+            return
+        self.resetTransform()
+        self.scale(scale, scale)
+        self._clamp_zoom_to_min()
+
     def _apply_fit_if_active(self):
         """Called after page load or resize. Re-applies the view mode if one is
         set, so a fit survives a page turn and a window resize."""

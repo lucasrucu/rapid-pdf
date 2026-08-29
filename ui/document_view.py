@@ -64,6 +64,13 @@ windows.
 Releasing a clone on every tab switch is also what made known bug 6 fire
 reliably rather than intermittently, which is why it was fixed in the same
 phase. See `_refresh_organizer`.
+
+PHASE 6 ADDED THE PENDING TAB, which is a view that stands for a file it has
+not read yet. `stage_path` claims one, `ensure_loaded` opens it, and
+`set_active` is what calls that: a restored tab is opened the first time it
+comes to the front and never before. Everything that used to ask
+`has_document()` to mean "is this tab free" asks `is_empty()` instead, because
+a pending tab is spoken for with nothing loaded in it. See ui/session.py.
 """
 
 import os
@@ -172,6 +179,15 @@ class DocumentView(QWidget):
         # code-drawn surfaces and hands the palette to the Combine dialog.
         self._theme = theme
         self._doc = PDFDocument()
+        # A file this tab STANDS FOR but has not opened yet. Session restore is
+        # the only thing that sets it (see ui/session.py): eight A1 drawings
+        # opened at once before the window is usable would make startup feel
+        # broken, and opening big drawings fast is the whole pitch. The tab
+        # exists, is named after the path, and calls PDFDocument.open() the
+        # first time it is brought to the front. `_pending_view` is the page,
+        # zoom and fit to land on when that happens.
+        self._pending_path = None
+        self._pending_view: dict = {}
         self._current_page = 0
         self._org_render = None  # throwaway clone backing the Organizer's markup thumbnails
         self._panel_render = None  # throwaway clone backing the left page panel's thumbnails
@@ -302,6 +318,20 @@ class DocumentView(QWidget):
     def has_document(self) -> bool:
         return self._doc.doc is not None
 
+    def is_pending(self) -> bool:
+        """A restored tab that has not been opened yet. See `_pending_path`."""
+        return self._pending_path is not None and self._doc.doc is None
+
+    def is_empty(self) -> bool:
+        """Nothing open and nothing on the way: the blank tab a window starts with.
+
+        `not has_document()` used to be the whole question, and a lazy tab is
+        the case that made it two. Everywhere that means "is this tab free to
+        open something into" asks this instead, because a pending tab is spoken
+        for even though nothing is loaded in it yet.
+        """
+        return self._doc.doc is None and self._pending_path is None
+
     def page_count(self) -> int:
         return self._doc.page_count()
 
@@ -309,13 +339,18 @@ class DocumentView(QWidget):
         return self._current_page
 
     def document_path(self):
-        """The file this document came from, or None for an untitled merge."""
-        return self._doc.path
+        """The file this document came from, or None for an untitled merge.
+
+        A pending tab answers with the file it is going to open, which is what
+        makes the tab label, the tooltip, the duplicate-tab check and
+        `WindowRegistry.find_by_path` all work on a tab nobody has opened yet.
+        """
+        return self._doc.path if self._doc.doc else self._pending_path
 
     def document_name(self):
         """The basename a title should show, or None with nothing open."""
         if not self._doc.doc:
-            return None
+            return os.path.basename(self._pending_path) if self._pending_path else None
         return os.path.basename(self._doc.path) if self._doc.path else "Untitled"
 
     def is_dirty(self) -> bool:
@@ -331,6 +366,14 @@ class DocumentView(QWidget):
         for some other tab.
         """
         return self._canvas.fit_mode()
+
+    def view_scale(self) -> float:
+        """How far this canvas is zoomed. Saved with the session; see fit_mode.
+
+        Only worth restoring when no fit mode is active, because a fit
+        recomputes the scale from the window size the moment it is applied.
+        """
+        return self._canvas.view_scale()
 
     def refresh_chrome(self):
         """Re-announce everything the window's chrome reads off this view.
@@ -482,7 +525,15 @@ class DocumentView(QWidget):
         What deliberately stays: the live fitz document and the canvas scene.
         Those are what make a tab switch instant, and what finding 2 in the
         plan proved survive a move between windows.
+
+        AND IT IS WHERE A RESTORED TAB IS OPENED, above the early return rather
+        than below it. A view is built with `_active` already True (nothing is
+        gained by making a brand new view rebuild what it has not built), so
+        the first tab of a restored window is made current without `_active`
+        ever changing, and a load hung off the flag would never run for it.
         """
+        if active:
+            self.ensure_loaded()
         if active == self._active:
             return
         self._active = active
@@ -535,6 +586,8 @@ class DocumentView(QWidget):
 
     def teardown(self):
         """Release everything this view owns, on the way out for good."""
+        self._pending_path = None
+        self._pending_view = {}
         self._close_org_render()
         self._close_panel_render()
         self._doc.close()
@@ -593,6 +646,63 @@ class DocumentView(QWidget):
         self._refresh_panel_thumbnails()
         self._apply_default_fit()
         self._update_status()
+        return True
+
+    def stage_path(self, path: str, page: int = 0, zoom: float = 0.0,
+                   fit_mode: str | None = None) -> bool:
+        """Claim this empty view for a file WITHOUT opening it. Restore only.
+
+        The tab that results is named after `path` and behaves like an open tab
+        everywhere the name is what matters (the label, the tooltip, the
+        already-open check, the close prompt). What it does not do is read the
+        file, which is the point: a window of eight A1 drawings comes up as
+        fast as an empty one and each document is read when it is first looked
+        at. `ensure_loaded` is where that happens.
+        """
+        if self._doc.doc or not path:
+            return False
+        self._pending_path = path
+        self._pending_view = {"page": page, "zoom": zoom, "fit_mode": fit_mode}
+        self.title_changed.emit()
+        return True
+
+    def ensure_loaded(self) -> bool:
+        """Open a pending tab's file, now. True if there was one to open.
+
+        Driven by `set_active`, so the first time a restored tab comes to the
+        front it becomes an ordinary open document and every later question
+        about it is answered the ordinary way. A file that has gone since the
+        session was saved reports itself through `open_path`'s message box,
+        which is the right amount of noise for one tab the user just clicked;
+        the whole-session case is filtered before any of these are made (see
+        ui/session.py).
+        """
+        path = self._pending_path
+        if path is None or self._doc.doc:
+            return False
+        # Cleared FIRST. open_path refuses to run against a view it thinks is
+        # already spoken for, and a failed open must leave an ordinary empty
+        # tab rather than one that tries again on every switch.
+        self._pending_path = None
+        wanted = self._pending_view
+        self._pending_view = {}
+        if not self.open_path(path):
+            self.title_changed.emit()
+            return True
+        page = wanted.get("page") or 0
+        if 0 < page < self._doc.page_count():
+            self.jump_to_page(page)
+        fit = wanted.get("fit_mode")
+        if fit:
+            self.set_fit_mode(fit)
+        else:
+            zoom = wanted.get("zoom") or 0.0
+            if zoom > 0:
+                # No fit mode was active when this was saved, so the canvas was
+                # at a hand-set zoom. `_apply_default_fit` has already put a fit
+                # on it by now; taking that off is what restores what was there.
+                self._canvas.set_fit_mode(None)
+                self._canvas.set_view_scale(zoom)
         return True
 
     def combine_pdfs(self):
@@ -690,7 +800,16 @@ class DocumentView(QWidget):
         """Close the current document so the next Open starts fresh instead of
         appending. False when there was nothing open, or the user cancelled."""
         if not self._doc.doc:
-            return False
+            if self._pending_path is None:
+                return False
+            # A restored tab nobody ever opened. There is no document to save
+            # and nothing to release, so closing it is forgetting the file it
+            # stood for. Answering False here would make Ctrl+W a dead key on
+            # every tab of a freshly restored window.
+            self._pending_path = None
+            self._pending_view = {}
+            self._update_status()
+            return True
         if not self.maybe_save_before_close():
             return False
         self.clear_document()
