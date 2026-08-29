@@ -551,14 +551,29 @@ def test_the_page_panel_toggle_stays_on_the_menu_and_moves_the_view(win):
     assert not win.view._page_panel.isHidden()
 
 
-def test_open_paths_still_appends_in_this_phase(win, tmp_path):
-    """Explicitly pinned: removing the append is phase 2's job, and doing it
-    here would have made this diff unreviewable."""
+def test_open_paths_no_longer_appends_into_the_open_document(win, tmp_path):
+    """CHANGED ON PURPOSE IN PHASE 2, and the point of the phase.
+
+    This test used to assert the opposite: opening a second file appended its
+    pages onto the end of the first, taking a three-page document to four. That
+    was not a weak test, it was an accurate one, and the behaviour it described
+    is the single worst thing the app did. Opening a second PDF silently merged
+    it into the one on screen and the next Save wrote the merge over the file.
+
+    A second file is a second tab. The first document is untouched, which is
+    the half that matters: `page_count() == 3` on the original view is the
+    assertion that would have failed under the old behaviour.
+    """
     extra = tmp_path / "one_more.pdf"
     raw = fitz.open()
     raw.new_page(width=400, height=500)
     raw.save(str(extra))
     raw.close()
 
+    first = win.view
     win.open_paths([str(extra)])
-    assert win.view.page_count() == 4
+
+    assert win.document_area().count() == 2
+    assert first.page_count() == 3, "the open document was appended to"
+    assert win.view is not first
+    assert win.view.page_count() == 1

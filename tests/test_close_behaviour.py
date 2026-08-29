@@ -216,13 +216,22 @@ def test_quit_is_on_ctrl_q_not_the_exit_media_key(win):
     assert action.shortcut().toString() == "Ctrl+Q"
 
 
-def test_close_pdf_empties_the_window_without_closing_it(win, never_prompts):
-    """What Ctrl+W is wired to. The document goes, the window and its
-    Organizer grid are emptied, and nothing quits."""
+def test_close_pdf_empties_the_only_tab_and_takes_the_window_with_it(win,
+                                                                     never_prompts):
+    """CHANGED ON PURPOSE IN PHASE 2.
+
+    What Ctrl+W is wired to. The document goes and the Organizer grid empties,
+    exactly as before; what is new is that this was the last tab, and closing
+    the last tab closes the window, the way it does in every other tabbed app.
+    The old name claimed the window survived. Nothing asserted it, and under
+    tabs it no longer does. tests/test_document_tabs.py covers Ctrl+W on one
+    tab of several, where the window stays and the other tabs do not move.
+    """
     win.close_pdf()
     assert win.view._doc.doc is None
     assert win.view._current_page == 0
     assert win.view._organizer._list.count() == 0
+    assert not win.isVisible()
 
 
 # ---------------------------------------------------------------------------

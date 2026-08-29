@@ -70,19 +70,51 @@ strip keeps its own size.
 
 | Key | Action |
 |---|---|
-| `Ctrl+O` | Open / combine PDFs |
+| `Ctrl+O` | Open PDFs, one tab each |
 | `Ctrl+S` | Save |
 | `Ctrl+Shift+S` | Save As |
-| `Ctrl+W` | Close the PDF, leaving the window open |
+| `Ctrl+W` | Close the current tab |
 | `Ctrl+Q` | Quit |
 
-The window's X closes the app. To have it close the PDF and leave an empty
-window instead (which is what Rapid PDF did up to 1.5.0), pick the second
-choice under Closing in Edit > Preferences. Either way, unsaved changes are
-prompted for first and cancelling the prompt cancels the close.
+Opening a second PDF gives it a second tab. It no longer appends its pages to
+the document you are reading, which is what it did up to 1.5.0. To merge files,
+ask for it by name: `File > Combine PDFs`, or `+ Add Pages` in the Organizer.
+
+The window's X closes the window and everything in it. To have it close the
+front PDF and leave the window up instead (which is what Rapid PDF did up to
+1.5.0), pick the second choice under Closing in Edit > Preferences. Either way,
+unsaved changes are prompted for first, once per document, and cancelling any
+of those prompts cancels the whole close.
 
 Open and Save As start in the last folder you used. Edit > Preferences can pin
 them to one folder instead.
+
+## Tabs
+
+| Key | Action |
+|---|---|
+| `Ctrl+T` | New tab |
+| `Ctrl+W` | Close the current tab |
+| `Ctrl+PgDn` / `Ctrl+PgUp` | Next / previous tab, wrapping |
+| Middle-click a tab | Close it |
+| Double-click empty bar space | New tab |
+| Drag a tab | Reorder it |
+| Right-click a tab | Close, Close Others, Close to the Right, Duplicate Tab, Copy Full Path, Open Containing Folder |
+
+Closing the last tab closes the window. A tab with unsaved changes shows a dot
+where its close button would be; hover it and the dot becomes the X again.
+
+Tabs are named by the filename without `.pdf`, and two files with the same name
+grow as much of their folder path as it takes to tell them apart. The full path
+is in the tooltip. The chevron at the right of the bar lists every open
+document, which is the answer when there are more tabs than fit.
+
+Opening a file that is already open activates its tab rather than opening a
+second copy of it.
+
+Several documents open and none of them unsaved, and the X asks before closing
+them all. Turn that off under Closing in Edit > Preferences. Unsaved documents
+are always asked about, whatever that setting says.
 
 ## Preferences
 

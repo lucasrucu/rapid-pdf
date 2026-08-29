@@ -1,8 +1,9 @@
 """The application shell: menus, status bar, theme, updates, window lifetime.
 
-It holds exactly ONE DocumentView (ui/document_view.py), which owns the open
-PDF and everything that belongs to it. Phase 1 of docs/tabs-plan.md: the window
-used to BE the document, and nothing could hold a second one.
+It holds a DocumentArea (ui/document_area.py), which is a tab bar over a stack
+of DocumentViews. Phase 2 of docs/tabs-plan.md. `MainWindow.view` is the FRONT
+document, which is the only thing that changed for everything reaching through
+it: phase 1 wrote every one of those call sites so this would be the only edit.
 
 WHAT LIVES UP HERE, AND WHY. Chrome, and only chrome. The menu bar, the status
 bar, the update strip, Preferences, the theme, `_force_quit` and `closeEvent`.
@@ -17,14 +18,26 @@ Three of those controls act on a document and still belong here:
     one owner is the point. Only the applying goes down to the canvas.
   - the single-key TOOL SHORTCUTS (v/h/r/l/t). Two live DocumentViews would
     each own a window-context QShortcut for "v", which Qt reports as ambiguous
-    and then routes to neither.
+    and then routes to neither. They stay here and reach the front view only,
+    through the `view` property.
 
 The search bar went the other way and lives in the view: its hits are page
 numbers in one particular document.
 
-WHAT PHASE 2 HAS TO REBIND. Everything reached through `self._view`, plus the
-Edit menu's Undo/Redo actions, which are built from the front view's undo stack
-(`QUndoStack.createUndoAction`) and so are bound to one document's history.
+WHAT IS REBOUND ON A TAB SWITCH, which is where the bugs in this phase live.
+`_on_front_view_changed` is the single place it happens:
+
+  - the five chrome signals, disconnected from the tab leaving and connected to
+    the one arriving (`_connect_view` / `_disconnect_view`). Leave them all
+    connected and a background document writes the status bar.
+  - the Edit menu's UNDO and REDO, which `QUndoStack.createUndoAction` binds to
+    one stack for the life of the action, so they are rebuilt rather than
+    re-pointed (`_rebuild_undo_actions`).
+  - the status bar's page box, and the window title, both re-read off the
+    arriving view (`DocumentView.refresh_chrome`).
+  - the fit group, which follows the arriving CANVAS rather than the remembered
+    setting, because a manual zoom breaks the fit on one canvas only
+    (`_sync_fit_group`).
 """
 
 from PySide6.QtWidgets import (
@@ -55,6 +68,7 @@ from core.resources import app_icon_path
 from core.version import APP_VERSION
 from ui.update_notice import UpdateNotice
 from ui.canvas import FIT_MODES
+from ui.document_area import DocumentArea
 from ui.document_view import DocumentView
 from ui.preferences_dialog import PreferencesDialog
 from ui.page_jump import PageJump
@@ -72,18 +86,26 @@ class MainWindow(QMainWindow):
         self._prefs_dialog = None  # the one Preferences window, while it is open
         # Theme: use the passed-in manager, or stand one up (e.g. tests/smoke).
         self._theme = theme or ThemeManager(QApplication.instance())
-        # The one open document, and everything that belongs to it. Built here
-        # rather than in _setup_ui so the title below has something to read.
-        self._view = DocumentView(self._theme)
+        # Every open document in this window, one tab each. Empty for now: the
+        # first view is added at the end of this method, once the chrome it
+        # drives (status bar, page box, Edit menu) exists to be driven.
+        self._area = DocumentArea()
+        self._area.current_view_changed.connect(self._on_front_view_changed)
+        self._area.view_close_requested.connect(self._on_view_close_requested)
+        self._area.new_tab_requested.connect(self.new_tab)
+        self._area.duplicate_requested.connect(self._duplicate_tab)
+        self._area.tab_close_requested.connect(self.close_tab)
         self._force_quit = False # Quit menu wants a real app quit, not "close PDF"
         self._session_ending = False  # Windows is ending the session; never block it
-        self._update_title()
         self.setMinimumSize(1100, 720)
         icon_path = app_icon_path()
         if icon_path:
             self.setWindowIcon(QIcon(icon_path))
         self._setup_ui()
         self._setup_menu()
+        # The first tab. Last, because adding it makes it the front view, and
+        # everything that fires on that reaches for chrome built above.
+        self._area.add_view(self._new_view())
         self._setup_shortcuts()
         # Code-drawn surfaces (the canvas page backdrop) follow the theme too.
         self._apply_theme_surfaces(self._theme.palette)
@@ -98,18 +120,41 @@ class MainWindow(QMainWindow):
 
     @property
     def view(self) -> DocumentView:
-        """The document this window is showing.
+        """The FRONT document of however many this window is holding.
 
-        Phase 2 makes this the FRONT one of several. Everything that reaches
-        through it is written so that stays the only change.
+        Phase 1 wrote every call site through this property so that phase 2
+        only had to change what it returns. None only during construction,
+        before the first tab is added.
         """
-        return self._view
+        return self._area.current_view()
+
+    def document_area(self) -> DocumentArea:
+        """The tab bar and the views under it. For tests and Preferences."""
+        return self._area
+
+    def _new_view(self) -> DocumentView:
+        """Build a document view and wire what it needs for its whole life.
+
+        The chrome signals are NOT wired here: those belong to whichever view
+        is in front, and `_connect_view` binds them on the switch. What is
+        wired here is the two the view raises no matter where it sits, both of
+        which are decisions about tabs and therefore the window's.
+        """
+        view = DocumentView(self._theme)
+        view.apply_palette(self._theme.palette)
+        if hasattr(self, "_panel_action"):
+            view.set_page_panel_visible(self._panel_action.isChecked())
+        view.paths_requested.connect(self.open_paths)
+        view.combine_requested.connect(self.combine_paths)
+        return view
 
     def _apply_theme_surfaces(self, palette):
         """Re-tint the bits QSS can't reach: the canvas backdrop and its selection
         chrome, the thumbnail delegates, the toggle action's icon/label, and the
         Mica header on a switch."""
-        self._view.apply_palette(palette)
+        for view in self._area.views():
+            view.apply_palette(palette)
+        self._area.apply_palette(palette)
         self._update_notice.apply_palette(palette)
         self._retint_fit_icons(palette)
         if hasattr(self, "_theme_action"):
@@ -137,9 +182,9 @@ class MainWindow(QMainWindow):
         self._update_notice.staged_ready.connect(self._on_update_staged)
         root.addWidget(self._update_notice)
 
-        # The document, in the same place in the layout the Editor/Organizer
-        # switcher used to sit (that switcher is now inside it).
-        root.addWidget(self._view)
+        # The tab bar and the documents under it, in the same place in the
+        # layout the Editor/Organizer switcher used to sit.
+        root.addWidget(self._area)
 
         self._status = QStatusBar()
         self.setStatusBar(self._status)
@@ -153,21 +198,95 @@ class MainWindow(QMainWindow):
 
         self._status.addPermanentWidget(self._build_fit_group())
 
-        # Last, so every piece of chrome a view drives already exists.
-        self._connect_view(self._view)
+    # ------------------------------------------------------------------
+    # Binding the chrome to whichever document is in front
+    # ------------------------------------------------------------------
+
+    #: The signals the window's chrome follows. Exactly one view is connected
+    #: to them at a time: a background document that could still write the
+    #: status bar or move the page box is the whole class of bug this phase
+    #: had to avoid.
+    _CHROME_SIGNALS = (
+        ("title_changed", "_update_title"),
+        ("status_message", "_status_message"),
+        ("page_changed", "_on_view_page_changed"),
+        ("fit_mode_broken", "_on_fit_mode_broken"),
+        ("default_fit_requested", "_apply_default_fit"),
+    )
 
     def _connect_view(self, view: DocumentView):
-        """Wire one document view to the window chrome it drives.
+        """Wire the front document view to the window chrome it drives."""
+        for signal, slot in self._CHROME_SIGNALS:
+            getattr(view, signal).connect(getattr(self, slot))
 
-        A method rather than five lines inline because phase 2 runs it once per
-        tab, and the disconnect that pairs with it goes next to it.
+    def _disconnect_view(self, view: DocumentView):
+        """Unwire a view that is no longer in front.
+
+        Tolerant of a connection that is not there: a view can leave the front
+        without ever having reached it (a tab closed while another was
+        current), and a missing disconnect is not worth an exception on a
+        switch.
         """
-        view.title_changed.connect(self._update_title)
-        view.status_message.connect(self._status_message)
-        view.page_changed.connect(self._on_view_page_changed)
-        view.fit_mode_broken.connect(self._on_fit_mode_broken)
-        view.default_fit_requested.connect(self._apply_default_fit)
-        view.close_requested.connect(self._on_view_close_requested)
+        for signal, slot in self._CHROME_SIGNALS:
+            try:
+                getattr(view, signal).disconnect(getattr(self, slot))
+            except (RuntimeError, TypeError):
+                pass
+
+    def _on_front_view_changed(self, previous, current):
+        """A different document came to the front. Rebind everything it drives."""
+        if previous is not None:
+            self._disconnect_view(previous)
+        if current is None:
+            self._page_jump.set_total(0)
+            self._update_title()
+            return
+        self._connect_view(current)
+        self._rebuild_undo_actions()
+        self._sync_fit_group(current)
+        # Re-announces the title, the status line and the page, so all three
+        # stop showing the tab that just left.
+        current.refresh_chrome()
+
+    def _rebuild_undo_actions(self):
+        """Point Edit > Undo / Redo at the front document's history.
+
+        Rebuilt rather than re-pointed. `QUndoStack.createUndoAction` binds an
+        action to ONE stack for the life of that action, and there is one stack
+        per document because `PDFCanvas.set_document` clears it, so a canvas
+        can never serve two. The old pair comes out of the menu first: two
+        actions carrying Ctrl+Z at once is an ambiguous shortcut to Qt.
+        """
+        view = self.view
+        if view is None:
+            return
+        for action in (self._undo_action, self._redo_action):
+            if action is not None:
+                self._edit_menu.removeAction(action)
+                action.setParent(None)
+        stack = view.undo_stack()
+        self._undo_action = stack.createUndoAction(self, "Undo")
+        self._undo_action.setShortcut(QKeySequence.StandardKey.Undo)
+        self._redo_action = stack.createRedoAction(self, "Redo")
+        self._redo_action.setShortcut(QKeySequence.StandardKey.Redo)
+        self._edit_menu.insertAction(self._undo_anchor, self._undo_action)
+        self._edit_menu.insertAction(self._undo_anchor, self._redo_action)
+
+    def _sync_fit_group(self, view: DocumentView):
+        """Show the fit the ARRIVING canvas is actually in.
+
+        Not the remembered setting. `view.default_fit_mode` is one app-wide
+        value, but a manual zoom breaks the fit on one canvas and leaves the
+        setting alone, so reading the setting here would light up a mode for a
+        tab that is not in it.
+        """
+        mode = view.fit_mode()
+        button = self._fit_btns.get(mode) if mode else None
+        if button is not None:
+            button.setChecked(True)
+            self._retint_fit_icons(self._theme.palette)
+            return
+        self._clear_fit_group()
 
     def _status_message(self, text: str):
         self._status.showMessage(text)
@@ -178,19 +297,12 @@ class MainWindow(QMainWindow):
         The box is window chrome driven by document state, which is why it
         follows a signal instead of being poked from inside the view.
         """
-        if self._view.has_document():
-            self._page_jump.set_total(self._view.page_count())
+        view = self.view
+        if view is not None and view.has_document():
+            self._page_jump.set_total(view.page_count())
             self._page_jump.set_current_page(page_num)
         else:
             self._page_jump.set_total(0)
-
-    def _on_view_close_requested(self):
-        """The view was asked to go (File > Close PDF).
-
-        Nothing to do while the window holds exactly one: it stays, emptied,
-        which is what Close PDF has always done. Phase 2 is where the tab goes
-        with it, and this is the seam it hangs off.
-        """
 
     def _build_fit_group(self) -> QWidget:
         """The view-mode control: one icon per mode, exactly one of them active.
@@ -234,7 +346,11 @@ class MainWindow(QMainWindow):
         mb = self.menuBar()
 
         fm = mb.addMenu("File")
-        self._add_action(fm, "Open / Combine PDFs…", self.open_pdf, QKeySequence.StandardKey.Open)
+        self._add_action(fm, "New Tab", self.new_tab, "Ctrl+T")
+        # Was "Open / Combine PDFs…". Opening several files is N tabs now, not
+        # a merge, so the one verb no longer covers both and Combine has to be
+        # asked for by name.
+        self._add_action(fm, "Open PDFs…", self.open_pdf, QKeySequence.StandardKey.Open)
         self._add_action(fm, "Combine PDFs…", self.combine_pdfs)
         self._add_action(fm, "Close PDF", self.close_pdf, "Ctrl+W")
         fm.addSeparator()
@@ -250,16 +366,14 @@ class MainWindow(QMainWindow):
         self._add_action(fm, "Quit", self._quit_app, "Ctrl+Q")
 
         em = mb.addMenu("Edit")
-        # Bound to the front view's stack. Phase 2 rebuilds these on a tab
-        # switch; there is one history per document and no way around that
-        # (PDFCanvas.set_document clears the stack).
-        undo_act = self._view.undo_stack().createUndoAction(self, "Undo")
-        undo_act.setShortcut(QKeySequence.StandardKey.Undo)
-        redo_act = self._view.undo_stack().createRedoAction(self, "Redo")
-        redo_act.setShortcut(QKeySequence.StandardKey.Redo)
-        em.addAction(undo_act)
-        em.addAction(redo_act)
-        em.addSeparator()
+        self._edit_menu = em
+        # Undo/Redo are bound to the FRONT view's stack and rebuilt on every
+        # tab switch (see _rebuild_undo_actions). They do not exist yet: the
+        # first view is added after the menus are built. The separator below is
+        # the anchor they get inserted in front of.
+        self._undo_action = None
+        self._redo_action = None
+        self._undo_anchor = em.addSeparator()
         self._add_action(em, "Find…", self._open_search, QKeySequence.StandardKey.Find)
         em.addSeparator()
         self._add_action(em, "Copy", self.copy_selection, QKeySequence.StandardKey.Copy)
@@ -286,8 +400,11 @@ class MainWindow(QMainWindow):
         vm.addAction(self._panel_action)
         panel_visible = settings().view.page_panel_visible
         self._panel_action.setChecked(panel_visible)
-        # setChecked(False) fires no toggle, so the panel is set directly too.
-        self._view.set_page_panel_visible(panel_visible)
+        # Views are built after this runs and read the action for their initial
+        # state (see _new_view), so there is nothing to set directly here.
+        vm.addSeparator()
+        self._add_action(vm, "Next Tab", self.next_tab, "Ctrl+PgDown")
+        self._add_action(vm, "Previous Tab", self.previous_tab, "Ctrl+PgUp")
         vm.addSeparator()
         self._theme_action = QAction("Dark Mode", self)
         self._theme_action.setShortcut("Ctrl+D")
@@ -351,6 +468,20 @@ class MainWindow(QMainWindow):
             "<p>Fast PDF annotation and page organization.</p>"
             "<p>Copyright (c) 2026 Lucas Ruiz</p>")
 
+    def _maybe_save_every_tab(self) -> bool:
+        """Put the unsaved-changes question to every open document in turn.
+
+        Cancel anywhere aborts the whole close, and the tabs already answered
+        for stay answered: the ones that were saved are saved, the ones that
+        were discarded are still dirty and will ask again next time. That is
+        the same trade every tabbed editor makes, and the alternative (roll the
+        saves back) is not a thing that can be done to a file on disk.
+        """
+        for view in self._area.views():
+            if not view.maybe_save_before_close():
+                return False
+        return True
+
     def _on_update_staged(self, staged):
         """A verified update is on disk and the app has to close for the swap.
 
@@ -359,12 +490,13 @@ class MainWindow(QMainWindow):
         offering it. The helper is only started once closing is certain,
         because the moment it starts it is watching for this process to exit.
         """
-        if not self._view.maybe_save_before_close():
+        if not self._maybe_save_every_tab():
             self._update_notice.apply_cancelled()
             return
         if not self._update_notice.launch_swap(staged):
             return
-        self._view.mark_clean()      # the prompt above has already settled this
+        for view in self._area.views():
+            view.mark_clean()    # the prompt above has already settled these
         self._force_quit = True
         self.close()
 
@@ -372,7 +504,10 @@ class MainWindow(QMainWindow):
         self._theme.toggle()
 
     def _on_panel_toggled(self, checked: bool):
-        self._view.set_page_panel_visible(checked)
+        # One app-wide setting, so every tab moves, not just the front one.
+        # A background tab left with a stale panel would jump on activation.
+        for view in self._area.views():
+            view.set_page_panel_visible(checked)
         settings().view.page_panel_visible = checked
 
     def _add_action(self, menu, label: str, slot, shortcut=None):
@@ -383,10 +518,97 @@ class MainWindow(QMainWindow):
         menu.addAction(action)
 
     def _setup_shortcuts(self):
+        # Window level on purpose: two live views each owning a QShortcut for
+        # "v" is ambiguous to Qt, which then routes it to neither. `view` is
+        # the front one, so a single shortcut still reaches the right canvas.
         for key, tool in [("v", "select"), ("h", "pan"), ("r", "rect"),
                           ("l", "line"), ("t", "text")]:
             sc = QShortcut(key, self)
-            sc.activated.connect(lambda t=tool: self._view.trigger_tool(t))
+            sc.activated.connect(lambda t=tool: self.trigger_tool(t))
+
+    def trigger_tool(self, tool: str):
+        view = self.view
+        if view is not None:
+            view.trigger_tool(tool)
+
+    # ------------------------------------------------------------------
+    # Tabs
+    # ------------------------------------------------------------------
+
+    def new_tab(self) -> DocumentView:
+        """Ctrl+T, and a double-click on empty tab bar space."""
+        view = self._new_view()
+        self._area.add_view(view)
+        return view
+
+    def next_tab(self):
+        """Ctrl+PgDn. Positional, and wrapping.
+
+        Positional, not most-recently-used: MRU is the Ctrl+Tab ordering and it
+        is phase 3, because it needs a visit history nothing keeps yet.
+        """
+        self._area.step_current(1)
+
+    def previous_tab(self):
+        """Ctrl+PgUp."""
+        self._area.step_current(-1)
+
+    def close_tab(self, index: int) -> bool:
+        """Close one tab: its own X, its middle-click, or Ctrl+W on the front one.
+
+        A tab holding a document goes through `request_close`, which prompts
+        for unsaved changes, closes the document and then announces itself; the
+        tab-or-window decision lands in `_on_view_close_requested`. An empty
+        tab has nothing to prompt about, and the last empty tab is what an
+        empty window looks like, so closing that one does nothing at all.
+        """
+        view = self._area.view_at(index)
+        if view is None:
+            return False
+        if view.has_document():
+            return view.request_close()
+        if self._area.count() <= 1:
+            return False
+        self._area.remove_view(index)
+        return True
+
+    def _on_view_close_requested(self, view=None):
+        """A view's document has gone and the tab is what is left.
+
+        Closing the last tab closes the window, the way it does in every other
+        tabbed app. The document is already closed by the time this runs, so
+        `closeEvent` finds nothing left to prompt about.
+        """
+        if view is None:
+            view = self.view
+        if self._area.count() <= 1:
+            self.close()
+            return
+        index = self._area.index_of(view)
+        if index >= 0:
+            self._area.remove_view(index)
+
+    def _duplicate_tab(self, view: DocumentView):
+        """Tab menu > Duplicate Tab: the same file, open a second time.
+
+        Deliberately a second independent document rather than a second view of
+        one: one canvas per document is forced by `PDFCanvas.set_document`, and
+        two tabs sharing a document would share an undo stack neither of them
+        owns. Unsaved markup does not come along, because it is not in the file.
+        """
+        path = view.document_path()
+        if not path:
+            return
+        self.new_tab().open_path(path)
+
+    def _target_view(self) -> DocumentView:
+        """Somewhere empty to open into: the front tab if it is empty, else a
+        new one. This is what makes the very first Open reuse the tab that is
+        already there instead of leaving a blank one behind it."""
+        view = self.view
+        if view is not None and not view.has_document():
+            return view
+        return self.new_tab()
 
     # ------------------------------------------------------------------
     # File operations. The window owns the menu; the document owns the work,
@@ -394,58 +616,95 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def open_pdf(self):
-        self._view.open_pdf()
+        self.view.open_pdf()
 
     def open_paths(self, paths: list):
-        """Open/append the given PDF paths (shared by the Open dialog and the
-        shell/CLI launch path)."""
-        self._view.open_paths(paths)
+        """Open each PDF in its own tab.
+
+        ONE FILE, ONE TAB. This used to hand the whole list to the open
+        document, which appended every one of them onto the end of it: opening
+        a second PDF silently merged it into the one being read, and the next
+        Save wrote that merge over the file. Merging is now something you ask
+        for by name (File > Combine PDFs, or the Organizer's Add Pages).
+
+        A file that is already open activates its tab rather than opening a
+        second copy of itself.
+        """
+        for path in paths:
+            index = self._area.index_of_path(path)
+            if index >= 0:
+                self._area.set_current_index(index)
+                continue
+            self._target_view().open_path(path)
 
     def combine_pdfs(self):
-        self._view.combine_pdfs()
+        self.view.combine_pdfs()
+
+    def combine_paths(self, paths: list):
+        """Stage a combine and land the merge in a tab of its own.
+
+        The open document is no longer closed to make room for it, which was
+        the other way a merge could take a document you were reading away.
+        """
+        if not paths:
+            return
+        view = self.view
+        borrowed = view is not None and not view.has_document()
+        if not borrowed:
+            view = self.new_tab()
+        view.combine_paths(list(paths))
+        if not borrowed and not view.has_document():
+            # Cancelled at the dialog: take the empty tab away again.
+            index = self._area.index_of(view)
+            if index >= 0 and self._area.count() > 1:
+                self._area.remove_view(index)
 
     def close_pdf(self):
-        """File > Close PDF (Ctrl+W)."""
-        self._view.request_close()
+        """File > Close PDF (Ctrl+W). Closes the front TAB now."""
+        self.close_tab(self._area.current_index())
 
     def save_pdf(self) -> bool:
-        return self._view.save_pdf()
+        return self.view.save_pdf()
 
     def save_pdf_as(self) -> bool:
-        return self._view.save_pdf_as()
+        return self.view.save_pdf_as()
 
     def enhance_for_search(self):
-        self._view.enhance_for_search()
+        self.view.enhance_for_search()
 
     def copy_selection(self):
-        self._view.copy_selection()
+        self.view.copy_selection()
 
     def paste(self):
-        self._view.paste()
+        self.view.paste()
 
     def paste_image(self):
-        self._view.paste_image()
+        self.view.paste_image()
 
     def delete_current_page(self):
-        self._view.delete_current_page()
+        self.view.delete_current_page()
 
     def _open_search(self):
-        self._view.open_search()
+        self.view.open_search()
 
     def _delete_key(self):
-        self._view.delete_key()
+        self.view.delete_key()
 
     def _bring_to_front(self):
-        self._view.bring_to_front()
+        self.view.bring_to_front()
 
     def _send_to_back(self):
-        self._view.send_to_back()
+        self.view.send_to_back()
 
     def handle_cli_files(self, files: list, combine: bool):
         """One aggregated shell/CLI launch batch (see core.single_instance).
 
-        Pulls the window to the front first, since the launch came from
-        Explorer and not from the app, then hands the batch to the document.
+        Decided by VERB, not by how many files arrived. `--combine` is the
+        Explorer verb that means merge, and it opens the staged Combine dialog
+        whether it carries two files or twenty. A plain open of N files opens N
+        tabs, because that is what opening N files means now; it used to close
+        whatever was open and stage a Combine as soon as the count passed one,
+        which made "open these three drawings" destroy the document on screen.
         """
         # Un-minimize and raise: the user just acted in Explorer.
         self.setWindowState((self.windowState() & ~Qt.WindowState.WindowMinimized)
@@ -455,7 +714,10 @@ class MainWindow(QMainWindow):
         self.activateWindow()
         if not files:
             return
-        self._view.handle_cli_files(files, combine)
+        if combine:
+            self.combine_paths(files)
+        else:
+            self.open_paths(files)
 
     # ------------------------------------------------------------------
     # The status bar's page box
@@ -467,7 +729,9 @@ class MainWindow(QMainWindow):
 
     def _on_page_jump(self, page_num: int):
         """A page number was typed into the status-bar box."""
-        self._view.jump_to_page(page_num)
+        view = self.view
+        if view is not None:
+            view.jump_to_page(page_num)
 
     # ------------------------------------------------------------------
     # What Preferences edits. Narrow on purpose: the dialog holds no copy of
@@ -506,7 +770,9 @@ class MainWindow(QMainWindow):
         """
         if mode not in FIT_MODES:
             return
-        self._view.set_fit_mode(mode)
+        view = self.view
+        if view is not None:
+            view.set_fit_mode(mode)
         button = self._fit_btns.get(mode)
         if button is not None:
             button.setChecked(True)
@@ -534,9 +800,12 @@ class MainWindow(QMainWindow):
             btn.setIcon(themed_icon(icons[mode], color))
 
     def _on_fit_mode_broken(self):
-        # User zoomed manually, so no mode is active any more. An exclusive
-        # QButtonGroup refuses to leave every button unchecked, so exclusivity
-        # comes off for the one call that clears it.
+        # User zoomed manually, so no mode is active any more.
+        self._clear_fit_group()
+
+    def _clear_fit_group(self):
+        # An exclusive QButtonGroup refuses to leave every button unchecked, so
+        # exclusivity comes off for the one call that clears it.
         checked = self._fit_group.checkedButton()
         if checked is None:
             return
@@ -556,12 +825,13 @@ class MainWindow(QMainWindow):
         The view says WHEN (title_changed); the name and the dirty flag are read
         back off it here, because the title bar is the window's.
         """
-        name = self._view.document_name()
+        view = self.view
+        name = view.document_name() if view is not None else None
         if name is None:
             self.setWindowModified(False)
             self.setWindowTitle("Rapid PDF")
             return
-        self.setWindowModified(self._view.is_dirty())
+        self.setWindowModified(view.is_dirty())
         self.setWindowTitle(f"Rapid PDF — {name}[*]")
 
     def _quit_app(self):
@@ -618,19 +888,44 @@ class MainWindow(QMainWindow):
 
     def _teardown_for_quit(self):
         """Release everything the process owns, on the way out for good."""
-        # The view drops its render clones and closes its document.
-        self._view.teardown()
+        # Each view drops its render clones and closes its document.
+        for view in self._area.views():
+            view.teardown()
         # A check thread still running when the window goes is a crash on
         # exit. Bounded wait, see UpdateNotice.shutdown().
         self._update_notice.shutdown()
         settings().flush()   # writes are debounced; the timer may never fire
 
+    def _confirm_closing_several_tabs(self, count: int) -> bool:
+        """`close.confirm_multiple_tabs`, which finally has something to guard.
+
+        The key has been in the schema since phase 0 with no reader and no
+        control, because there were no tabs for it to be about. It is about
+        losing your place, not about losing your work: an unsaved document gets
+        a real save prompt of its own, and this question is skipped entirely
+        when there is one, because two dialogs asking the same thing in a row
+        is worse than one.
+        """
+        reply = QMessageBox.question(
+            self, "Close Rapid PDF",
+            f"{count} documents are open. Close them all?",
+            QMessageBox.StandardButton.Close | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Close,
+        )
+        return reply == QMessageBox.StandardButton.Close
+
     def closeEvent(self, event):
         """The X, Alt+F4, Ctrl+Q, and the session manager all land here.
 
-        Written so the tab work can extend it: the only decision that changes
-        with tabs is what `clear_document` has to clear and whether more than
-        one document is open, and both sit behind the two branches below.
+        Precedence, highest first, and none of it changed with tabs:
+
+        1. a session end is never blocked, prompted or delayed;
+        2. `close.x_closes == "document"` empties the front tab and keeps the
+           window, which is the pre-1.6 behaviour, still available;
+        3. unsaved changes are prompted for, per dirty document, and Cancel
+           anywhere aborts the whole close;
+        4. `close.confirm_multiple_tabs` asks before several tabs go at once,
+           and only when nothing is dirty (see _confirm_closing_several_tabs).
         """
         # Windows is shutting down. Anything that stalls here is what makes it
         # put up "this app is preventing shutdown", so there is no prompt and,
@@ -643,26 +938,38 @@ class MainWindow(QMainWindow):
             event.accept()
             return
 
-        # The X closes the window and the app. Setting close.x_closes to
-        # "document" restores the older behaviour: the PDF closes and an empty
-        # window stays up. The Quit menu (_force_quit) overrides either way.
-        close_document_only = (
-            self._view.has_document()
-            and not self._force_quit
-            and settings().close.x_closes == "document"
-        )
-
-        # Unsaved changes are prompted for first and the answer overrides the
-        # setting: Cancel aborts the close outright, whichever branch it was
-        # heading for.
-        if not self._view.maybe_save_before_close():
-            self._force_quit = False
-            event.ignore()
+        # The X closes the window and everything in it. Setting close.x_closes
+        # to "document" restores the older behaviour: the front PDF closes and
+        # the window stays up. The Quit menu (_force_quit) overrides either way.
+        view = self.view
+        if (view is not None and view.has_document() and not self._force_quit
+                and settings().close.x_closes == "document"):
+            if not view.maybe_save_before_close():
+                self._force_quit = False
+                event.ignore()
+                return
+            view.clear_document()
+            event.ignore()      # the window stays, empty
             return
 
-        if close_document_only:
-            self._view.clear_document()
-            event.ignore()      # the window stays, empty
+        views = self._area.views()
+        open_docs = [v for v in views if v.has_document()]
+        any_dirty = any(v.is_dirty() for v in open_docs)
+
+        # The count warning, and only when nothing is dirty: a dirty tab is
+        # about to be asked a better version of the same question.
+        if (not any_dirty and len(open_docs) > 1
+                and settings().close.confirm_multiple_tabs):
+            if not self._confirm_closing_several_tabs(len(open_docs)):
+                self._force_quit = False
+                event.ignore()
+                return
+
+        # Unsaved changes are prompted for per document, and the answer
+        # overrides the setting: Cancel aborts the close outright.
+        if not self._maybe_save_every_tab():
+            self._force_quit = False
+            event.ignore()
             return
 
         self._teardown_for_quit()

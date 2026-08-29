@@ -180,7 +180,7 @@ implements it. No custom event handling needed.
 | --- | --- | --- | --- |
 | 0 | Settings module plus close rework | 1.5 d | in progress, `feat/settings-and-close` |
 | 1 | Extract `DocumentView` from `MainWindow` | 2-3 d | **riskiest phase**, done on `refactor/document-view` |
-| 2 | Tabs in one window | 1.5-2 d | |
+| 2 | Tabs in one window | 1.5-2 d | done on `feat/document-tabs` |
 | 3 | Multi-window via `WindowRegistry`, menu item only | 1.5-2 d | |
 | 4 | Tear-off drag gesture | 1-1.5 d | |
 | 5 | Pages between tabs | 4 d | |
@@ -265,9 +265,28 @@ an edit to pass, behaviour moved, not just code. Stop and find out why.
 
 ### Phase 2: tabs in one window
 
-`QTabBar` plus `QStackedWidget` of `DocumentView`s. Open a second file, get a
-second tab. Middle-click closes (finding 3). `open_paths` stops appending.
-`handle_cli_files` opens one tab per path instead of merging.
+Done. `ui/document_area.py` holds a `DocumentTabBar` over a `QStackedWidget`,
+index-parallel, asserted by `DocumentArea.check_invariant()`. `MainWindow` holds
+one of those instead of one `DocumentView` and `MainWindow.view` is the front
+one. Middle-click closes (finding 3, and it survived replacing Qt's own close
+button with the dirty-dot one). `open_paths` no longer appends: a second file is
+a second tab, and a file already open activates its tab. `handle_cli_files`
+decides by VERB, so `--combine` stages a combine whatever the file count and a
+plain open of N files opens N tabs.
+
+Rebound on a tab switch, all in `MainWindow._on_front_view_changed`: the five
+chrome signals (`_connect_view` / `_disconnect_view`), the Edit menu's Undo and
+Redo (rebuilt, because `createUndoAction` binds an action to one stack for its
+life), the page box and the title (`DocumentView.refresh_chrome`), and the fit
+group (`_sync_fit_group`, which reads the arriving CANVAS rather than the
+app-wide setting, since a manual zoom breaks the fit on one canvas only).
+
+`close.confirm_multiple_tabs` finally has a reader and a checkbox. It is skipped
+whenever any document is dirty, because the per-document save prompt is a better
+version of the same question and two dialogs in a row are worse than one.
+
+Not done here, on purpose: MRU `Ctrl+Tab` (phase 3), "Move to New Window"
+(phase 3), background-tab clone release (phase 3, see "Memory and cost").
 
 ### Phase 3: multi-window, menu-driven
 
