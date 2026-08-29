@@ -66,35 +66,35 @@ def test_only_one_mode_can_be_active(window):
 
 def test_clicking_a_mode_tells_the_canvas(window):
     window._fit_btns["fit_height"].click()
-    assert window._canvas.fit_mode() == "fit_height"
+    assert window.view._canvas.fit_mode() == "fit_height"
 
 
 def test_nothing_is_active_until_a_mode_is_chosen(window):
     assert window._fit_group.checkedButton() is None
-    assert window._canvas.fit_mode() is None
+    assert window.view._canvas.fit_mode() is None
 
 
 def test_a_manual_zoom_puts_the_active_mode_out(window):
     """The canvas breaks the fit when the user zooms; the group has to follow."""
     window._fit_btns["fit_page"].click()
     assert window._fit_group.checkedButton() is not None
-    window._canvas.fit_mode_broken.emit()
+    window.view._canvas.fit_mode_broken.emit()
     assert window._fit_group.checkedButton() is None
 
 
 def test_the_group_can_be_used_again_after_a_break(window):
     """Clearing an exclusive group is fiddly; make sure it stays usable."""
     window._fit_btns["fit_page"].click()
-    window._canvas.fit_mode_broken.emit()
+    window.view._canvas.fit_mode_broken.emit()
     window._fit_btns["actual"].click()
-    assert window._canvas.fit_mode() == "actual"
+    assert window.view._canvas.fit_mode() == "actual"
     assert window._fit_btns["actual"].isChecked()
 
 
 def test_the_pan_tool_is_on_the_rail_and_reaches_the_canvas(window):
     """Item 2's toolbar toggle, wired end to end."""
-    assert "pan" in window._toolbar._tool_btns
-    window._toolbar.trigger_tool("pan")
-    assert window._canvas.is_panning()
-    window._toolbar.trigger_tool("select")
-    assert not window._canvas.is_panning()
+    assert "pan" in window.view._toolbar._tool_btns
+    window.view._toolbar.trigger_tool("pan")
+    assert window.view._canvas.is_panning()
+    window.view._toolbar.trigger_tool("select")
+    assert not window.view._canvas.is_panning()

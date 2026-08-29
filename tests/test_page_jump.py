@@ -208,9 +208,9 @@ def win(qt_app, pdf_path):
     window = MainWindow()
     window.open_paths([pdf_path])
     yield window
-    window._doc.close()
-    window._close_panel_render()
-    window._close_org_render()
+    window.view._doc.close()
+    window.view._close_panel_render()
+    window.view._close_org_render()
     window.deleteLater()
 
 
@@ -223,28 +223,28 @@ def test_the_box_is_in_the_status_bar(win):
 def test_a_jump_moves_the_editor_and_the_strip(win):
     win._page_jump._edit.setText("14")
     win._page_jump._edit.returnPressed.emit()
-    assert win._current_page == 13
-    assert win._canvas._current_page == 13
-    assert win._page_panel._list.currentRow() == 13
+    assert win.view._current_page == 13
+    assert win.view._canvas._current_page == 13
+    assert win.view._page_panel._list.currentRow() == 13
 
 
 def test_a_jump_moves_the_organizer_too(win):
-    win._tabs.setCurrentIndex(1)      # rebuilds the grid from the document
+    win.view._tabs.setCurrentIndex(1)      # rebuilds the grid from the document
     QApplication.processEvents()
     win._page_jump._edit.setText("17")
     win._page_jump._edit.returnPressed.emit()
-    assert win._organizer._list.currentRow() == 16
+    assert win.view._organizer._list.currentRow() == 16
 
 
 def test_the_box_follows_the_page_the_editor_moves_to(win):
-    win._on_page_selected(8)
+    win.view._on_page_selected(8)
     assert win._page_jump.current_text() == "9"
 
 
 def test_out_of_range_in_the_window_clamps_instead_of_throwing(win):
     win._page_jump._edit.setText("500")
     win._page_jump._edit.returnPressed.emit()
-    assert win._current_page == 19
+    assert win.view._current_page == 19
     assert win._page_jump.current_text() == "20"
 
 

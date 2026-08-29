@@ -164,7 +164,7 @@ def test_the_checkbox_is_bound_to_the_menu_action(prefs, window):
 def test_ticking_the_checkbox_moves_the_menu_and_the_panel(prefs, window, store):
     prefs._panel_check.setChecked(False)
     assert not window.page_panel_action().isChecked()
-    assert not window._page_panel.isVisible()
+    assert not window.view._page_panel.isVisible()
     assert store.view.page_panel_visible is False
 
 
@@ -199,7 +199,7 @@ def test_the_dropdown_names_the_modes_the_way_the_tooltips_do(prefs, window):
 def test_choosing_a_fit_applies_it_and_remembers_it(prefs, window, store):
     index = prefs._fit_combo.findData("fit_height")
     prefs._fit_combo.setCurrentIndex(index)
-    assert window._canvas.fit_mode() == "fit_height"
+    assert window.view._canvas.fit_mode() == "fit_height"
     assert window._fit_btns["fit_height"].isChecked()
     assert store.view.default_fit_mode == "fit_height"
 
@@ -215,7 +215,7 @@ def test_a_manual_zoom_clears_the_icons_but_not_the_chosen_default(prefs, window
     """Breaking a fit is not un-choosing it: the icons go out, the remembered
     mode stays, and so does the dropdown that displays it."""
     window._fit_btns["actual"].click()
-    window._canvas.fit_mode_broken.emit()
+    window.view._canvas.fit_mode_broken.emit()
     assert window._fit_group.checkedButton() is None
     assert prefs._fit_combo.currentData() == "actual"
     assert store.view.default_fit_mode == "actual"
