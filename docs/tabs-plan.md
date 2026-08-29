@@ -179,7 +179,7 @@ implements it. No custom event handling needed.
 | Phase | What | Estimate | Status |
 | --- | --- | --- | --- |
 | 0 | Settings module plus close rework | 1.5 d | in progress, `feat/settings-and-close` |
-| 1 | Extract `DocumentView` from `MainWindow` | 2-3 d | **riskiest phase** |
+| 1 | Extract `DocumentView` from `MainWindow` | 2-3 d | **riskiest phase**, done on `refactor/document-view` |
 | 2 | Tabs in one window | 1.5-2 d | |
 | 3 | Multi-window via `WindowRegistry`, menu item only | 1.5-2 d | |
 | 4 | Tear-off drag gesture | 1-1.5 d | |
@@ -493,6 +493,37 @@ after save and reopen:     [[1,'Page One',1], [1,'Page Two',-1], [1,'Page Three'
 It survives the save, so the file we write has a broken bookmark in it. Same
 applies to `delete_pages` (`:405`). The fix is to drop TOC entries whose
 target went to `-1` after any deletion.
+
+### 6. The SECOND switch into the Organizer throws, and loses the clone
+
+Found during phase 1, and measured on `main` at `ab0506a` before the split, so
+it is not something the split introduced. `_refresh_organizer` closes the old
+render clone as its first statement and only later hands the Organizer a new
+one, but in between it calls `QApplication.processEvents()`:
+
+```
+self._close_org_render()          # the Organizer's render source is now closed
+...
+QApplication.processEvents()      # the Organizer's queued render runs anyway
+self._org_render = self._make_markup_baked_render()
+```
+
+The Organizer's `_render_visible` (`ui/organizer.py:748`) reads `src.doc`,
+PyMuPDF raises `ValueError: document closed`, and the exception unwinds out of
+`_refresh_organizer` before the new clone is ever assigned. Net effect on a
+second switch into the Organizer: a stack trace on stderr and `_org_render`
+left at `None`, so the grid keeps whatever it had. The first switch is clean,
+because there is no previous clone to close, which is why nothing has noticed.
+
+It only bites when the Organizer has a render queued at that moment, so it is
+intermittent by hand and reliable from a test that switches out and back.
+
+Two candidate fixes, neither taken in phase 1 (move-don't-change): clear the
+Organizer's render source before closing the clone
+(`set_document(self._doc, None)` first), or build the new clone before closing
+the old one and swap. **This matters for phase 3**, where backgrounded tabs
+release their render clones and rebuild them on activation: that is exactly
+this sequence, run far more often.
 
 ## Memory and cost
 
