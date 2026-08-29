@@ -22,10 +22,10 @@ theme = apply_theme(app)
 theme.set_mode(ThemeMode.LIGHT)  # start from a known light state for the shots
 
 win = MainWindow(theme=theme)
-win._doc.open(pdf)
-win._canvas.set_document(win._doc)
-win._page_panel.set_document(win._doc)
-win._toolbar.trigger_tool("rect")  # show an active tool + appearance controls
+win.view._doc.open(pdf)
+win.view._canvas.set_document(win.view._doc)
+win.view._page_panel.set_document(win.view._doc)
+win.view._toolbar.trigger_tool("rect")  # show an active tool + appearance controls
 win.resize(1200, 800)
 win.show()
 
@@ -40,14 +40,14 @@ def grab(tag):
 # selection highlight; switching to the Organizer tab shows that grid.
 def run():
     grab("light-editor")
-    win._page_panel.set_current_page(1)  # select page 2 to show selection backing
+    win.view._page_panel.set_current_page(1)  # select page 2 to show selection backing
     app.processEvents(); grab("light-editor-sel")
-    win._tabs.setCurrentIndex(1)
+    win.view._tabs.setCurrentIndex(1)
     QTimer.singleShot(500, after_org_light)
 
 
 def after_org_light():
-    win._organizer._list.setCurrentRow(1)  # select a page in the grid
+    win.view._organizer._list.setCurrentRow(1)  # select a page in the grid
     app.processEvents(); grab("light-organizer")
     theme.set_mode(ThemeMode.DARK)
     QTimer.singleShot(400, dark_org)
@@ -55,12 +55,12 @@ def after_org_light():
 
 def dark_org():
     grab("dark-organizer")
-    win._tabs.setCurrentIndex(0)
+    win.view._tabs.setCurrentIndex(0)
     QTimer.singleShot(400, dark_editor)
 
 
 def dark_editor():
-    win._page_panel.set_current_page(1)
+    win.view._page_panel.set_current_page(1)
     app.processEvents(); grab("dark-editor-sel")
     print("done")
     os._exit(0)

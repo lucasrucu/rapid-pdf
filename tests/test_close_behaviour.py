@@ -60,9 +60,9 @@ def win(qt_app, store, pdf_path):
     window = MainWindow()
     window.open_paths([pdf_path])
     yield window
-    window._doc.close()
-    window._close_panel_render()
-    window._close_org_render()
+    window.view._doc.close()
+    window.view._close_panel_render()
+    window.view._close_org_render()
     window.deleteLater()
 
 
@@ -70,9 +70,9 @@ def win(qt_app, store, pdf_path):
 def empty_win(qt_app, store):
     window = MainWindow()
     yield window
-    window._doc.close()
-    window._close_panel_render()
-    window._close_org_render()
+    window.view._doc.close()
+    window.view._close_panel_render()
+    window.view._close_org_render()
     window.deleteLater()
 
 
@@ -111,7 +111,7 @@ def _answer_with(monkeypatch, button):
 
 def test_x_closes_the_app_by_default(win, never_prompts):
     """The new default, and the reason this phase exists."""
-    assert win._doc.doc is not None
+    assert win.view._doc.doc is not None
     assert _close(win) is True
 
 
@@ -120,8 +120,8 @@ def test_x_closes_only_the_document_when_the_setting_says_so(win, store,
     """The old behaviour, still available: the PDF goes, the window stays."""
     store.close.x_closes = "document"
     assert _close(win) is False          # ignored: the window survives
-    assert win._doc.doc is None
-    assert win._current_page == 0
+    assert win.view._doc.doc is None
+    assert win.view._current_page == 0
 
 
 def test_x_quits_when_nothing_is_open_whatever_the_setting(empty_win, store,
@@ -129,7 +129,7 @@ def test_x_quits_when_nothing_is_open_whatever_the_setting(empty_win, store,
     """There is no document to close, so "document" has nothing to fall back
     to and the window has to go."""
     store.close.x_closes = "document"
-    assert empty_win._doc.doc is None
+    assert empty_win.view._doc.doc is None
     assert _close(empty_win) is True
 
 
@@ -155,19 +155,19 @@ def test_closing_the_document_twice_ends_up_quitting(win, store, never_prompts):
 @pytest.mark.parametrize("x_closes", ["window", "document"])
 def test_cancel_at_the_prompt_aborts_the_close(win, store, monkeypatch, x_closes):
     store.close.x_closes = x_closes
-    win._dirty = True
+    win.view._dirty = True
     asked = _answer_with(monkeypatch, QMessageBox.StandardButton.Cancel)
 
     assert _close(win) is False          # ignored
     assert asked, "the prompt never opened"
-    assert win._doc.doc is not None      # and the document is still here
+    assert win.view._doc.doc is not None      # and the document is still here
 
 
 @pytest.mark.parametrize("x_closes", ["window", "document"])
 def test_the_prompt_opens_before_either_branch_is_taken(win, store, monkeypatch,
                                                         x_closes):
     store.close.x_closes = x_closes
-    win._dirty = True
+    win.view._dirty = True
     asked = _answer_with(monkeypatch, QMessageBox.StandardButton.Discard)
 
     accepted = _close(win)
@@ -178,7 +178,7 @@ def test_the_prompt_opens_before_either_branch_is_taken(win, store, monkeypatch,
 def test_cancelling_a_quit_leaves_the_window_ready_for_the_next_x(win, monkeypatch):
     """A cancelled Quit must clear _force_quit, or the next X would skip
     straight past the setting on a stale flag."""
-    win._dirty = True
+    win.view._dirty = True
     win._force_quit = True
     _answer_with(monkeypatch, QMessageBox.StandardButton.Cancel)
 
@@ -187,7 +187,7 @@ def test_cancelling_a_quit_leaves_the_window_ready_for_the_next_x(win, monkeypat
 
 
 def test_a_clean_document_is_never_prompted_for(win, never_prompts):
-    win._dirty = False
+    win.view._dirty = False
     assert _close(win) is True
 
 
@@ -220,9 +220,9 @@ def test_close_pdf_empties_the_window_without_closing_it(win, never_prompts):
     """What Ctrl+W is wired to. The document goes, the window and its
     Organizer grid are emptied, and nothing quits."""
     win.close_pdf()
-    assert win._doc.doc is None
-    assert win._current_page == 0
-    assert win._organizer._list.count() == 0
+    assert win.view._doc.doc is None
+    assert win.view._current_page == 0
+    assert win.view._organizer._list.count() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -237,14 +237,14 @@ def test_a_session_end_is_never_ignored(win, store, never_prompts):
     win._session_ending = True
 
     assert _close(win) is True
-    assert win._doc.doc is None
+    assert win.view._doc.doc is None
 
 
 def test_a_session_end_does_not_stop_to_prompt(win, store, never_prompts):
     """A modal dialog during a session end blocks the shutdown just as surely
     as ignoring the event does."""
     store.close.x_closes = "document"
-    win._dirty = True                    # would normally open the prompt
+    win.view._dirty = True                    # would normally open the prompt
     win._session_ending = True
 
     assert _close(win) is True           # never_prompts would have fired
