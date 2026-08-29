@@ -571,6 +571,36 @@ document**.
 
 Ten tabs of A1 drawings could approach a gigabyte.
 
+### Measured with tabs actually open (phase 2)
+
+Numbers, not arithmetic. Measured on this install with the Windows working set
+(`GetProcessMemoryInfo`), A1 portrait at 1684 x 2384 pt.
+
+| Measured | Value |
+| --- | --- |
+| one A1 page cached at zoom 1.0 | 1684 x 2384 px, 32-bit, **15.3 MB** |
+| one A1 page cached at zoom 1.5 | 2526 x 3576 px, 32-bit, **34.5 MB** |
+| one document's full render cache (6 entries, zoom 1.5) | **207 MB** |
+| ten documents' full render caches | **2.02 GB** |
+| ten tabs open, one page viewed in each, default fit | **+345 MB** (about 35 MB a tab) |
+| ten live fitz documents PLUS twenty markup-baked clones, no renders | **+2 MB** |
+
+The estimate above was right about the ceiling and **wrong about where the
+weight is**, which changes what phase 3 should do first.
+
+**The clones are nearly free. The pixmap cache is the whole cost.** Ten live
+documents and their twenty clones came to two megabytes, because
+`clone_with_annotations` copies page content streams and a drawing is vector
+data. That cost scales with the FILE, so a 20 MB drawing clones to roughly
+20 MB, and even then it is an order of magnitude under the 207 MB of pixmaps
+that one document's render cache holds regardless of how big the file is.
+
+So the phase 3 rule to write first is **drop a backgrounded document's pixmap
+cache** (`invalidate_render_cache`, `core/pdf_document.py:88`), which is one
+call, cannot fail, and recovers 200 MB a tab. Releasing the render clones is
+still worth doing and it is still where the second-switch bug lives (known bug
+6), but on these numbers it is the smaller half of the job, not the headline.
+
 **Background tabs must release their render clones, and that is phase 3 work,
 not later.** The rules:
 
