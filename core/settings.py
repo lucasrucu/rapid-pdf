@@ -256,7 +256,12 @@ class ViewSection(_Section):
     _name = "view"
 
     page_panel_visible = _Field(_as_bool)
-    default_fit_mode = _Field(_as_str, allowed=("fit_page", "fit_width", "actual"))
+    # Every mode the status-bar fit group offers. `fit_height` was missing from
+    # this tuple while ui.canvas.FIT_MODES has carried it all along, so choosing
+    # Fit height and setting it as the default silently fell back to fit_page.
+    # test_preferences.py asserts the two sets stay equal.
+    default_fit_mode = _Field(
+        _as_str, allowed=("fit_page", "fit_width", "fit_height", "actual"))
     organizer_zoom_index = _Field(_as_int)
 
 
@@ -550,3 +555,72 @@ def set_settings(store: Settings | None) -> Settings | None:
     previous = _INSTANCE
     _INSTANCE = store
     return previous
+
+
+# ---------------------------------------------------------------------------
+# Where a file dialog opens
+# ---------------------------------------------------------------------------
+# Every QFileDialog in the app used to be handed "" as its starting directory,
+# which is not "no preference": Qt reads it as the process working directory,
+# so a shortcut launched from the desktop opened the Open dialog on the
+# desktop and one launched from Explorer opened it wherever Explorer happened
+# to be. These two functions are the whole of the fix, and every dialog goes
+# through them.
+#
+# ONE KEY, TWO MODES, AND WHY. `files.default_folder` holds the folder the
+# dialogs start in. In "last_used" mode the app rewrites it after every dialog;
+# in "fixed" mode only the user writes it, through Preferences. That means a
+# fixed folder is overwritten if the user switches to last_used and then opens
+# something, which is the price of not carrying a second key for a value that
+# is the same thing either way: the folder to start in. Remembering it in the
+# file rather than in memory is what makes the FIRST dialog of a run land
+# somewhere sensible, which is the whole complaint.
+def dialog_start_dir(fallback: str | os.PathLike | None = None) -> str:
+    """The directory a file dialog should open in, or "" for Qt's own default.
+
+    `fallback` is the caller's better guess when nothing is remembered yet,
+    typically the open document's own path. A file path is accepted and its
+    parent used, so callers do not each have to work that out.
+    """
+    remembered = settings().files.default_folder
+    if remembered:
+        # Strictly a directory. A remembered folder that has gone (an unplugged
+        # drive, a network share that is down) falls through to the caller's
+        # guess rather than up to its parent, which would be a folder the user
+        # never chose.
+        try:
+            if Path(remembered).is_dir():
+                return str(remembered)
+        except OSError:
+            pass
+    if fallback:
+        try:
+            path = Path(fallback)
+            directory = path if path.is_dir() else path.parent
+            if directory.is_dir():
+                return str(directory)
+        except OSError:
+            pass
+    return ""
+
+
+def remember_dialog_dir(path: str | os.PathLike | None) -> None:
+    """Record where a dialog just landed. A no-op unless the mode says to.
+
+    Silent on anything unusable: a dialog that was cancelled, a path on a
+    drive that has since gone, a store that cannot be written. None of it is
+    worth interrupting the thing the user was actually doing.
+    """
+    if not path:
+        return
+    store = settings()
+    if store.files.default_folder_mode != "last_used":
+        return
+    try:
+        candidate = Path(path)
+        directory = candidate if candidate.is_dir() else candidate.parent
+        if not directory.is_dir():
+            return
+        store.files.default_folder = str(directory)
+    except (OSError, ValueError):
+        return

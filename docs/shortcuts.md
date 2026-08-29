@@ -77,10 +77,25 @@ strip keeps its own size.
 | `Ctrl+Q` | Quit |
 
 The window's X closes the app. To have it close the PDF and leave an empty
-window instead (which is what Rapid PDF did up to 1.5.0), set `close.x_closes`
-to `"document"` in `%LOCALAPPDATA%\Rapid PDF\settings.json`. Either way,
-unsaved changes are prompted for first and cancelling the prompt cancels the
-close.
+window instead (which is what Rapid PDF did up to 1.5.0), pick the second
+choice under Closing in Edit > Preferences. Either way, unsaved changes are
+prompted for first and cancelling the prompt cancels the close.
+
+Open and Save As start in the last folder you used. Edit > Preferences can pin
+them to one folder instead.
+
+## Preferences
+
+| Key | Action |
+|---|---|
+| `Ctrl+,` | Edit > Preferences |
+
+Everything the app remembers, on one page: the close behaviour above, the
+theme, where file dialogs start, the page panel, and the page fit a document
+opens in. There is no OK and no Cancel because every control applies as soon as
+it is touched, which is what the theme and page panel already did from the View
+menu. The dialog and the View menu are the same controls, so `Ctrl+B` and
+`Ctrl+D` still work while it is open and it moves with them.
 
 ## Mouse
 

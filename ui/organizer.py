@@ -9,7 +9,7 @@ from PySide6.QtGui import (
     QIcon, QColor, QPixmap, QPainter, QDrag, QShortcut, QKeySequence,
 )
 
-from core.settings import settings
+from core.settings import dialog_start_dir, remember_dialog_dir, settings
 from ui.thumbnails import aspect_ratio_placeholder, draw_thumbnail
 from ui.theme import LIGHT
 from ui.scrolling import TrackpadScrollFilter
@@ -832,10 +832,12 @@ class PageOrganizer(QWidget):
         if not self._doc or not self._doc.doc:
             return
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "Select PDFs to Insert", "", "PDF Files (*.pdf)"
+            self, "Select PDFs to Insert", dialog_start_dir(self._doc.path),
+            "PDF Files (*.pdf)"
         )
         if not paths:
             return
+        remember_dialog_dir(paths[0])
         paths = sorted(paths)
         selected = self._list.selectedItems()
         at = self._list.row(selected[-1]) + 1 if selected else self._doc.page_count()
