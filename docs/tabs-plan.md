@@ -156,6 +156,14 @@ destination, with no `setParent(None)` anywhere. Result:
 Nothing reloaded, nothing was recreated, the undo history survived. This is
 the whole reason tear-off is a gesture layer rather than a rebuild.
 
+> **One line of that table stopped being true in phase 5: the undo stack.** It
+> is the WINDOW's now, not the canvas's, so a view arriving in another window
+> necessarily joins that window's history. Everything else in the table still
+> holds, and it is still what makes the tear-off a reparent rather than a
+> rebuild; the history is the one thing a cross-window move gives up, which is
+> why cross-window PAGE moves are refused outright. See the undo decision
+> below and `ui/undo.py`.
+
 **Re-verified in phase 3 across the real path.** The table above was a bare
 canvas moved between two layouts. `MainWindow.adopt` is what the menu item and
 (later) the gesture actually call, and every identity in it survives that too:
@@ -193,7 +201,7 @@ implements it. No custom event handling needed.
 | 2 | Tabs in one window | 1.5-2 d | done on `feat/document-tabs` |
 | 3 | Multi-window via `WindowRegistry`, menu item only | 1.5-2 d | done on `feat/multi-window` |
 | 4 | Tear-off drag gesture | 1-1.5 d | done on `feat/tab-tear-off` |
-| 5 | Pages between tabs | 4 d | |
+| 5 | Pages between tabs | 4 d | done on `feat/pages-between-tabs` |
 | 6 | Session restore | 0.5-1 d | |
 
 The order is not arbitrary. Each phase leaves the app shippable, and phases 3
@@ -442,6 +450,42 @@ both. See the undo decision below.
   `screenChanged`. A cross-document page move should reuse it rather than grow
   a third copy of that sequence.
 
+**What phase 5 actually did, and the four things worth knowing.**
+
+Done. `ui/page_drag.py` holds the payload and the lookup, `ui/undo.py` holds
+the window stack, `TransferPagesCommand` in `ui/page_commands.py` is the one
+command, and `PDFDocument.transfer_pages_from` is the 40 lines the finding
+promised. 562 tests, 27 of them new in `tests/test_pages_between_tabs.py`, and
+`tools/smoke_multi_window.py` grew a step 4 that runs it on the real platform.
+
+- **The undo stack moved to the window, and the dirty flag had to move with
+  it.** `setClean()` marks one index on one stack, and one stack now carries
+  three documents, so saving B would have cleared the modified marker on A.
+  Each `DocumentView` keeps a revision counter instead: every command that
+  touches it bumps the counter on redo and drops it on undo, and the counter it
+  was last saved at is the marker. A dropped redo branch retires a marker that
+  lived inside it, which is the rule `QUndoStack` applies to its own clean
+  index. Six existing tests asserted the per-document stack and were rewritten;
+  none of them found a bug, they were pinning the old contract.
+- **A view leaving a window takes its history with it, or rather loses it.**
+  There is no selective removal in `QUndoStack`, so `release_view` drops the
+  whole stack, and only when the departing view is actually named in it
+  (`WindowUndoStack.drop_history_for`). An unedited tab, which is the ordinary
+  tear-off, costs nothing. This is the trade for cross-window moves being
+  refused: two windows means two stacks and the duplicate-page problem returns.
+- **`source() is self` did not have to go, only stop being the only check.**
+  The plan said the four guards had to become mime-format checks, and they did;
+  what was not obvious until the tests ran is that keeping `source() is self`
+  as a SECOND way in costs nothing and means a drag carrying no payload at all
+  still resolves to a reorder. Every one of the 535 existing tests passed
+  unmodified through the drag layer because of it.
+- **A `QMimeData` passed inline into a `QDropEvent` is a segfault.**
+  `QDropEvent` does not take ownership, so an inline argument is collectable
+  the moment the constructor returns and the handler reads freed memory. It
+  took the smoke script down C++-side with no traceback. Hold it in a named
+  local. Only bites code that BUILDS drop events, so the app itself is safe and
+  the smoke script is not.
+
 ### Phase 6: session restore
 
 Reopen the tabs and windows that were open last time. Small, and it depends on
@@ -598,7 +642,7 @@ in `_flush`: an empty batch should still emit a raise-and-focus.
 Under tabs this matters more, because `Ctrl+W` closing a tab is the thing
 everyone will reach for first.
 
-### 4. Encrypted PDFs report a successful open, then throw on first render
+### 4. Encrypted PDFs report a successful open, then throw on first render - FIXED in phase 5
 
 `PDFDocument.open` (`core/pdf_document.py:102`) returns `True` for a
 password-protected PDF, because `fitz.open` succeeds and only sets
@@ -615,7 +659,7 @@ So the app accepts the file, shows a two-page document, and then blows up on
 the first render. `open` needs a `needs_pass` check and either a password
 prompt or a clean refusal.
 
-### 5. Deleting a page leaves a bookmark pointing at page -1
+### 5. Deleting a page leaves a bookmark pointing at page -1 - FIXED in phase 5
 
 `PDFDocument.delete_page` (`core/pdf_document.py:400`) calls
 `fitz.Document.delete_page`, which renumbers the table of contents but leaves
