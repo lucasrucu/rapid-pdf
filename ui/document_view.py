@@ -50,6 +50,20 @@ THREE THINGS IN HERE ARE LOAD-BEARING, AND THE WORST ONE FAILS SILENTLY.
 3. Undo stack ownership. `PDFCanvas.set_document` clears the undo stack, so one
    canvas can only ever serve one document. This widget owns its canvas
    outright and never shares it.
+
+PHASE 3 ADDED BACKGROUNDING, and it is where the memory goes. `set_active` is
+called by the tab bar on every switch, and a view that is no longer in front
+drops its render cache and both markup clones. Phase 2's numbers say which half
+matters: one document's six-entry pixmap cache is 207 MB, and ten live
+documents plus twenty markup clones came to 2 MB between them. So
+`invalidate_render_cache` is the saving and the clones are tidiness. The live
+fitz document and the canvas scene stay, because those are what make a switch
+back instant and what phase 1's finding 2 proved survive a move between
+windows.
+
+Releasing a clone on every tab switch is also what made known bug 6 fire
+reliably rather than intermittently, which is why it was fixed in the same
+phase. See `_refresh_organizer`.
 """
 
 import os
@@ -131,6 +145,10 @@ class DocumentView(QWidget):
         self._panel_render = None  # throwaway clone backing the left page panel's thumbnails
         self._dirty = False      # unsaved changes exist (annotations, page edits, merges)
         self._dirty_announced = False  # last value dirty_changed went out with
+        # Front tab or background tab. True to start: a view is built to be
+        # shown, and the only thing this flag gates is the RELEASE, so nothing
+        # is gained by making a brand new view rebuild what it has not built.
+        self._active = True
         self._ocr_thread = None  # active OCR QThread, or None when idle
         self._ocr_worker = None  # keep a ref alive alongside the thread
         # Rows the page panel should end up with highlighted after the next
@@ -328,6 +346,62 @@ class DocumentView(QWidget):
         replaces.
         """
         self._dirty = False
+
+    def is_active(self) -> bool:
+        """Whether this is the front tab of its window."""
+        return self._active
+
+    def set_active(self, active: bool):
+        """Front tab, or backgrounded. Driven by DocumentArea on every switch.
+
+        This is the memory rule from phase 3 of docs/tabs-plan.md, and phase 2's
+        measurements decided its order of importance. Backgrounding drops:
+
+          - THE PIXMAP CACHE, which is where the cost is. One document's six
+            entries at A1 and zoom 1.5 measured 207 MB, and ten open documents
+            measured 2.02 GB of caches against 2 MB of everything else. It is
+            one call and it cannot fail. Measured saving, six A1 tabs with
+            every cache full: 1249 MB down to 387 MB, about 173 MB a tab. It is
+            173 and not 207 because the canvas scene holds the page currently
+            on screen as its background item and QPixmap is implicitly shared,
+            so that one entry is not freed by dropping the cache. The corollary
+            is that a tab where only one page was ever rendered saves nothing.
+          - THE TWO MARKUP CLONES, worth about a megabyte, released because
+            leaving them is a slow leak rather than because it is a saving.
+
+        What deliberately stays: the live fitz document and the canvas scene.
+        Those are what make a tab switch instant, and what finding 2 in the
+        plan proved survive a move between windows.
+        """
+        if active == self._active:
+            return
+        self._active = active
+        if active:
+            self._on_activated()
+        else:
+            self._on_backgrounded()
+
+    def _on_backgrounded(self):
+        """Give back what a document nobody is looking at does not need."""
+        if not self._doc.doc:
+            return
+        self._doc.invalidate_render_cache()
+        self._close_org_render()
+        self._close_panel_render()
+
+    def _on_activated(self):
+        """Rebuild what backgrounding released. Idempotent, and cheap.
+
+        Only the panel is rebuilt unconditionally: it is on screen the moment
+        the tab is. The Organizer is rebuilt only when it is the tab being
+        shown, because `_on_tab_changed` already rebuilds it on the way in and
+        doing it here as well would clone the document twice for one switch.
+        """
+        if not self._doc.doc:
+            return
+        self._refresh_panel_thumbnails(current_page=self._current_page)
+        if self._tabs.currentIndex() == 1:
+            self._refresh_organizer()
 
     def teardown(self):
         """Release everything this view owns, on the way out for good."""
@@ -967,9 +1041,10 @@ class DocumentView(QWidget):
     def _close_panel_render(self):
         # Same ordering as _close_org_render, and for the same reason: the
         # panel renders its thumbnails on a queued zero timer too, so it has to
-        # stop naming the clone before the clone is closed. It has never bitten
-        # here because the only caller is the rebuild directly above, which
-        # closes and re-hands-over with nothing pumped in between.
+        # stop naming the clone before the clone is closed. It never bit here
+        # because the only caller was the rebuild directly above, which closes
+        # and re-hands-over with nothing pumped in between. Backgrounding calls
+        # it on its own, which is where it would have.
         self._page_panel.release_render_source(self._panel_render)
         self._close_render(self._panel_render)
         self._panel_render = None
