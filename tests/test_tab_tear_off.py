@@ -32,6 +32,7 @@ SECTIONS.
 4. ESCAPE. Back to the window and the index it came from.
 5. THE SINGLE-TAB CASE. One tab drags its own window, and never spawns an
    empty one.
+6. THE MRU. A visit history for tabs, frozen while the walk is in flight.
 """
 
 import fitz
@@ -515,3 +516,148 @@ def test_dropping_into_an_empty_window_replaces_its_placeholder_tab(
     assert empty.document_area().count() == 1
     assert empty.document_area().view_at(0) is moving
     empty.document_area().check_invariant()
+
+
+# ======================================================================
+# 6. The MRU order behind Ctrl+Tab
+# ======================================================================
+
+def test_mru_is_visit_order_not_tab_order(qt_app, store, registry, tmp_path):
+    window = _window(registry, tmp_path, ["a.pdf", "b.pdf", "c.pdf"])
+    area = window.document_area()
+    a, b, c = area.view_at(0), area.view_at(1), area.view_at(2)
+
+    area.set_current_index(0)
+    area.set_current_index(2)
+    area.set_current_index(1)
+    assert area.mru_order() == [b, c, a]
+
+
+def test_ctrl_tab_goes_to_the_tab_you_were_just_in(qt_app, store, registry,
+                                                   tmp_path):
+    """Not the one to the right. That is Ctrl+PgDn and it is a different key."""
+    window = _window(registry, tmp_path, ["a.pdf", "b.pdf", "c.pdf"])
+    area = window.document_area()
+    a, b, c = area.view_at(0), area.view_at(1), area.view_at(2)
+
+    area.set_current_index(0)       # a
+    area.set_current_index(2)       # c, having come from a
+    window.next_recent_tab()
+    assert area.current_view() is a
+
+    window._end_mru_walk()
+    assert area.mru_order()[0] is a
+
+
+def test_holding_ctrl_walks_back_through_the_stack(qt_app, store, registry,
+                                                   tmp_path):
+    """The list is FROZEN while Ctrl is down. Without the freeze the second tap
+    would come straight back to where the first one started."""
+    window = _window(registry, tmp_path, ["a.pdf", "b.pdf", "c.pdf"])
+    area = window.document_area()
+    a, b, c = area.view_at(0), area.view_at(1), area.view_at(2)
+
+    area.set_current_index(0)       # a
+    area.set_current_index(1)       # b
+    area.set_current_index(2)       # c
+    assert area.mru_order() == [c, b, a]
+
+    window.next_recent_tab()
+    assert area.current_view() is b
+    assert area.is_walking_mru()
+    window.next_recent_tab()
+    assert area.current_view() is a
+    window.next_recent_tab()
+    assert area.current_view() is c     # wraps
+
+    window._end_mru_walk()
+    assert not area.is_walking_mru()
+
+
+def test_releasing_ctrl_commits_the_landing_tab(qt_app, store, registry, tmp_path):
+    window = _window(registry, tmp_path, ["a.pdf", "b.pdf", "c.pdf"])
+    area = window.document_area()
+    a, b, c = area.view_at(0), area.view_at(1), area.view_at(2)
+
+    area.set_current_index(0)
+    area.set_current_index(1)
+    area.set_current_index(2)
+    window.next_recent_tab()
+    window.next_recent_tab()
+    assert area.current_view() is a
+
+    # The release the application filter is watching for.
+    window.eventFilter(window, QKeyEvent(
+        QEvent.Type.KeyRelease, Qt.Key.Key_Control,
+        Qt.KeyboardModifier.NoModifier))
+
+    assert not area.is_walking_mru()
+    assert area.mru_order() == [a, c, b]
+
+
+def test_ctrl_shift_tab_walks_the_other_way(qt_app, store, registry, tmp_path):
+    window = _window(registry, tmp_path, ["a.pdf", "b.pdf", "c.pdf"])
+    area = window.document_area()
+    a, b, c = area.view_at(0), area.view_at(1), area.view_at(2)
+
+    area.set_current_index(0)
+    area.set_current_index(1)
+    area.set_current_index(2)       # order is [c, b, a]
+    window.previous_recent_tab()
+    assert area.current_view() is a
+
+
+def test_ctrl_pgdn_stays_positional(qt_app, store, registry, tmp_path):
+    """The two orders must not be conflated. Ctrl+PgDn is the tab to the right
+    whatever the visit history says."""
+    window = _window(registry, tmp_path, ["a.pdf", "b.pdf", "c.pdf"])
+    area = window.document_area()
+    a, b, c = area.view_at(0), area.view_at(1), area.view_at(2)
+
+    area.set_current_index(2)
+    area.set_current_index(0)       # MRU says a then c then b
+    window.next_tab()
+    assert area.current_view() is b
+
+
+def test_a_closed_tab_leaves_the_mru(qt_app, store, registry, tmp_path):
+    window = _window(registry, tmp_path, ["a.pdf", "b.pdf", "c.pdf"])
+    area = window.document_area()
+    a, b, c = area.view_at(0), area.view_at(1), area.view_at(2)
+
+    area.set_current_index(1)
+    area.set_current_index(2)
+    for view in area.views():
+        view.mark_clean()
+    area.remove_view(area.index_of(b))
+
+    assert b not in area.mru_order()
+    assert len(area.mru_order()) == 2
+    area.check_invariant()
+
+
+def test_a_torn_off_tab_leaves_the_source_windows_mru(qt_app, store, registry,
+                                                      tmp_path):
+    """`detach` is the source half of a move, so the history has to let go of
+    the view even though nothing was destroyed."""
+    window = _window(registry, tmp_path, ["a.pdf", "b.pdf", "c.pdf"])
+    area = window.document_area()
+    bar = area.bar()
+    moving = area.view_at(1)
+    area.set_current_index(1)
+
+    start = _tab_point(bar, 1)
+    _press(bar, start)
+    _move(bar, _below_bar(bar, start))
+    _release(bar, _below_bar(bar, start))
+
+    assert moving not in area.mru_order()
+    assert len(area.mru_order()) == 2
+
+
+def test_one_tab_has_no_mru_walk(qt_app, store, registry, tmp_path):
+    window = _window(registry, tmp_path, ["a.pdf"])
+    area = window.document_area()
+    window.next_recent_tab()
+    assert not area.is_walking_mru()
+    assert window._mru_filter_on is False

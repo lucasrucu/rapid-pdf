@@ -33,8 +33,12 @@ forwarded into it, and the insertion line the bar paints while a tab is hovering
 over it. It drives `detach`/`adopt` through MainWindow exactly as the menu item
 does, so switching it off would cost the gesture and nothing else.
 
-STILL NOT HERE. MRU Ctrl+Tab ordering: the next/previous shortcuts are
-positional and this class holds no visit history.
+The MRU list is the other half. `_mru` is a visit history for TABS, which is a
+different list from the registry's activation order for WINDOWS, and Ctrl+Tab
+needs the first one. It is FROZEN while the walk is in flight (`_mru_walk`), so
+holding Ctrl and tapping Tab walks a stable stack instead of swapping the top
+two entries back and forth forever. Ctrl+PgDn stays strictly positional: the
+two orders are deliberately different and `step_current` is untouched.
 """
 
 from __future__ import annotations
@@ -442,6 +446,14 @@ class DocumentArea(QWidget):
         super().__init__(parent)
         self._current_view = None
         self._syncing = False       # a bar/stack edit is mid-flight
+        # Most recently looked at FIRST. A visit history for TABS, which is not
+        # the same list as the registry's activation order for WINDOWS: that
+        # one answers "where does a new file go", this one answers Ctrl+Tab.
+        self._mru: list = []
+        # A frozen copy of the above while Ctrl is held down, plus where in it
+        # the walk has got to. None means no walk is in flight.
+        self._mru_walk = None
+        self._mru_pos = 0
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -655,6 +667,7 @@ class DocumentArea(QWidget):
         finally:
             self._syncing = False
         self._disconnect_view(view)
+        self._forget_visit(view)
         self._refresh_titles()
         self._sync_header_visibility()
         self._resync_current()
@@ -684,6 +697,7 @@ class DocumentArea(QWidget):
         finally:
             self._syncing = False
         self._disconnect_view(view)
+        self._forget_visit(view)
         view.teardown()
         view.setParent(None)
         view.deleteLater()
@@ -703,13 +717,82 @@ class DocumentArea(QWidget):
     def step_current(self, delta: int):
         """Positional next/previous, wrapping. Ctrl+PgDn and Ctrl+PgUp.
 
-        Positional on purpose: the most-recently-used ordering behind Ctrl+Tab
-        needs a visit history this class does not keep.
+        Positional on purpose, and it stayed that way when phase 4 added the
+        MRU walk below. They are two different orders and conflating them is
+        the mistake: this one is "the tab to the right", `step_mru` is "the tab
+        I was just in", and a user reaches for each of them for its own reason.
         """
         count = self._bar.count()
         if count < 2:
             return
         self.set_current_index((self._bar.currentIndex() + delta) % count)
+
+    # ------------------------------------------------------------------
+    # Most recently used, for Ctrl+Tab
+    # ------------------------------------------------------------------
+
+    def _note_visit(self, view):
+        """This tab became the front one. Ignored while a walk is in flight.
+
+        The freeze is the whole design. Recording every step of a walk would
+        put the tab just landed on at the top of the list, so the next tap
+        would come straight back, and holding Ctrl would flip between two tabs
+        forever instead of walking back through the stack.
+        """
+        if view is None or self._mru_walk is not None:
+            return
+        self._mru = [v for v in self._mru if v is not view]
+        self._mru.insert(0, view)
+
+    def _forget_visit(self, view):
+        self._mru = [v for v in self._mru if v is not view]
+        if self._mru_walk is not None:
+            self._mru_walk = [v for v in self._mru_walk if v is not view]
+
+    def mru_order(self) -> list:
+        """Every open view, most recently looked at first.
+
+        Anything never visited (a background tab opened alongside others) comes
+        last, in tab order, so the list always names every tab exactly once
+        however the history got there.
+        """
+        live = self.views()
+        ordered = [v for v in self._mru if any(v is w for w in live)]
+        ordered += [v for v in live if not any(v is o for o in ordered)]
+        return ordered
+
+    def is_walking_mru(self) -> bool:
+        return self._mru_walk is not None
+
+    def step_mru(self, delta: int) -> bool:
+        """One tap of Ctrl+Tab. True if a walk is now in flight.
+
+        The caller is what notices Ctrl coming up: see
+        MainWindow._start_mru_walk, which arms an application event filter on a
+        True and disarms it on the release.
+        """
+        if self.count() < 2:
+            return False
+        if self._mru_walk is None:
+            self._mru_walk = self.mru_order()
+            self._mru_pos = 0
+        order = self._mru_walk
+        if len(order) < 2:
+            self._mru_walk = None
+            return False
+        self._mru_pos = (self._mru_pos + delta) % len(order)
+        index = self.index_of(order[self._mru_pos])
+        if index >= 0:
+            self.set_current_index(index)
+        return True
+
+    def end_mru_walk(self):
+        """Ctrl came up. Whatever tab it landed on is now the most recent."""
+        if self._mru_walk is None:
+            return
+        self._mru_walk = None
+        self._mru_pos = 0
+        self._note_visit(self._current_view)
 
     # ------------------------------------------------------------------
     # Staying in step
@@ -751,6 +834,9 @@ class DocumentArea(QWidget):
             previous.set_active(False)
         if new is not None:
             new.set_active(True)
+        # The one place a tab is looked at, so the one place the visit history
+        # is written. Frozen mid-walk; see _note_visit.
+        self._note_visit(new)
         self.current_view_changed.emit(previous, new)
         return True
 

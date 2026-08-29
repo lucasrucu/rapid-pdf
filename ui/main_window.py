@@ -133,6 +133,7 @@ class MainWindow(QMainWindow):
         self._session_ending = False  # Windows is ending the session; never block it
         self._mica_applied = False  # the backdrop needs an HWND, so it waits for show()
         self._screen_watched = False  # so does the QWindow behind screenChanged
+        self._mru_filter_on = False   # a Ctrl+Tab walk is waiting on Ctrl coming up
         # Joined BEFORE anything that asks the registry a question. In
         # particular _should_check_for_updates counts the windows already in it,
         # so a window that has not joined would think it was the first.
@@ -274,8 +275,15 @@ class MainWindow(QMainWindow):
         the window being read rather than the oldest one.
         """
         super().changeEvent(event)
-        if event.type() == QEvent.Type.ActivationChange and self.isActiveWindow():
+        if event.type() != QEvent.Type.ActivationChange:
+            return
+        if self.isActiveWindow():
             self._registry.note_activated(self)
+        elif self._mru_filter_on:
+            # Alt+Tab away with Ctrl still down and the release never arrives
+            # here. Losing activation ends the walk, or the filter would sit
+            # installed until some unrelated Ctrl came up.
+            self._end_mru_walk()
 
     def raise_and_focus(self):
         """Un-minimize, raise and focus. What an Explorer launch or a drop
@@ -740,6 +748,10 @@ class MainWindow(QMainWindow):
         vm.addSeparator()
         self._add_action(vm, "Next Tab", self.next_tab, "Ctrl+PgDown")
         self._add_action(vm, "Previous Tab", self.previous_tab, "Ctrl+PgUp")
+        # The MRU pair, and deliberately not the same order as the two above.
+        self._add_action(vm, "Recent Tab", self.next_recent_tab, "Ctrl+Tab")
+        self._add_action(vm, "Previous Recent Tab", self.previous_recent_tab,
+                         "Ctrl+Shift+Tab")
         vm.addSeparator()
         self._theme_action = QAction("Dark Mode", self)
         self._theme_action.setShortcut("Ctrl+D")
@@ -887,6 +899,59 @@ class MainWindow(QMainWindow):
     def previous_tab(self):
         """Ctrl+PgUp."""
         self._area.step_current(-1)
+
+    def next_recent_tab(self):
+        """Ctrl+Tab. Most recently used, NOT positional.
+
+        Deferred by phase 2, confirmed missing by phase 3, and here at last.
+        Ctrl+PgDn stays the positional one: "the tab to the right" and "the tab
+        I was just in" are different questions and the whole value of having
+        both is that they are not the same key.
+        """
+        self._start_mru_walk(1)
+
+    def previous_recent_tab(self):
+        """Ctrl+Shift+Tab. Back up the same stack."""
+        self._start_mru_walk(-1)
+
+    def _start_mru_walk(self, delta: int):
+        """Step the MRU, and start watching for Ctrl coming up if it stepped.
+
+        The list is frozen for as long as Ctrl is held, so tapping Tab walks
+        back through the stack rather than flipping between the top two.
+        """
+        if not self._area.step_mru(delta):
+            return
+        if self._mru_filter_on:
+            return
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+            self._mru_filter_on = True
+
+    def eventFilter(self, obj, event):
+        """Watch the whole application for Ctrl being released.
+
+        An application filter and not `keyReleaseEvent`, because the release
+        lands on whatever has keyboard focus (a canvas, a thumbnail list, the
+        page box) and several of those consume it long before it would reach
+        the window. Installed only while a walk is in flight and removed the
+        moment it ends, so nothing is filtering in the general case.
+        """
+        if (self._mru_filter_on
+                and event.type() == QEvent.Type.KeyRelease
+                and event.key() == Qt.Key.Key_Control):
+            self._end_mru_walk()
+        return super().eventFilter(obj, event)
+
+    def _end_mru_walk(self):
+        """Commit the walk: the tab landed on becomes the most recent."""
+        if self._mru_filter_on:
+            app = QApplication.instance()
+            if app is not None:
+                app.removeEventFilter(self)
+            self._mru_filter_on = False
+        self._area.end_mru_walk()
 
     def close_tab(self, index: int) -> bool:
         """Close one tab: its own X, its middle-click, or Ctrl+W on the front one.
@@ -1238,6 +1303,9 @@ class MainWindow(QMainWindow):
 
     def _teardown_for_quit(self):
         """Release everything the process owns, on the way out for good."""
+        # An application-wide event filter belonging to a window that is going
+        # away outlives the window that installed it. Ctrl+Tab arms one.
+        self._end_mru_walk()
         # Each view drops its render clones and closes its document.
         for view in self._area.views():
             view.teardown()

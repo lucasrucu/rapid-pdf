@@ -251,7 +251,23 @@ def run(app, folder):
           QWidget.mouseGrabber() is None, QWidget.mouseGrabber())
     area.check_invariant()
 
-    print("\n6. close both windows")
+    print("\n6. Ctrl+Tab walks the visit history, not the tab order")
+    area.set_current_index(0)
+    area.set_current_index(2)
+    area.set_current_index(1)
+    first.next_recent_tab()
+    check("Ctrl+Tab went to the tab visited before this one",
+          area.current_view() is area.view_at(2), area.current_index())
+    first.next_recent_tab()
+    check("holding Ctrl walked further back, not straight home",
+          area.current_view() is area.view_at(0), area.current_index())
+    first._end_mru_walk()
+    check("the walk committed", not area.is_walking_mru())
+    first.next_tab()
+    check("Ctrl+PgDn is still positional",
+          area.current_index() == 1, area.current_index())
+
+    print("\n7. close both windows")
     quit_seen = []
     app.aboutToQuit.connect(lambda: quit_seen.append(True))
 
@@ -273,7 +289,7 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Rapid PDF")
     app.setOrganizationName("Lucas")
-    # The same line main.py sets, and the reason step 6 proves anything.
+    # The same line main.py sets, and the reason step 7 proves anything.
     app.setQuitOnLastWindowClosed(False)
 
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:

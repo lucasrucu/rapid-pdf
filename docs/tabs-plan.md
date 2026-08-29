@@ -297,9 +297,10 @@ version of the same question and two dialogs in a row are worse than one.
 
 Not done here, on purpose: MRU `Ctrl+Tab`, "Move to New Window" and
 background-tab clone release all went to phase 3. Of those, phase 3 shipped the
-last two; **MRU `Ctrl+Tab` is still not done**. The registry keeps an activation
-order for WINDOWS, which is a different list from a visit history for TABS, and
-nothing keeps the second one yet. `step_current` remains positional.
+last two and **phase 4 finally shipped MRU `Ctrl+Tab`**. The registry keeps an
+activation order for WINDOWS, which is a different list from a visit history for
+TABS; `DocumentArea._mru` is now the second one. `step_current` is still
+positional and stays that way.
 
 ### Phase 3: multi-window, menu-driven
 
@@ -359,6 +360,16 @@ and the MRU visit history. Two arguments were added rather than two new code
 paths: `MainWindow.move_view_to_new_window(view, geometry=...)` places the torn
 window under the cursor, and `move_view_to_window(view, target, at=...)` docks
 at the index the insertion line was showing.
+
+MRU `Ctrl+Tab` / `Ctrl+Shift+Tab` landed with it, which is the thing phase 2
+deferred and phase 3 confirmed was still missing. `DocumentArea._mru` is a visit
+history for TABS, written in `_set_current_view` and FROZEN while the walk is in
+flight; without the freeze, holding Ctrl flips between the top two entries
+forever. `step_current` was not touched: `Ctrl+PgDn` is still strictly
+positional and the two orders are meant to differ. `MainWindow` notices Ctrl
+coming up with an application-wide event filter installed only for the length of
+the walk, because the release lands on whatever has focus and a canvas eats it
+long before it would reach the window.
 
 **Two things worth knowing that the design did not anticipate.**
 
