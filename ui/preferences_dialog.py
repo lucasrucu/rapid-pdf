@@ -35,12 +35,15 @@ at the first repeat. That is why there are no re-entrancy guards below.
 WHAT IS DELIBERATELY NOT HERE. `view.organizer_zoom_index` is persisted but has
 no control, because it is driven by Ctrl+wheel in the Organizer and a spinbox
 for it would be a second, worse way to do something that already has a good
-one. `close.confirm_multiple_tabs` is persisted and has no control either,
-because tabs do not exist yet: the dialog applies immediately, so a permanently
-disabled checkbox would be the one control on the page that does nothing, and a
-tooltip explaining an unshipped feature is a worse answer than waiting. The key
-keeps its default and the checkbox arrives with the feature that gives it
-meaning.
+one.
+
+`close.confirm_multiple_tabs` used to be in that list, kept out because tabs
+did not exist and a permanently disabled checkbox would have been the one
+control here that does nothing. Tabs exist now, so it has its checkbox, under
+Closing with the other close behaviour. What it guards is losing your PLACE,
+not your work: unsaved documents are prompted for one at a time whatever this
+says, and the count warning is skipped entirely when any of them is dirty,
+because two dialogs in a row asking the same question is worse than one.
 """
 
 from __future__ import annotations
@@ -130,6 +133,13 @@ class PreferencesDialog(QDialog):
                 lambda checked, v=value: self._on_close_choice(v, checked))
             col.addWidget(radio)
             self._close_radios[value] = radio
+
+        self._confirm_tabs_check = QCheckBox(
+            "Ask first when several documents are open")
+        self._confirm_tabs_check.setToolTip(
+            "Unsaved documents are always asked about, whatever this says")
+        self._confirm_tabs_check.toggled.connect(self._on_confirm_tabs)
+        col.addWidget(self._confirm_tabs_check)
         return box
 
     def _on_close_choice(self, value: str, checked: bool) -> None:
@@ -137,6 +147,9 @@ class PreferencesDialog(QDialog):
         # True. Only the True half is a decision.
         if checked:
             settings().close.x_closes = value
+
+    def _on_confirm_tabs(self, checked: bool) -> None:
+        settings().close.confirm_multiple_tabs = checked
 
     # ------------------------------------------------------------------
     # Appearance
@@ -335,6 +348,7 @@ class PreferencesDialog(QDialog):
         radio = self._close_radios.get(store.close.x_closes)
         if radio is not None:
             radio.setChecked(True)
+        self._confirm_tabs_check.setChecked(store.close.confirm_multiple_tabs)
 
         self._sync_theme_combo()
 
