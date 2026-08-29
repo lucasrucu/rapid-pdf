@@ -390,6 +390,26 @@ def test_a_drop_from_another_window_is_refused_with_a_reason(two_tabs):
     _dispose(torn)
 
 
+def test_the_organizer_grid_takes_a_drop_from_another_document_too(two_tabs):
+    """Both receivers had the same guard and both had to change. The grid is
+    the one that also lost its native drop indicator to DragDrop mode, so it
+    is worth asserting it still lands the pages."""
+    _win, alpha_view, beta_view = two_tabs
+    beta_view._tabs.setCurrentIndex(1)          # switch to the Organizer
+    grid = beta_view._organizer._list
+    assert grid.count() == 2, "the grid did not load"
+
+    rect = grid.visualItemRect(grid.item(0))
+    event = _FakeDrop(alpha_view._page_panel._list,
+                      QPoint(rect.left() + 1, rect.center().y()),
+                      make_page_mime(alpha_view, [1]))
+    grid.dropEvent(event)
+
+    assert event.accepted
+    assert _texts(beta_view) == ["alpha.pdf p1", "beta.pdf p0", "beta.pdf p1"]
+    assert _texts(alpha_view) == ["alpha.pdf p0", "alpha.pdf p2"]
+
+
 def test_hovering_a_tab_under_a_page_drag_switches_to_it(two_tabs):
     """550 ms of rest brings a tab forward mid-drag, so a page can be dropped
     into a document that was not on screen when the drag started.
