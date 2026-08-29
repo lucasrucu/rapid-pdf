@@ -71,6 +71,18 @@ class PDFDocument:
         # None. Set on every failure and cleared at the top of every save, so
         # the caller reads it immediately after a False and never later.
         self.last_save_error: str | None = None
+        # Why the last open() returned False, in words fit to show a user, or
+        # None. Same contract as last_save_error: read it straight after a False.
+        self.last_open_error: str | None = None
+        # Cross-document page moves this document has been part of SINCE ITS
+        # LAST SAVE, so the close prompt can say what is actually at stake.
+        # Two lists of plain strings (the other document's display name):
+        #   sent_to    - pages that left here and are now living in that file
+        #   taken_from - pages that arrived here out of that file
+        # Set by the transfer command, cleared by save(). See
+        # DocumentView.transfer_warning.
+        self.transfers_sent: list[tuple[int, str]] = []
+        self.transfers_taken: list[tuple[int, str]] = []
         # LRU cache of rendered page pixmaps keyed by (page_num, zoom_key).
         # A cache hit makes a repeated render_page of the same page+zoom free
         # (the lift re-render, reload-after-strip, organizer/page round-trips).
@@ -133,15 +145,36 @@ class PDFDocument:
         self.path = None
 
     def open(self, path: str) -> bool:
+        """Open a file, or return False with the reason in last_open_error.
+
+        THE needs_pass CHECK IS NOT OPTIONAL, and it is known bug 4 in
+        docs/tabs-plan.md. fitz.open() SUCCEEDS on a password-protected PDF: it
+        hands back a document that reports a real page count and then raises
+        "document closed or encrypted" on the first render. The app used to
+        accept the file, draw an empty two-page document and blow up as soon as
+        anything asked for a pixmap. Refusing here is the whole fix, and it is
+        also why the page-transfer work does not have to special-case encrypted
+        documents: one can never be open in the first place.
+        """
+        self.last_open_error = None
         try:
             if self.doc:
                 self.doc.close()
             self.invalidate_render_cache()   # new document — no stale pixmaps
             self.doc = fitz.open(path)
+            if getattr(self.doc, "needs_pass", False):
+                self.doc.close()
+                self.doc = None
+                self.last_open_error = (
+                    "This PDF is password protected, so it cannot be opened."
+                )
+                return False
             self.path = path
             return True
         except Exception as e:
             print(f"Open error: {e}")
+            self.doc = None
+            self.last_open_error = f"Could not open the PDF:\n{e}"
             return False
 
     def close(self):
@@ -149,6 +182,7 @@ class PDFDocument:
             self.doc.close()
         self.doc = None
         self.path = None
+        self.clear_transfer_ledger()
         self.invalidate_render_cache()
 
     def is_open(self) -> bool:
@@ -288,6 +322,9 @@ class PDFDocument:
                 self.doc.save(target, garbage=4, deflate=True)
             # Adopt the target as the canonical path so later saves write in place.
             self.path = target
+            # Whatever this document owed the other side of a page move is now
+            # on disk, so the close prompt has nothing left to warn about.
+            self.clear_transfer_ledger()
             return True
         except Exception as e:
             print(f"Save error: {e}")
@@ -510,9 +547,42 @@ class PDFDocument:
             raise
         return clone
 
+    def strip_dangling_toc(self) -> int:
+        """Drop bookmarks whose target page no longer exists. Returns how many.
+
+        KNOWN BUG 5 in docs/tabs-plan.md, and it is older than the page-move
+        work. `fitz.Document.delete_page` renumbers the table of contents but
+        leaves the DELETED page's own entry pointing at -1, and that survives a
+        save, so the file we write carries a broken bookmark. Measured on a
+        3-page file with one bookmark per page:
+
+            after delete_page(1): [[1,'One',1], [1,'Two',-1], [1,'Three',2]]
+
+        A page number of 0 or less is fitz's "no destination" marker (real pages
+        are 1-based here), so both are dropped. Cheap enough to run after every
+        delete, and it does nothing at all on a document with no bookmarks.
+        """
+        if not self.doc:
+            return 0
+        try:
+            toc = self.doc.get_toc(simple=True)
+        except Exception:
+            return 0
+        if not toc:
+            return 0
+        kept = [entry for entry in toc if len(entry) > 2 and entry[2] > 0]
+        dropped = len(toc) - len(kept)
+        if dropped:
+            try:
+                self.doc.set_toc(kept)
+            except Exception:
+                return 0
+        return dropped
+
     def delete_page(self, page_num: int):
         if self.doc and 0 <= page_num < len(self.doc):
             self.doc.delete_page(page_num)
+            self.strip_dangling_toc()
             self.invalidate_render_cache()   # pages after this one renumbered
 
     def delete_pages(self, page_nums: list) -> list:
@@ -529,6 +599,7 @@ class PDFDocument:
             return []
         for page_num in reversed(rows):   # descending, so the rest stay valid
             self.doc.delete_page(page_num)
+        self.strip_dangling_toc()
         self.invalidate_render_cache()
         return rows
 
@@ -565,6 +636,109 @@ class PDFDocument:
             self.doc.insert_pdf(stash, from_page=k, to_page=k,
                                 start_at=max(0, min(at, len(self.doc))))
         self.invalidate_render_cache()   # page set/indices changed
+
+    # ------------------------------------------------------------------
+    # Moving pages between two LIVE documents (phase 5 of docs/tabs-plan.md)
+    # ------------------------------------------------------------------
+
+    def transfer_pages_from(self, src: "PDFDocument", rows: list, at: int) -> int:
+        """Copy `rows` out of another OPEN document and land them at `at`.
+
+        The counterpart of `restore_pages` for a source that is a live document
+        rather than a stash, and the whole engine half of dragging a page from
+        one tab into another. A MOVE is this call followed by
+        `src.delete_pages(rows)`; a copy is this call on its own.
+
+        ONE insert_pdf PER ROW, deliberately. A multi-selection can be
+        non-contiguous, and one call per page keeps the arithmetic trivial:
+        everything already inserted sits below the next insertion point, so the
+        k-th row goes to `at + k` with no adjustment.
+
+        `src` MUST be a different Document object. PyMuPDF's insert_pdf refuses
+        to read a document into itself, so a drop back into the document the
+        pages came from is routed to the plain reorder path instead of here
+        (see PagePanel's drop handling). Asserted rather than tolerated: a
+        silent no-op would look like a page that vanished.
+
+        What travels and what does not is measured in docs/tabs-plan.md ("What
+        comes along with a page"). Annotations, links to the outside world,
+        fonts, page size and rotation travel. Internal GOTO links pointing
+        outside the copied range, layers, and unsaved rapid-pdf markup do not;
+        the first two are reported by transfer_report() so the UI can say so,
+        and markup is carried separately as JSON by the command.
+        """
+        if not self.doc or src is None or src.doc is None:
+            return 0
+        if src.doc is self.doc:
+            raise ValueError("transfer_pages_from cannot read a document into itself")
+        rows = sorted({int(r) for r in rows if 0 <= int(r) < src.page_count()})
+        if not rows:
+            return 0
+        at = max(0, min(int(at), self.page_count()))
+        for k, row in enumerate(rows):
+            self.doc.insert_pdf(src.doc, from_page=row, to_page=row,
+                                start_at=at + k, links=True, annots=True,
+                                widgets=True)
+        self.invalidate_render_cache()   # page set/indices changed
+        return len(rows)
+
+    def transfer_report(self, rows: list) -> dict:
+        """What moving `rows` OUT of this document will quietly lose or rename.
+
+        PyMuPDF reports none of this: it drops an internal link whose target is
+        outside the copied range, flattens layers, and renames a colliding form
+        field, all silently and with no exception. Read before the move, so the
+        UI can say it once in the status bar rather than leaving the user to
+        find out on the next save.
+
+        Keys: `links` (internal GOTO links that will not survive), `layers`
+        (True when the source has optional content groups at all), `widgets`
+        (form fields on the moved pages, which are the ones a name collision
+        can rename in the destination).
+        """
+        out = {"links": 0, "layers": False, "widgets": 0}
+        if not self.doc:
+            return out
+        rows = sorted({int(r) for r in rows if 0 <= int(r) < self.page_count()})
+        moving = set(rows)
+        for row in rows:
+            try:
+                page = self.doc[row]
+            except Exception:
+                continue
+            try:
+                for link in page.get_links():
+                    if link.get("kind") == fitz.LINK_GOTO and link.get("page") not in moving:
+                        out["links"] += 1
+            except Exception:
+                pass
+            try:
+                out["widgets"] += sum(1 for _ in page.widgets())
+            except Exception:
+                pass
+        try:
+            out["layers"] = bool(self.doc.get_ocgs())
+        except Exception:
+            out["layers"] = False
+        return out
+
+    def note_pages_sent(self, count: int, to_name: str):
+        """Record that `count` pages left here for `to_name` and are not saved."""
+        self.transfers_sent.append((int(count), to_name))
+
+    def note_pages_taken(self, count: int, from_name: str):
+        """Record that `count` pages arrived here out of `from_name`, unsaved."""
+        self.transfers_taken.append((int(count), from_name))
+
+    def forget_last_transfer(self, sent: bool):
+        """Undo's half of the ledger: drop the entry the redo just wrote."""
+        ledger = self.transfers_sent if sent else self.transfers_taken
+        if ledger:
+            ledger.pop()
+
+    def clear_transfer_ledger(self):
+        self.transfers_sent = []
+        self.transfers_taken = []
 
     def insert_pdf(self, src_path: str, from_page: int = 0,
                    to_page: int = -1, start_at: int = -1):

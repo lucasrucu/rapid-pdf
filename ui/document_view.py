@@ -459,7 +459,12 @@ class DocumentView(QWidget):
         if self._doc.doc:
             return False
         if not self._doc.open(path):
-            QMessageBox.critical(self.window(), "Error", f"Could not open:\n{path}")
+            # The document knows WHY, and for a password-protected file that
+            # reason is the whole message (known bug 4: it used to open, then
+            # throw on the first render). Falls back to the old line otherwise.
+            QMessageBox.critical(
+                self.window(), "Error",
+                self._doc.last_open_error or f"Could not open:\n{path}")
             return False
         self._dirty = False           # freshly opened, in sync with disk
         self._canvas.set_document(self._doc)
