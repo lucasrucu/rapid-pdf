@@ -28,8 +28,14 @@ def qt_app():
 @pytest.fixture
 def server(qt_app):
     """A server object without a listening socket: only the aggregation and
-    flush logic is under test, and listening would collide with a real app."""
+    flush logic is under test, and listening would collide with a real app.
+
+    arm() stands in for the window being wired up. The server holds every
+    batch until then, because listen() now runs before the main window exists
+    and a batch that arrived first would otherwise be emitted into nothing.
+    """
     s = InstanceServer()
+    s.arm()
     yield s
     s.deleteLater()
 
