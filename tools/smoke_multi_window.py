@@ -23,6 +23,15 @@ lifetime, and ALWAYS after putting an OpenGL viewport on the canvas: a GL
 viewport is a native window, so reparenting it across top-levels destroys and
 recreates the context and the scene's backing store goes with it. See the
 standing constraint in docs/tabs-plan.md.
+
+PHASE 4 ADDED STEPS 5 TO 7, the tear-off gesture. Those steps are the reason to
+prefer the second command line above. The pytest suite drives the gesture by
+handing synthesised QMouseEvents to the tab bar, which is enough to pin the
+decisions it makes; what it cannot do is grab the mouse, move a real top-level
+window under a cursor, or say whether the geometry the gesture computes lands
+anywhere sensible on a real screen. Run natively and watch: the torn-off window
+should appear under the pointer with the tab where the pointer left it, not
+offset by a title bar.
 """
 
 import os
@@ -33,16 +42,59 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import tempfile
 
 import fitz
-from PySide6.QtCore import QRectF, QTimer
-from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer
+from PySide6.QtGui import QColor, QMouseEvent
+from PySide6.QtWidgets import QApplication, QWidget
 
 from core.settings import Settings, set_settings
 from ui.canvas import AddItemsCommand, HighlightItem
+from ui.tab_tear_off import DETACH_MARGIN
 from ui.theme import apply_theme
 from ui.window_registry import WindowRegistry
 
 FAILURES = []
+
+
+# ----------------------------------------------------------------------
+# Driving the tear-off gesture
+#
+# The same synthesis the pytest suite uses (tests/test_tab_tear_off.py), for
+# the same reason: there is no pointer to script. What is different here is
+# that the events go into a bar inside a REAL top-level window with a real
+# frame, and the window the gesture creates is really shown and really moved,
+# so the geometry these steps assert on is geometry the OS agreed to.
+# ----------------------------------------------------------------------
+
+
+def _mouse(kind, bar, global_pos, button=Qt.MouseButton.LeftButton):
+    held = (Qt.MouseButton.NoButton
+            if kind == QMouseEvent.Type.MouseButtonRelease else button)
+    return QMouseEvent(kind, QPointF(bar.mapFromGlobal(global_pos)),
+                       QPointF(global_pos), button, held,
+                       Qt.KeyboardModifier.NoModifier)
+
+
+def _tab_point(bar, index, dx=10):
+    rect = bar.tabRect(index)
+    return bar.mapToGlobal(rect.topLeft() + QPoint(dx, rect.height() // 2))
+
+
+def _below_bar(bar, global_pos, extra=DETACH_MARGIN + 20):
+    bottom = bar.mapToGlobal(QPoint(0, bar.rect().bottom())).y()
+    return QPoint(global_pos.x(), bottom + extra)
+
+
+def _press(bar, global_pos):
+    bar.mousePressEvent(_mouse(QMouseEvent.Type.MouseButtonPress, bar, global_pos))
+
+
+def _move(bar, global_pos):
+    bar.mouseMoveEvent(_mouse(QMouseEvent.Type.MouseMove, bar, global_pos))
+
+
+def _release(bar, global_pos):
+    bar.mouseReleaseEvent(
+        _mouse(QMouseEvent.Type.MouseButtonRelease, bar, global_pos))
 
 
 def check(label, condition, detail=""):
@@ -143,7 +195,63 @@ def run(app, folder):
     check("the other window still shows its own document",
           first.view is not moving and first.view.has_document())
 
-    print("\n4. close both windows")
+    print("\n4. tear a tab out with the gesture (phase 4)")
+    # Two more documents in the first window, so there is something to tear and
+    # something left behind when it goes.
+    first.open_paths([make_pdf(folder, "delta.pdf", 2)])
+    bar = area.bar()
+    check("three tabs to drag from", area.count() == 3, area.count())
+    torn_view = area.view_at(2)
+    torn_canvas = torn_view._canvas
+    torn_scene = torn_canvas.scene()
+
+    grab = _tab_point(bar, 2)
+    _press(bar, grab)
+    _move(bar, _below_bar(bar, grab))
+    third = bar.tear_off().floating_window()
+    check("crossing the threshold made a window",
+          third is not None and third is not first and third is not second)
+    check("three windows now", registry.count() == 3, registry.count())
+    check("the torn window holds the document",
+          third.document_area().view_at(0) is torn_view)
+    check("the first window kept the rest", area.count() == 2, area.count())
+    check("the canvas survived the gesture", torn_canvas.scene() is torn_scene)
+    check("no native handle grown on the way",
+          torn_canvas.internalWinId() == 0, torn_canvas.internalWinId())
+
+    # The real window follows the cursor: the offset between the pointer and
+    # the window frame is what has to stay constant, and only a real platform
+    # plugin has a frame worth measuring.
+    here = _below_bar(bar, grab)
+    offset = here - third.frameGeometry().topLeft()
+    _move(bar, here + QPoint(260, 180))
+    check("the window tracked the cursor",
+          (here + QPoint(260, 180)) - third.frameGeometry().topLeft() == offset,
+          f"{offset} -> {(here + QPoint(260, 180)) - third.frameGeometry().topLeft()}")
+    area.check_invariant()
+    third.document_area().check_invariant()
+
+    print("\n5. drop it back onto the first window's bar, at index 0")
+    over = _tab_point(bar, 0, dx=6)
+    _move(bar, over)
+    target = bar.tear_off().drop_target()
+    check("the first window is the drop target",
+          target is not None and target[0] is first and target[1] == 0, target)
+    check("the insertion line is drawn", bar.drop_indicator() is not None)
+    _release(bar, over)
+    check("the document docked at index 0",
+          area.view_at(0) is torn_view, area.index_of(torn_view))
+    check("three tabs again", area.count() == 3, area.count())
+    check("the emptied window closed itself", registry.count() == 2,
+          registry.count())
+    check("the insertion line was cleared", bar.drop_indicator() is None)
+    # The one thing offscreen genuinely cannot check: a leaked grabMouse() is a
+    # frozen application, and only a real platform plugin has a grab to leak.
+    check("the mouse grab was given back",
+          QWidget.mouseGrabber() is None, QWidget.mouseGrabber())
+    area.check_invariant()
+
+    print("\n6. close both windows")
     quit_seen = []
     app.aboutToQuit.connect(lambda: quit_seen.append(True))
 
@@ -165,7 +273,7 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Rapid PDF")
     app.setOrganizationName("Lucas")
-    # The same line main.py sets, and the reason step 4 proves anything.
+    # The same line main.py sets, and the reason step 6 proves anything.
     app.setQuitOnLastWindowClosed(False)
 
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:

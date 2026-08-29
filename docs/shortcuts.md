@@ -98,8 +98,15 @@ them to one folder instead.
 | `Ctrl+PgDn` / `Ctrl+PgUp` | Next / previous tab, wrapping |
 | Middle-click a tab | Close it |
 | Double-click empty bar space | New tab |
-| Drag a tab | Reorder it |
-| Right-click a tab | Close, Close Others, Close to the Right, Duplicate Tab, Copy Full Path, Open Containing Folder |
+| Drag a tab sideways | Reorder it |
+| Drag a tab off the bar | Tear it into its own window |
+| Right-click a tab | Close, Close Others, Close to the Right, Move to New Window, Duplicate Tab, Copy Full Path, Open Containing Folder |
+
+Dragging a tab DOWN off the bar tears it into its own window, which appears
+under the cursor straight away and follows it. Drop it on another window's tab
+bar and it docks there, at the gap the insertion line is showing. Drop it
+anywhere else and it stays where you let go. Escape mid-drag puts it back where
+it came from. Dragging sideways, however far, is only ever a reorder.
 
 Closing the last tab closes the window. A tab with unsaved changes shows a dot
 where its close button would be; hover it and the dot becomes the X again.

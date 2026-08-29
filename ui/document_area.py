@@ -27,10 +27,14 @@ Background tabs also stop holding what nobody is looking at, which is why
 `_set_current_view` tells the leaving view it is no longer active. The
 releasing itself is DocumentView's, where phase 1 put the clone lifecycle.
 
-WHAT IS STILL DELIBERATELY NOT HERE. MRU Ctrl+Tab ordering: the next/previous
-shortcuts are positional and this class holds no visit history. The tear-off
-gesture is phase 4, and it will drive `detach`/`adopt` rather than replace
-them.
+PHASE 4 ADDED THE GESTURE AND THE VISIT HISTORY. The tear-off itself lives in
+`ui/tab_tear_off.py`; what is here is the three mouse events and the key press
+forwarded into it, and the insertion line the bar paints while a tab is hovering
+over it. It drives `detach`/`adopt` through MainWindow exactly as the menu item
+does, so switching it off would cost the gesture and nothing else.
+
+STILL NOT HERE. MRU Ctrl+Tab ordering: the next/previous shortcuts are
+positional and this class holds no visit history.
 """
 
 from __future__ import annotations
@@ -44,6 +48,8 @@ from PySide6.QtWidgets import (
     QTabBar, QToolButton, QVBoxLayout, QWidget,
 )
 
+from ui.tab_tear_off import TabTearOff
+
 # Tabs share the bar equally until they hit the ceiling, then shrink to the
 # floor, and only once every tab is at the floor does the bar start scrolling.
 # That order is the point: scrolling hides tabs, eliding only shortens them.
@@ -56,6 +62,11 @@ CHEVRON_WIDTH = 26
 
 # The unsaved-changes dot, drawn in place of the close X.
 DIRTY_DOT_RADIUS = 3.5
+
+# The line drawn where a torn-off tab would land. Two pixels, in the accent, and
+# full height: it has to read as "between these two tabs" from the corner of the
+# eye, while the thing actually being looked at is the window under the cursor.
+DROP_LINE_WIDTH = 2
 
 
 def tab_titles(paths: list) -> list:
@@ -224,6 +235,73 @@ class DocumentTabBar(QTabBar):
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.DefaultContextMenu)
         self._palette = None
+        # Phase 4. Set by DocumentArea, which owns both halves of the move.
+        self._tear_off = None
+        # x of the insertion line while a torn-off tab is over this bar, or None.
+        self._drop_x = None
+
+    # -- the tear-off gesture ------------------------------------------
+
+    def set_tear_off(self, controller):
+        """The phase 4 gesture controller, installed by DocumentArea."""
+        self._tear_off = controller
+
+    def tear_off(self):
+        return self._tear_off
+
+    def set_drop_indicator(self, x):
+        """Draw (or clear) the insertion line at `x`. None clears it."""
+        if x == self._drop_x:
+            return
+        self._drop_x = x
+        self.update()
+
+    def drop_indicator(self):
+        """Where the insertion line is, or None. Named for the tests, which
+        cannot see pixels but can ask the question the pixels answer."""
+        return self._drop_x
+
+    def insertion_x(self, index: int) -> int:
+        """The x a tab inserted at `index` would start at.
+
+        Past the last tab is its right edge, so dropping on empty bar space
+        draws the line after everything rather than at the origin.
+        """
+        if self.count() == 0:
+            return 0
+        if index >= self.count():
+            return self.tabRect(self.count() - 1).right()
+        return self.tabRect(max(0, index)).left()
+
+    def mousePressEvent(self, event):
+        """Record the grab, then let QTabBar have the event.
+
+        `super()` is not optional: it is what still gives us Qt's own reorder
+        and the current-tab change. The tear-off decides nothing here.
+        """
+        if self._tear_off is not None:
+            self._tear_off.press(event)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        # Once the threshold is crossed the gesture owns the mouse, and feeding
+        # QTabBar any more moves would have it reordering a tab that is no
+        # longer in this bar.
+        if self._tear_off is not None and self._tear_off.move(event):
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._tear_off is not None and self._tear_off.release(event):
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        # Only ever reached mid-drag: the bar has NoFocus, and the gesture
+        # grabs the keyboard precisely so Escape lands here.
+        if self._tear_off is not None and self._tear_off.key_press(event):
+            return
+        super().keyPressEvent(event)
 
     # -- geometry ------------------------------------------------------
 
@@ -298,6 +376,23 @@ class DocumentTabBar(QTabBar):
 
     # -- gestures ------------------------------------------------------
 
+    def paintEvent(self, event):
+        """The tabs, and over them the insertion line if one is asked for.
+
+        Drawn on top rather than as part of a tab, because the line belongs to
+        the gap BETWEEN two tabs and there is no tab at the end of the bar for
+        it to belong to.
+        """
+        super().paintEvent(event)
+        if self._drop_x is None:
+            return
+        painter = QPainter(self)
+        colour = QColor(self._palette.accent) if self._palette is not None \
+            else QColor("#3b82f6")
+        left = max(0, min(int(self._drop_x) - DROP_LINE_WIDTH // 2,
+                          self.width() - DROP_LINE_WIDTH))
+        painter.fillRect(QRect(left, 0, DROP_LINE_WIDTH, self.height()), colour)
+
     def mouseDoubleClickEvent(self, event):
         """Empty space opens a new tab. A double-click ON a tab does nothing.
 
@@ -366,6 +461,10 @@ class DocumentArea(QWidget):
         self._bar.tabCloseRequested.connect(self.tab_close_requested)
         self._bar.new_tab_requested.connect(self.new_tab_requested)
         self._bar.tab_menu_requested.connect(self._on_tab_menu)
+        # Phase 4. The bar forwards its mouse events in here; everything the
+        # gesture then does goes back out through MainWindow's move methods.
+        self._tear_off = TabTearOff(self._bar, self)
+        self._bar.set_tear_off(self._tear_off)
         header_row.addWidget(self._bar, stretch=1)
 
         # Every tab in one list, for when there are more than the bar can show
@@ -605,7 +704,7 @@ class DocumentArea(QWidget):
         """Positional next/previous, wrapping. Ctrl+PgDn and Ctrl+PgUp.
 
         Positional on purpose: the most-recently-used ordering behind Ctrl+Tab
-        is phase 3, and it needs a visit history this class does not keep.
+        needs a visit history this class does not keep.
         """
         count = self._bar.count()
         if count < 2:

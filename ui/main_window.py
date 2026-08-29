@@ -132,6 +132,7 @@ class MainWindow(QMainWindow):
         self._force_quit = False # Quit menu wants a real app quit, not "close PDF"
         self._session_ending = False  # Windows is ending the session; never block it
         self._mica_applied = False  # the backdrop needs an HWND, so it waits for show()
+        self._screen_watched = False  # so does the QWindow behind screenChanged
         # Joined BEFORE anything that asks the registry a question. In
         # particular _should_check_for_updates counts the windows already in it,
         # so a window that has not joined would think it was the first.
@@ -240,6 +241,30 @@ class MainWindow(QMainWindow):
         if not self._mica_applied:
             self._mica_applied = True
             apply_mica(self, self._theme.is_dark)
+        self._watch_screen_changes()
+
+    def _watch_screen_changes(self):
+        """Notice when this window is dragged onto a monitor at another scale.
+
+        Same reason as the Mica line above: there is no `QWindow` to listen to
+        until the widget has been shown. Phase 4 needs it because the tear-off
+        can put a document on a different monitor in one gesture, and a cached
+        page pixmap is DEVICE-dependent: rendered for a 1.0 screen and shown on
+        a 1.5 one it is soft, and the panel thumbnails with it.
+        """
+        if self._screen_watched:
+            return
+        handle = self.windowHandle()
+        if handle is None:
+            return
+        self._screen_watched = True
+        handle.screenChanged.connect(self._on_screen_changed)
+
+    def _on_screen_changed(self, _screen=None):
+        """Every open document in this window re-renders. Nothing about the
+        documents changed; their cached pixmaps are for the wrong device."""
+        for view in self._area.views():
+            view.rerender_for_screen_change()
 
     def changeEvent(self, event):
         """Tell the registry when this window comes to the front.
@@ -329,8 +354,12 @@ class MainWindow(QMainWindow):
                 pass
         self._disconnect_view(view)
 
-    def move_view_to_window(self, view, target: "MainWindow") -> bool:
+    def move_view_to_window(self, view, target: "MainWindow", at: int = -1) -> bool:
         """Move one open document from this window into another one.
+
+        `at` is where in the target's bar it lands, and -1 appends. The menu
+        item never passes it; the phase 4 tear-off does, because a tab dropped
+        between two others has to go between them.
 
         THE ORDER IS THE WHOLE THING, and it is the order phase 1's reparenting
         test was measured with:
@@ -356,27 +385,39 @@ class MainWindow(QMainWindow):
         if index < 0:
             return False
         self.release_view(view)
-        target.adopt(view)
+        target.adopt(view, at)
         self._area.detach(view, index)
         if self._area.count() == 0:
             self.close()
         target.raise_and_focus()
         return True
 
-    def move_view_to_new_window(self, view=None) -> "MainWindow | None":
+    def move_view_to_new_window(self, view=None, geometry=None) -> "MainWindow | None":
         """Tab menu > Move to New Window. The user-facing half of phase 3.
 
         Offset from this window rather than placed exactly on top of it, so the
         document that just moved is visibly somewhere else.
+
+        `geometry` overrides that placement, and is how phase 4's tear-off
+        drops the new window straight under the cursor. It is an ARGUMENT and
+        not a second method on purpose: create, size, position, show, and only
+        then move the view across is the order the reparent depends on, and one
+        copy of that order is the only safe number.
         """
         if view is None:
             view = self.view
         if view is None or self._area.index_of(view) < 0:
             return None
         target = self._registry.create_window(theme=self._theme, show=False)
-        target.resize(self.size())
-        target.move(self.pos() + QPoint(NEW_WINDOW_OFFSET, NEW_WINDOW_OFFSET))
-        target.show()               # real, and on screen, BEFORE anything leaves
+        if geometry is not None:
+            target.setGeometry(geometry)
+        else:
+            target.resize(self.size())
+            target.move(self.pos() + QPoint(NEW_WINDOW_OFFSET, NEW_WINDOW_OFFSET))
+        # Real, and on screen, BEFORE anything leaves. show() is also what
+        # reapplies the Mica backdrop: a new top-level gets a fresh HWND and
+        # inherits nothing from the window it was torn off. See showEvent.
+        target.show()
         if not self.move_view_to_window(view, target):
             target.close()
             return None

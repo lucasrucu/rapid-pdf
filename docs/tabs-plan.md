@@ -192,7 +192,7 @@ implements it. No custom event handling needed.
 | 1 | Extract `DocumentView` from `MainWindow` | 2-3 d | **riskiest phase**, done on `refactor/document-view` |
 | 2 | Tabs in one window | 1.5-2 d | done on `feat/document-tabs` |
 | 3 | Multi-window via `WindowRegistry`, menu item only | 1.5-2 d | done on `feat/multi-window` |
-| 4 | Tear-off drag gesture | 1-1.5 d | |
+| 4 | Tear-off drag gesture | 1-1.5 d | done on `feat/tab-tear-off` |
 | 5 | Pages between tabs | 4 d | |
 | 6 | Session restore | 0.5-1 d | |
 
@@ -352,8 +352,26 @@ where the reparent invariants below are checked against real window handles.
 
 ### Phase 4: the tear-off drag gesture
 
-Roughly 400 lines in one file. It calls into phase 3's registry and does
-nothing else. Detail in "Design decisions" below.
+Done. `ui/tab_tear_off.py` holds the whole gesture and calls nothing but phase
+3's move methods. `DocumentTabBar` forwards its three mouse events and its key
+presses in, and paints the insertion line; `DocumentArea` owns the controller
+and the MRU visit history. Two arguments were added rather than two new code
+paths: `MainWindow.move_view_to_new_window(view, geometry=...)` places the torn
+window under the cursor, and `move_view_to_window(view, target, at=...)` docks
+at the index the insertion line was showing.
+
+**Two things worth knowing that the design did not anticipate.**
+
+- **The grab offset has to be measured against `frameGeometry()`, not the
+  widget origin.** `move()` positions the FRAME. Offscreen the difference is
+  2 px and invisible; on the real Windows platform the smoke script measures it
+  at 70 px, which is the title bar plus the menu bar, so the tab would have sat
+  that far above the cursor for the whole drag.
+- **`QTabBar` has to be handed a release before the gesture takes over.**
+  `setMovable(True)` means a reorder is already in flight when the threshold is
+  crossed, and a `QTabBar` left mid-drag keeps a pressed index the next press
+  inherits. `_settle_tab_bar` sends it one synthetic release, and the tab index
+  is re-read afterwards because that reorder may have moved it.
 
 **What phase 3 changed about it.** Less than expected, which was the goal.
 
@@ -398,6 +416,20 @@ Drag a page from one document's panel or organizer into another's. Needs
 Four days, and the undo/dirty refactor is the uncertain part, not the drag. A
 cross-document move dirties two documents and has to undo as one action across
 both. See the undo decision below.
+
+**What phase 4 changed about it.** Three things, none of them large.
+
+- The three-gestures table below held. The tear-off never enters Qt's DnD
+  system, so phase 5's `QDrag` cannot collide with it by construction, and the
+  four `event.source() is not self` guards are still the only thing in the way.
+- **A tear-off holds a mouse AND keyboard grab on the source tab bar for the
+  length of the gesture.** If dropping pages ONTO a tab ever becomes a thing,
+  it has to be a Qt drop on a bar that may be mid-grab. Starting a page drag
+  from the tab bar is not possible today and should stay that way.
+- `DocumentView.rerender_for_screen_change` is the existing "drop the cache and
+  redraw" call, used by the DPI check on a drop and by the window's
+  `screenChanged`. A cross-document page move should reuse it rather than grow
+  a third copy of that sequence.
 
 ### Phase 6: session restore
 
