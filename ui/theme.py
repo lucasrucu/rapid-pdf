@@ -409,6 +409,36 @@ QTabBar::tab:selected {{
 }}
 QTabBar::tab:hover:!selected {{ color: {p.text_dim}; }}
 
+/* ---- document tabs --------------------------------------------------
+   The bar across the top of the window, one tab per open PDF. Same underline
+   language as the Editor/Organizer switcher above, but it has to shrink: the
+   min-width up there is a floor for two fixed labels, and here it would stop
+   tabs narrowing before the bar starts scrolling. The real widths come from
+   DocumentTabBar.tabSizeHint; this only takes the floor off. */
+#documentTabHeader {{
+    background-color: {p.window};
+    border-bottom: 1px solid {p.border};
+}}
+QTabBar#documentTabBar::tab {{
+    min-width: 0px;
+    padding: 6px 6px 6px 12px;
+    margin: 0px;
+}}
+QTabBar#documentTabBar::tab:selected {{
+    background-color: {p.surface};
+}}
+QToolButton#documentTabChevron {{
+    background: transparent;
+    border: none;
+    color: {p.text_dim};
+    font-size: 13px;
+}}
+QToolButton#documentTabChevron:hover {{
+    background-color: {p.surface_hover};
+    color: {p.text};
+}}
+QToolButton#documentTabChevron::menu-indicator {{ image: none; }}
+
 /* ---- list widgets (organizer / page panel) ------------------------- */
 QListWidget {{
     background-color: {p.surface};
