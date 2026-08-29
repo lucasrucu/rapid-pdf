@@ -429,6 +429,29 @@ def test_a_new_empty_tab_can_be_closed_again(win, area, three_pages):
     area.check_invariant()
 
 
+def test_closing_the_front_tab_unbinds_it_before_it_is_torn_down(
+        win, area, three_pages, one_page):
+    """Order, and it shows up as noise rather than as a failure.
+
+    The window unbinds its chrome from a departing view by disconnecting five
+    signals. Tear the view down first and every one of those disconnects fails,
+    which PySide reports as a RuntimeWarning on stderr: harmless, and exactly
+    the kind of thing that gets ignored until it is hiding a real one. So the
+    departure is announced while the connections still exist.
+    """
+    import warnings
+
+    win.open_paths([three_pages, one_page])
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        win.close_tab(area.current_index())
+
+    failed = [str(w.message) for w in caught
+              if "Failed to disconnect" in str(w.message)]
+    assert failed == []
+    assert area.count() == 1
+
+
 def test_closing_a_dirty_tab_prompts_and_cancel_keeps_it(
         win, area, monkeypatch, three_pages, one_page):
     win.open_paths([three_pages, one_page])

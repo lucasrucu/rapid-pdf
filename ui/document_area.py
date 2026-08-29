@@ -462,6 +462,13 @@ class DocumentArea(QWidget):
         view = self.view_at(index)
         if view is None:
             return
+        if view is self._current_view:
+            # Announce the departure while this view's connections still exist,
+            # so the window can unbind its chrome from it cleanly. Do it after
+            # the teardown below and the disconnect fails with a Qt warning on
+            # stderr, because the signals have already been cut.
+            self._current_view = None
+            self.current_view_changed.emit(view, None)
         self._syncing = True
         try:
             self._bar.removeTab(index)
