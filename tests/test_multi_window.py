@@ -35,7 +35,7 @@ Qt: the test drives the same entry point `changeEvent` does.
 import fitz
 import pytest
 
-from PySide6.QtCore import QPointF, QRectF, QUrl
+from PySide6.QtCore import QRectF, QUrl
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QApplication, QMessageBox
 

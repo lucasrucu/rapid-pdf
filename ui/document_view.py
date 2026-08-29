@@ -85,7 +85,7 @@ from PySide6.QtWidgets import (
 from core.ocr_worker import run_ocr_enhance
 from core.page_ops import is_permutation
 from core.pdf_document import PDFDocument
-from core.settings import dialog_start_dir, remember_dialog_dir, settings
+from core.settings import dialog_start_dir, remember_dialog_dir
 from ui.canvas import PDFCanvas
 from ui.combine_dialog import CombineDialog
 from ui.organizer import PageOrganizer
