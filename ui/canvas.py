@@ -565,7 +565,22 @@ class _Command(QUndoCommand):
         self._canvas = canvas
         self._skip_redo = True
 
+    def affected_views(self) -> tuple:
+        """The document this edit belongs to, for the window's stack.
+
+        One stack now carries every tab in the window (see ui/undo.py), so a
+        command has to say whose revision counter it moves. A bare canvas with
+        no view behind it (tests, the smoke script) reports nothing and the
+        bookkeeping simply does not run.
+        """
+        owner = self._canvas.revision_owner()
+        return (owner,) if owner is not None else ()
+
     def redo(self):
+        # BEFORE the skip. The edit is already applied live when the command is
+        # constructed, so the push's own first redo() is a no-op for the scene
+        # but it is still the first revision of this document.
+        self._canvas.note_revision(1)
         if self._skip_redo:
             self._skip_redo = False
             return
@@ -573,6 +588,7 @@ class _Command(QUndoCommand):
         self._canvas.annotation_changed.emit()
 
     def undo(self):
+        self._canvas.note_revision(-1)
         self._do_undo()
         self._canvas.annotation_changed.emit()
 
@@ -780,8 +796,13 @@ class PDFCanvas(QGraphicsView):
         self._resize_orig_rect: QRectF | None = None
         self._resize_before: dict | None = None
 
-        # Undo/redo
+        # Undo/redo. This one is the FALLBACK, for a canvas standing on its own
+        # (tests, the smoke script). Inside the app a DocumentView hands over
+        # the window's shared stack: see set_undo_stack and ui/undo.py.
         self._undo_stack = QUndoStack(self)
+        self._owns_undo_stack = True
+        # The DocumentView whose dirty state this canvas's edits move, or None.
+        self._revision_owner = None
 
         # In-app annotation clipboard (clones of copied items)
         self._clipboard_items: list = []
@@ -861,6 +882,58 @@ class PDFCanvas(QGraphicsView):
     @property
     def undo_stack(self) -> QUndoStack:
         return self._undo_stack
+
+    def set_undo_stack(self, stack):
+        """Push this canvas's edits onto somebody else's history.
+
+        The window's, in practice: a cross-document page move is one command
+        that touches two documents, and it can only be one command if there is
+        one stack. See ui/undo.py for why that is not negotiable.
+
+        Passing None hands the canvas a private stack back, which is what keeps
+        a bare canvas (tests, the smoke script) working unchanged.
+        """
+        if stack is None:
+            self._undo_stack = QUndoStack(self)
+            self._owns_undo_stack = True
+        else:
+            self._undo_stack = stack
+            self._owns_undo_stack = False
+
+    def set_revision_owner(self, owner):
+        """Name the DocumentView whose dirty state this canvas's edits move."""
+        self._revision_owner = owner
+
+    def revision_owner(self):
+        """The DocumentView this canvas's edits dirty, or None."""
+        return self._revision_owner
+
+    def clear_own_history(self):
+        """Put this document's undo history out of reach, and nobody else's.
+
+        A canvas that owns its stack just clears it. A canvas SHARING the
+        window's stack cannot: the other tabs' history is in there too. What it
+        can do is drop the whole history when this document is actually named
+        in it, which is what `WindowUndoStack.drop_history_for` decides. A tab
+        nothing has edited costs nothing, and that is the common case.
+        """
+        if self._owns_undo_stack:
+            self._undo_stack.clear()
+            return
+        dropper = getattr(self._undo_stack, "drop_history_for", None)
+        if dropper is not None:
+            dropper(self._revision_owner)
+
+    def note_revision(self, delta: int):
+        """Tell the owning document one of its edits was applied or taken back.
+
+        Dirty state is a per-document revision counter now, because one shared
+        stack's isClean() cannot answer the question for three documents at
+        once. Silent when nobody owns this canvas.
+        """
+        owner = self._revision_owner
+        if owner is not None:
+            owner.note_revision(delta)
 
     def set_backdrop_color(self, color):
         """Set the color of the work area behind the page (themed light/dark)."""
@@ -946,7 +1019,7 @@ class PDFCanvas(QGraphicsView):
         self._scene.clear()          # deletes any search overlays C++-side too
         self._search_items = []
         self._bg_item = None
-        self._undo_stack.clear()
+        self.clear_own_history()
         self._cancel_interaction()
         if doc and doc.page_count() > 0:
             self._load_page(0)
@@ -1464,6 +1537,78 @@ class PDFCanvas(QGraphicsView):
                 self._page_annotations.setdefault(page_num, []).append(item)
                 item.setVisible(page_num == self._current_page)
 
+    # ------------------------------------------------------------------
+    # Carrying markup to another document (phase 5 of docs/tabs-plan.md)
+    # ------------------------------------------------------------------
+
+    def export_page_markup(self, rows: list) -> list:
+        """The JSON form of the markup on `rows`, one list per row, in order.
+
+        UNSAVED MARKUP DOES NOT TRAVEL WITH insert_pdf. It is Qt scene items,
+        not annotations in the file yet, so a page dragged into another tab
+        would arrive blank. This is the seam that carries it, and it is the one
+        that already existed: `_item_to_json` is PDF-space and zoom-independent
+        precisely so the far end can rebuild at its own zoom.
+
+        Images come back as None from `_item_to_json` and are therefore NOT in
+        here. They are baked into the page content instead, before the
+        transfer, by `bake_image_items` below.
+        """
+        out = []
+        for row in rows:
+            items = self._page_annotations.get(row, [])
+            out.append([j for j in (self._item_to_json(it) for it in items)
+                        if j is not None])
+        return out
+
+    def build_page_markup(self, exported: list, at: int) -> dict:
+        """Rebuild exported markup as items on THIS canvas, filed at `at`+k.
+
+        Returns a {page_index: [items]} fragment for a page command to merge
+        into the map it restores. The items are constructed but not attached:
+        `restore_page_annotations` is what puts them in the scene, so redo and
+        undo go through exactly one path.
+        """
+        built: dict = {}
+        for k, items_json in enumerate(exported):
+            page_num = at + k
+            items = [it for it in (self._item_from_dict(j, page_num)
+                                   for j in items_json) if it is not None]
+            if items:
+                built[page_num] = items
+        return built
+
+    def bake_image_items(self, doc, rows: list) -> int:
+        """Write lifted images on `rows` into the page content, and drop them.
+
+        Lifted images are the one kind of markup the JSON path loses on
+        purpose: `_item_to_json` skips them because they are baked into page
+        content on save and recovered by the embedded-image lift feature. A
+        page moving to another document is saved by nobody in between, so
+        without this the image simply vanishes.
+
+        Baking makes it page CONTENT (write_annotations routes an image through
+        insert_image, not through an annotation object), so it travels with
+        insert_pdf like anything else drawn on the page, and a later
+        delete_tagged_annotations in the destination cannot strip it.
+        """
+        if doc is None:
+            return 0
+        baked = 0
+        for row in rows:
+            items = self._page_annotations.get(row, [])
+            images = [it for it in items if isinstance(it, ImageAnnotationItem)]
+            if not images:
+                continue
+            dicts = [it.to_annotation_dict(self._zoom) for it in images]
+            doc.write_annotations(row, dicts)
+            for it in images:
+                self._detach_item(it)
+            baked += len(images)
+        if baked:
+            self._invalidate_embedded_scan()
+        return baked
+
     def reload_current_page(self):
         """Re-render the current page (e.g. after stripping baked markup on open)."""
         if self._doc and self._doc.page_count() > 0:
@@ -1492,7 +1637,7 @@ class PDFCanvas(QGraphicsView):
             # A pasted-image Add command could otherwise redo a dropped item back
             # in (and re-bake a duplicate); clearing avoids that. Only fires when
             # an image was actually dropped, so shape/text-only sessions keep undo.
-            self.undo_stack.clear()
+            self.clear_own_history()
             self._load_page(self._current_page)
 
     def reorder_pages(self, new_order: list):

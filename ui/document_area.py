@@ -45,13 +45,14 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
+from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractButton, QHBoxLayout, QMenu, QSizePolicy, QStackedWidget, QStyle,
     QTabBar, QToolButton, QVBoxLayout, QWidget,
 )
 
+from ui.page_drag import read_page_mime
 from ui.tab_tear_off import TabTearOff
 
 # Tabs share the bar equally until they hit the ceiling, then shrink to the
@@ -218,9 +219,32 @@ class _TabCloseButton(QAbstractButton):
         painter.drawLine(inset.topRight(), inset.bottomLeft())
 
 
+#: How long a page drag has to rest over a tab before that tab comes forward.
+#: Long enough that dragging ACROSS the bar on the way somewhere else never
+#: fires, short enough that deliberately parking on a tab does not feel stuck.
+HOVER_SWITCH_MS = 550
+
+#: How far the cursor may wander and still count as resting on the same tab.
+#: A hand holding a drag still is not still, and restarting the countdown on
+#: every pixel of tremor means it never completes.
+HOVER_JITTER_PX = 4
+
+
 class DocumentTabBar(QTabBar):
     """The bar itself. Widths, the dirty dot, and the two gestures Qt does not
-    give us: double-click on empty space, and a context menu per tab."""
+    give us: double-click on empty space, and a context menu per tab.
+
+    IT IS ALSO A DRAG TARGET, and a strange one: it accepts a page drag so it
+    can HOVER-SWITCH, and then refuses every drop. Dragging a page onto a tab
+    and holding still brings that tab forward mid-drag, so the page can be
+    dropped into a document that was not on screen when the drag started. The
+    drop itself belongs to the strip or the grid underneath, so `dragMoveEvent`
+    ignores the event: Qt keeps delivering moves to a widget that accepted the
+    ENTER, which is exactly the shape this needs.
+
+    Switching does not end the drag. Nothing here touches the QDrag; the stack
+    simply shows a different widget under a cursor that is still holding pages.
+    """
 
     #: Double-clicked past the last tab.
     new_tab_requested = Signal()
@@ -243,6 +267,75 @@ class DocumentTabBar(QTabBar):
         self._tear_off = None
         # x of the insertion line while a torn-off tab is over this bar, or None.
         self._drop_x = None
+        # Phase 5. Hover-switch while a PAGE drag is over the bar: which tab
+        # the cursor is resting on, where it was when the countdown started,
+        # and the countdown itself.
+        self.setAcceptDrops(True)
+        self._hover_index = -1
+        self._hover_pos = None
+        self._hover_timer = QTimer(self)
+        self._hover_timer.setSingleShot(True)
+        self._hover_timer.setInterval(HOVER_SWITCH_MS)
+        self._hover_timer.timeout.connect(self._on_hover_elapsed)
+
+    # -- hover-switch under a page drag --------------------------------
+
+    def dragEnterEvent(self, event):
+        """Accept a PAGE drag only, and only so move events keep arriving.
+
+        Nothing else is welcome: a file dropped from Explorer belongs to the
+        window, and the tear-off never enters Qt's drag system at all (phase 4),
+        so there is no third case to worry about.
+        """
+        if read_page_mime(event.mimeData()) is None:
+            self._cancel_hover()
+            event.ignore()
+            return
+        event.accept()
+
+    def dragMoveEvent(self, event):
+        """Count down to a tab switch, and never accept the drop itself."""
+        if read_page_mime(event.mimeData()) is None:
+            self._cancel_hover()
+            event.ignore()
+            return
+        pos = (event.position().toPoint() if hasattr(event, "position")
+               else event.pos())
+        index = self.tabAt(pos)
+        wandered = (self._hover_pos is None
+                    or (pos - self._hover_pos).manhattanLength() > HOVER_JITTER_PX)
+        if index != self._hover_index or wandered:
+            self._hover_index = index
+            self._hover_pos = pos
+            self._hover_timer.stop()
+            if index >= 0 and index != self.currentIndex():
+                self._hover_timer.start()
+        # Deliberately ignored: hovering here switches tabs, it does not land
+        # pages. The drop belongs to the strip or the grid under the bar.
+        event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self._cancel_hover()
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        self._cancel_hover()
+        event.ignore()
+
+    def _cancel_hover(self):
+        self._hover_timer.stop()
+        self._hover_index = -1
+        self._hover_pos = None
+
+    def _on_hover_elapsed(self):
+        """The cursor rested long enough. Bring that tab forward."""
+        index = self._hover_index
+        if 0 <= index < self.count() and index != self.currentIndex():
+            self.setCurrentIndex(index)
+
+    def hover_switch_timer(self) -> QTimer:
+        """The countdown, for the tests. A real drag loop cannot run in one."""
+        return self._hover_timer
 
     # -- the tear-off gesture ------------------------------------------
 
@@ -569,6 +662,7 @@ class DocumentArea(QWidget):
             (view.title_changed, self._refresh_titles),
             (view.dirty_changed, self._refresh_dirty),
             (view.close_requested, self._on_view_closed),
+            (view.activation_requested, self._on_activation_requested),
         )
 
     def _connect_view(self, view):
@@ -591,6 +685,23 @@ class DocumentArea(QWidget):
         view = self.sender()
         if view is not None:
             self.view_close_requested.emit(view)
+
+    def _on_activation_requested(self):
+        """A view is about to be changed and wants to be watched while it is.
+
+        Phase 5: one undo stack per window, so Ctrl+Z can reach a document in
+        another tab. The command asks for its tab first, and this is what
+        brings it up. `sender()` rather than a captured view, for the same
+        reason as `_on_view_closed`: one object this area can disconnect by
+        reference. Ignored while an MRU walk is in flight, which is the one
+        time the front tab is deliberately not the one the user is settling on.
+        """
+        view = self.sender()
+        if view is None or view is self._current_view:
+            return
+        index = self.index_of(view)
+        if index >= 0 and not self.is_walking_mru():
+            self.set_current_index(index)
 
     def add_view(self, view, activate: bool = True) -> int:
         """Take ownership of a DocumentView and give it a tab.

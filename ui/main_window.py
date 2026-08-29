@@ -30,9 +30,11 @@ WHAT IS REBOUND ON A TAB SWITCH, which is where the bugs in this phase live.
   - the five chrome signals, disconnected from the tab leaving and connected to
     the one arriving (`_connect_view` / `_disconnect_view`). Leave them all
     connected and a background document writes the status bar.
-  - the Edit menu's UNDO and REDO, which `QUndoStack.createUndoAction` binds to
-    one stack for the life of the action, so they are rebuilt rather than
-    re-pointed (`_rebuild_undo_actions`).
+  - NOT the Edit menu's UNDO and REDO any more. Phase 5 gave the WINDOW one
+    undo stack that every tab shares, because a page dragged from one tab into
+    another is one action with two document-level effects and no pair of stacks
+    can undo that without leaving a duplicate. The actions are built once
+    (`_rebuild_undo_actions`) and never rebound. See ui/undo.py.
   - the status bar's page box, and the window title, both re-read off the
     arriving view (`DocumentView.refresh_chrome`).
   - the fit group, which follows the arriving CANVAS rather than the remembered
@@ -65,6 +67,7 @@ APPLICATION, so only the first window runs it. See `_should_check_for_updates`.
 """
 
 import os
+import uuid
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
@@ -104,6 +107,7 @@ from ui.document_view import DocumentView
 from ui.preferences_dialog import PreferencesDialog
 from ui.page_jump import PageJump
 from ui.theme import ThemeManager, apply_mica, themed_icon, qtawesome_available, LIGHT
+from ui.undo import WindowUndoStack
 from ui.window_registry import WindowRegistry
 
 
@@ -117,6 +121,19 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._prefs_dialog = None  # the one Preferences window, while it is open
         self._connected_view = None  # the view currently driving this chrome
+        # ONE UNDO STACK FOR THE WHOLE WINDOW, shared by every tab in it.
+        # Phase 5 of docs/tabs-plan.md: a page dragged from one tab into
+        # another is one action with two document-level effects, and split
+        # across two stacks there is no ordering that undoes it without leaving
+        # a duplicate. Every DocumentView that lands here is handed this stack;
+        # see ui/undo.py for the dirty-state rule that goes with it.
+        self._undo_stack = WindowUndoStack(self)
+        # A stable name for this window, carried in a page drag's payload. The
+        # binding check at drop time is still a LIVE comparison of the two
+        # views' windows, because a tear-off can move a document to another
+        # window while the drag is in flight; this is the record of where the
+        # drag started. See ui/page_drag.py.
+        self._window_id = uuid.uuid4().hex
         # Theme: use the passed-in manager, or stand one up (e.g. tests/smoke).
         self._theme = theme or ThemeManager(QApplication.instance())
         # Every open document in this window, one tab each. Empty for now: the
@@ -200,6 +217,7 @@ class MainWindow(QMainWindow):
         which are decisions about tabs and therefore the window's.
         """
         view = DocumentView(self._theme)
+        view.set_undo_stack(self._undo_stack)   # the window's, shared by every tab
         view.apply_palette(self._theme.palette)
         if hasattr(self, "_panel_action"):
             view.set_page_panel_visible(self._panel_action.isChecked())
@@ -327,6 +345,11 @@ class MainWindow(QMainWindow):
         """
         view.paths_requested.connect(self.open_paths)
         view.combine_requested.connect(self.combine_paths)
+        # The arriving document joins THIS window's history. Its old window
+        # already dropped whatever it held for it (see release_view), because a
+        # command left behind there would replay against a document that is no
+        # longer in that window.
+        view.set_undo_stack(self._undo_stack)
         view.set_page_panel_visible(self._panel_action.isChecked())
         view.apply_palette(self._theme.palette)
         # A brand new window comes up holding one empty tab, and a document
@@ -360,6 +383,12 @@ class MainWindow(QMainWindow):
                 signal.disconnect(slot)
             except (RuntimeError, TypeError):
                 pass
+        # This window's stack may hold commands that touch the departing
+        # document, and there is no selective removal in QUndoStack. Dropping
+        # the history is the honest answer, and `drop_history_for` only does it
+        # when the view is actually named in there: a tab nothing has edited,
+        # which is the ordinary tear-off, costs nothing.
+        self._undo_stack.drop_history_for(view)
         self._disconnect_view(view)
 
     def move_view_to_window(self, view, target: "MainWindow", at: int = -1) -> bool:
@@ -588,28 +617,38 @@ class MainWindow(QMainWindow):
         current.refresh_chrome()
 
     def _rebuild_undo_actions(self):
-        """Point Edit > Undo / Redo at the front document's history.
+        """Point Edit > Undo / Redo at this WINDOW's history. Once, not per tab.
 
-        Rebuilt rather than re-pointed. `QUndoStack.createUndoAction` binds an
-        action to ONE stack for the life of that action, and there is one stack
-        per document because `PDFCanvas.set_document` clears it, so a canvas
-        can never serve two. The old pair comes out of the menu first: two
-        actions carrying Ctrl+Z at once is an ambiguous shortcut to Qt.
+        PHASE 5 CHANGED WHAT THIS METHOD IS FOR. It used to run on every tab
+        switch, because `QUndoStack.createUndoAction` binds an action to one
+        stack for the life of that action and there was one stack per document.
+        There is now one stack per WINDOW (see ui/undo.py: a cross-document
+        page move cannot be undone as one action any other way), so the pair is
+        built when the menu is and never rebound. The rebuild is kept, and made
+        idempotent, because it is still the one place the pair is constructed
+        and the anchor discipline below still matters: two actions carrying
+        Ctrl+Z at once is an ambiguous shortcut to Qt.
+
+        Undo can now reach a document in another tab. The command switches to
+        that tab before it changes anything (see `_PageCommand._focus`), so the
+        user watches the edit come back rather than finding out about it later.
         """
-        view = self.view
-        if view is None:
+        if self._undo_action is not None:
             return
-        for action in (self._undo_action, self._redo_action):
-            if action is not None:
-                self._edit_menu.removeAction(action)
-                action.setParent(None)
-        stack = view.undo_stack()
-        self._undo_action = stack.createUndoAction(self, "Undo")
+        self._undo_action = self._undo_stack.createUndoAction(self, "Undo")
         self._undo_action.setShortcut(QKeySequence.StandardKey.Undo)
-        self._redo_action = stack.createRedoAction(self, "Redo")
+        self._redo_action = self._undo_stack.createRedoAction(self, "Redo")
         self._redo_action.setShortcut(QKeySequence.StandardKey.Redo)
         self._edit_menu.insertAction(self._undo_anchor, self._undo_action)
         self._edit_menu.insertAction(self._undo_anchor, self._redo_action)
+
+    def undo_stack(self) -> WindowUndoStack:
+        """This window's single history. Every tab in it pushes here."""
+        return self._undo_stack
+
+    def window_id(self) -> str:
+        """A stable name for this window, for a page drag's payload."""
+        return self._window_id
 
     def _sync_fit_group(self, view: DocumentView):
         """Show the fit the ARRIVING canvas is actually in.

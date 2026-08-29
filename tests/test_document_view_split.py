@@ -252,7 +252,11 @@ def test_a_saved_document_stops_being_dirty(win):
     assert win.view.is_dirty()
     assert win.save_pdf() is True
     assert not win.view.is_dirty()
-    assert win.view.undo_stack().isClean()
+    # NOT isClean(). Phase 5 put one undo stack on the WINDOW, so its clean
+    # index cannot say "this document is saved" without claiming it for every
+    # other tab too. Each document remembers the revision it was saved at
+    # instead; see ui/undo.py.
+    assert win.view._saved_rev == win.view._rev
 
 
 # ---------------------------------------------------------------------------
@@ -350,10 +354,15 @@ def test_the_editor_organizer_switcher_is_inside_the_view(win):
 
 def test_the_view_holds_its_own_canvas_and_never_shares_it(win, empty_win):
     """PDFCanvas.set_document clears the undo stack, so one canvas can only
-    ever serve one document. Two views, two canvases, two stacks."""
+    ever serve one document. Two views, two canvases.
+
+    The STACK is no longer per canvas: phase 5 moved it to the window, so these
+    two share one only when they are in one window. These are two windows, so
+    they do not."""
     assert win.view._canvas is not empty_win.view._canvas
     assert win.view.undo_stack() is not empty_win.view.undo_stack()
     assert win.view.undo_stack() is win.view._canvas.undo_stack
+    assert win.view.undo_stack() is win.undo_stack()
 
 
 def test_a_view_can_be_built_without_a_window_at_all(win):

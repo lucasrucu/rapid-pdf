@@ -24,7 +24,15 @@ viewport is a native window, so reparenting it across top-levels destroys and
 recreates the context and the scene's backing store goes with it. See the
 standing constraint in docs/tabs-plan.md.
 
-PHASE 4 ADDED STEPS 5 TO 7, the tear-off gesture. Those steps are the reason to
+PHASE 5 ADDED STEP 4, dragging a page from one tab into another. A real QDrag
+cannot be scripted either way (exec() hands control to the platform and blocks
+the loop on Windows), so what this step adds over the pytest suite is genuine
+QDropEvent and QDragMoveEvent objects going through the real widgets in real
+top-level windows: the position, the mime round-trip and the modifier reading
+are the platform's own rather than a stand-in object's. It also exercises the
+per-window undo stack end to end, which is the change phase 5 rests on.
+
+PHASE 4 ADDED THE TEAR-OFF GESTURE STEPS. Those steps are the reason to
 prefer the second command line above. The pytest suite drives the gesture by
 handing synthesised QMouseEvents to the tab bar, which is enough to pin the
 decisions it makes; what it cannot do is grab the mouse, move a real top-level
@@ -43,11 +51,12 @@ import tempfile
 
 import fitz
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer
-from PySide6.QtGui import QColor, QMouseEvent
+from PySide6.QtGui import QColor, QDragMoveEvent, QDropEvent, QMouseEvent
 from PySide6.QtWidgets import QApplication, QWidget
 
 from core.settings import Settings, set_settings
 from ui.canvas import AddItemsCommand, HighlightItem
+from ui.page_drag import make_page_mime
 from ui.tab_tear_off import DETACH_MARGIN
 from ui.theme import apply_theme
 from ui.window_registry import WindowRegistry
@@ -149,7 +158,6 @@ def run(app, folder):
     canvas = moving._canvas
     before = {
         "scene": canvas.scene(),
-        "undo": canvas.undo_stack,
         "viewport": canvas.viewport(),
         "fitz": moving._doc.doc,
         "pages": moving.page_count(),
@@ -168,8 +176,12 @@ def run(app, folder):
 
     print("\n   reparenting, re-verified across adopt (phase 1 finding 2)")
     check("same scene object", canvas.scene() is before["scene"])
-    check("same undo stack object", canvas.undo_stack is before["undo"])
     check("same viewport object", canvas.viewport() is before["viewport"])
+    # NOT the undo stack. Phase 5 moved it to the WINDOW, so a document
+    # arriving somewhere else necessarily joins that window's history. That is
+    # the deliberate trade behind a cross-document page move being one command.
+    check("the arriving document joined the new window's history",
+          canvas.undo_stack is second.undo_stack())
     check("same fitz document", moving._doc.doc is before["fitz"])
     check("document still open", moving._doc.is_open())
     check("page count unchanged", moving.page_count() == before["pages"])
@@ -195,11 +207,75 @@ def run(app, folder):
     check("the other window still shows its own document",
           first.view is not moving and first.view.has_document())
 
-    print("\n4. tear a tab out with the gesture (phase 4)")
+    print("\n4. drag a page from one tab into another (phase 5)")
+    # A real QDrag cannot be scripted: exec() hands control to the platform and
+    # blocks the event loop on Windows. What this DOES do that the pytest suite
+    # cannot is build genuine QDropEvent / QDragMoveEvent objects and put them
+    # through the real widgets in real top-level windows, so the position, the
+    # mime round-trip and the modifier reading are the platform's own rather
+    # than a stand-in object's.
+    donor = area.view_at(0)
+    recipient = area.view_at(1)
+    donor_pages = donor.page_count()
+    recipient_pages = recipient.page_count()
+    check("two documents to move a page between",
+          donor is not recipient and donor_pages > 1)
+
+    bar = area.bar()
+    area.set_current_index(1)
+    mime = make_page_mime(donor, [0])
+    tab_rect = bar.tabRect(0)
+    hover = QDragMoveEvent(tab_rect.center(), Qt.DropAction.MoveAction, mime,
+                           Qt.MouseButton.LeftButton,
+                           Qt.KeyboardModifier.NoModifier)
+    bar.dragMoveEvent(hover)
+    check("hovering a tab armed the switch", bar.hover_switch_timer().isActive())
+    check("the bar refused the drop itself", not hover.isAccepted())
+    check("it has not switched yet", area.current_index() == 1,
+          area.current_index())
+    bar._on_hover_elapsed()
+    check("resting on the tab brought it forward", area.current_index() == 0,
+          area.current_index())
+
+    area.set_current_index(1)
+    strip = recipient._page_panel._list
+    cell = strip.visualItemRect(strip.item(0))
+    # `drop_mime` is held in a NAMED local on purpose. QDropEvent does not take
+    # ownership of the QMimeData, so an inline argument is collectable the
+    # moment the constructor returns and the handler reads freed memory. A
+    # segfault, not an exception, because this is all C++ underneath.
+    drop_mime = make_page_mime(donor, [0])
+    drop = QDropEvent(QPointF(cell.center().x(), cell.top() + 1),
+                      Qt.DropAction.MoveAction, drop_mime,
+                      Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+    strip.dropEvent(drop)
+    check("the drop was taken", drop.isAccepted())
+    check("the page left the donor", donor.page_count() == donor_pages - 1,
+          donor.page_count())
+    check("the page arrived in the recipient",
+          recipient.page_count() == recipient_pages + 1, recipient.page_count())
+    check("both documents are unsaved", donor.is_dirty() and recipient.is_dirty())
+    check("the donor's close prompt names the recipient",
+          recipient.transfer_label() in donor.transfer_warning(),
+          donor.transfer_warning())
+    check("one command, not two", first.undo_stack().count() == 1,
+          first.undo_stack().count())
+
+    first.undo_stack().undo()
+    check("undo put the page back in the donor",
+          donor.page_count() == donor_pages, donor.page_count())
+    check("undo took it out of the recipient",
+          recipient.page_count() == recipient_pages, recipient.page_count())
+    check("undo switched to the document it changed",
+          area.current_view() is recipient, area.current_index())
+    check("both documents are clean again",
+          not donor.is_dirty() and not recipient.is_dirty())
+    area.check_invariant()
+
+    print("\n5. tear a tab out with the gesture (phase 4)")
     # Two more documents in the first window, so there is something to tear and
     # something left behind when it goes.
     first.open_paths([make_pdf(folder, "delta.pdf", 2)])
-    bar = area.bar()
     check("three tabs to drag from", area.count() == 3, area.count())
     torn_view = area.view_at(2)
     torn_canvas = torn_view._canvas
@@ -231,7 +307,7 @@ def run(app, folder):
     area.check_invariant()
     third.document_area().check_invariant()
 
-    print("\n5. drop it back onto the first window's bar, at index 0")
+    print("\n6. drop it back onto the first window's bar, at index 0")
     over = _tab_point(bar, 0, dx=6)
     _move(bar, over)
     target = bar.tear_off().drop_target()
@@ -251,7 +327,7 @@ def run(app, folder):
           QWidget.mouseGrabber() is None, QWidget.mouseGrabber())
     area.check_invariant()
 
-    print("\n6. Ctrl+Tab walks the visit history, not the tab order")
+    print("\n7. Ctrl+Tab walks the visit history, not the tab order")
     area.set_current_index(0)
     area.set_current_index(2)
     area.set_current_index(1)
@@ -267,7 +343,7 @@ def run(app, folder):
     check("Ctrl+PgDn is still positional",
           area.current_index() == 1, area.current_index())
 
-    print("\n7. close both windows")
+    print("\n8. close both windows")
     quit_seen = []
     app.aboutToQuit.connect(lambda: quit_seen.append(True))
 
