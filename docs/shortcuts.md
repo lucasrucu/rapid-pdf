@@ -5,9 +5,13 @@
 | Key | Action |
 |---|---|
 | `V` | Select tool |
-| `H` | Highlight tool |
+| `H` | Pan tool (hand) |
 | `R` | Rectangle tool |
 | `L` | Line tool |
+| `T` | Text tool |
+
+Pan moves the view and nothing else: with it active, nothing on the page can be
+selected, moved or edited.
 
 ## Editing
 
@@ -34,7 +38,9 @@
 | `Ctrl+Z` | Undo a page delete or move (same stack as annotations) |
 
 Deleting is not confirmed, because it is undoable. The last page cannot be
-deleted: a document has to keep at least one.
+deleted: a document has to keep at least one. The strip carries no delete
+button: select and press `Delete`, or use the right-click menu, or the
+Organizer.
 
 ## Going to a page
 
@@ -79,6 +85,19 @@ strip keeps its own size.
 | Double-click a shape | Add or edit text inside it |
 | `Ctrl+scroll` | Zoom in / out (centered on cursor) |
 | Scroll past the bottom / top of a page | Turn to the next / previous page |
+| Hold `Space` and drag | Pan, then back to the tool you were on |
+| Middle-button drag | Pan, whatever the active tool is |
+| Drag an image that is part of the page | Lifts it out and moves it (`Ctrl+Z` twice puts it back) |
+
+The cursor says which it is: a hand only where a drag pans, an arrow or a move
+cursor where a drag selects or moves something.
+
+## View
+
+The four icons at the right of the status bar are the view modes, one active at
+a time, each naming itself on hover: fit page, fit width, fit height, and 100%
+(actual size). Zooming by hand turns all four off, because the view is no longer
+at any of them.
 
 Trackpads scroll by the distance the fingers actually move, so two fingers cover
 the same ground as the same gesture in any other app. Turning a page takes a

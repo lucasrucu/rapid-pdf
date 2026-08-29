@@ -52,6 +52,9 @@ _PAGE_TURN_ARROWS = {
 # how many notches the event is worth, so a mouse click is still exactly this
 # and a trackpad's small deltas zoom smoothly instead of a whole step each.
 _ZOOM_PER_NOTCH = 1.15
+# Fit-width / fit-height leave a sliver rather than running the page edge into
+# the viewport edge. Fit-page keeps its own, looser 0.90 (padding on both axes).
+_FIT_AXIS_PADDING = 0.98
 
 
 # ---------------------------------------------------------------------------
@@ -609,6 +612,38 @@ class RemoveItemsCommand(_Command):
             it.setSelected(True)
 
 
+class LiftImageCommand(_Command):
+    """Lifting an embedded image out of the page, as one undoable step.
+
+    A lift is two edits at once: the image's placement operator leaves the page
+    content, and an ImageAnnotationItem takes its place on the canvas. Undo puts
+    both back, so the page renders exactly as it did before the image was
+    touched. Only pushed when the placement-removal path ran. The redaction
+    fallback rewrites the image's pixels, which restoring a content stream can't
+    bring back, so there is nothing safe to undo there.
+    """
+
+    def __init__(self, canvas, item, page_num, before, after, text="Lift image"):
+        super().__init__(canvas, text)
+        self._item = item
+        self._page_num = page_num
+        self._before = before
+        self._after = after
+
+    def _apply(self, snapshot):
+        self._canvas._doc.restore_page_content(self._page_num, snapshot)
+        self._canvas._invalidate_embedded_scan()
+        self._canvas._refresh_page_background(self._page_num)
+
+    def _do_redo(self):
+        self._canvas._attach_item(self._item)
+        self._apply(self._after)
+
+    def _do_undo(self):
+        self._canvas._detach_item(self._item)
+        self._apply(self._before)
+
+
 class MoveCommand(_Command):
     def __init__(self, canvas, items, dx, dy, text="Move"):
         super().__init__(canvas, text)
@@ -719,12 +754,16 @@ class PDFCanvas(QGraphicsView):
         self._drag_start: QPointF | None = None
         self._drag_total = QPointF(0, 0)
         self._drag_moved = False
-        self._drag_is_lift = False        # dragging a freshly lifted image (not undoable)
         self._duplicating = False
         self._dup_clones: list = []
         # Net displacement is computed from a fixed anchor so Shift can axis-lock it.
         self._drag_anchor: QPointF | None = None
         self._drag_applied = QPointF(0, 0)
+
+        # Panning. Space held is a temporary override that remembers the tool it
+        # interrupted; a middle-button drag pans from any tool at all.
+        self._space_pan_prev: str | None = None
+        self._mid_pan_last = None
 
         # Marquee (rubber-band) selection state
         self._press_empty_pos: QPointF | None = None
@@ -776,8 +815,9 @@ class PDFCanvas(QGraphicsView):
         self._settle_timer.setSingleShot(True)
         self._settle_timer.timeout.connect(self._end_active_render)
 
-        # Fit-to-view mode: when True the page is kept fitted on page load/resize
-        self._fit_mode = False
+        # View mode: one of FIT_MODES' keys, kept applied across page loads and
+        # resizes. None means a manual zoom that nothing re-fits.
+        self._fit_mode: str | None = None
 
         # Wheel travel spent pushing against a scroll edge, and the direction it
         # went in. A notch's worth turns the page; see _wheel_turns_page.
@@ -864,6 +904,22 @@ class PDFCanvas(QGraphicsView):
         lst = self._page_annotations.get(item.page_num, [])
         if item in lst:
             lst.remove(item)
+
+    def _invalidate_embedded_scan(self):
+        """Force the next embedded-image hit-test to re-scan the current page.
+
+        Used whenever a page's content changes underneath the scan (a lift, or a
+        lift being undone), because the scan is keyed on a page whose images may
+        no longer be the ones it recorded.
+        """
+        self._embedded_images = None
+        self._embedded_images_page = -1
+
+    def _refresh_page_background(self, page_num: int):
+        """Re-render the page behind the markup after its content changed."""
+        if self._bg_item is not None and self._doc and page_num == self._current_page:
+            self._bg_item.setPixmap(self._doc.render_page_cached(page_num, self._zoom))
+            self._bg_item.update()   # invalidate the item cache so the change shows
 
     def _cancel_interaction(self):
         """Drop any in-progress marquee/drag so a page or tool switch starts clean."""
@@ -963,11 +1019,63 @@ class PDFCanvas(QGraphicsView):
     def set_tool(self, tool: str):
         self._cancel_interaction()
         self._tool = tool
+        # Pan hands the drag to QGraphicsView's own ScrollHandDrag, which scrolls
+        # the view and sets the open/closed hand cursor itself. Every other tool
+        # goes back to NoDrag, because the marquee is drawn by hand here (see
+        # _rubber_item) and Qt's RubberBandDrag would fight it.
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag if tool == "pan"
+                         else QGraphicsView.DragMode.NoDrag)
+        # ScrollHandDrag on its own still hands the press down to items, so a pan
+        # drag would select whatever it started on. Non-interactive stops events
+        # reaching items while leaving the drag mode's own scrolling intact,
+        # which is what makes pan genuinely read-only.
+        self.setInteractive(tool != "pan")
         _cursors = {
             "select": Qt.CursorShape.ArrowCursor,
             "text":   Qt.CursorShape.IBeamCursor,
+            "pan":    Qt.CursorShape.OpenHandCursor,
         }
         self.setCursor(_cursors.get(tool, Qt.CursorShape.CrossCursor))
+
+    def is_panning(self) -> bool:
+        """True while a drag would move the view rather than anything on the page."""
+        return self._tool == "pan" or self._mid_pan_last is not None
+
+    def _restore_tool_cursor(self):
+        """Put the cursor back to whatever the active tool asks for."""
+        self.setCursor({
+            "select": Qt.CursorShape.ArrowCursor,
+            "text":   Qt.CursorShape.IBeamCursor,
+            "pan":    Qt.CursorShape.OpenHandCursor,
+        }.get(self._tool, Qt.CursorShape.CrossCursor))
+
+    def _pan_view_by(self, dx: int, dy: int):
+        """Scroll the view so the page moves with the cursor by (dx, dy) pixels."""
+        h, v = self.horizontalScrollBar(), self.verticalScrollBar()
+        h.setValue(h.value() - dx)
+        v.setValue(v.value() - dy)
+        self._mark_interacting()   # fast scaling while the page is moving
+
+    def begin_space_pan(self) -> bool:
+        """Hold-to-pan: switch to the pan tool and remember what to go back to.
+
+        Space-as-a-temporary-hand is the convention in every drawing app, and it
+        is a hold, not a toggle, so the toolbar button is deliberately left alone
+        (the tool the user chose is still the tool they get back on release).
+        """
+        if self._space_pan_prev is not None or self._tool == "pan":
+            return False
+        self._space_pan_prev = self._tool
+        self.set_tool("pan")
+        return True
+
+    def end_space_pan(self) -> bool:
+        """Release the space override and go back to the interrupted tool."""
+        if self._space_pan_prev is None:
+            return False
+        self.set_tool(self._space_pan_prev)
+        self._space_pan_prev = None
+        return True
 
     # ------------------------------------------------------------------
     # Fit-to-view
@@ -988,16 +1096,63 @@ class PDFCanvas(QGraphicsView):
         self.scale(scale, scale)
         self.centerOn(sr.center())
 
-    def set_fit_mode(self, enabled: bool):
-        """Enable or disable fit-to-view mode. When enabled, immediately fits the page."""
-        self._fit_mode = enabled
-        if enabled:
-            self.fit_page()
+    def fit_width(self):
+        """Zoom so the page's full width fits the viewport, keeping the scroll
+        position down the page where it was."""
+        sr = self._scene.sceneRect()
+        vp = self.viewport()
+        if sr.width() <= 0 or vp.width() <= 0:
+            return
+        keep_y = self.mapToScene(vp.rect().center()).y()
+        scale = (vp.width() / sr.width()) * _FIT_AXIS_PADDING
+        self.resetTransform()
+        self.scale(scale, scale)
+        self.centerOn(sr.center().x(), keep_y)
+
+    def fit_height(self):
+        """Zoom so the page's full height fits the viewport, keeping the scroll
+        position across the page where it was."""
+        sr = self._scene.sceneRect()
+        vp = self.viewport()
+        if sr.height() <= 0 or vp.height() <= 0:
+            return
+        keep_x = self.mapToScene(vp.rect().center()).x()
+        scale = (vp.height() / sr.height()) * _FIT_AXIS_PADDING
+        self.resetTransform()
+        self.scale(scale, scale)
+        self.centerOn(keep_x, sr.center().y())
+
+    def actual_size(self):
+        """Show the page at 100%: one PDF point to one screen pixel.
+
+        The page is rasterised at self._zoom, so the scene is already that many
+        times nominal size. The view transform has to divide it back out.
+        """
+        if self._zoom <= 0:
+            return
+        centre = self.mapToScene(self.viewport().rect().center())
+        self.resetTransform()
+        self.scale(1.0 / self._zoom, 1.0 / self._zoom)
+        self.centerOn(centre)
+
+    def set_fit_mode(self, mode):
+        """Set the view mode and apply it now.
+
+        `mode` is one of FIT_MODES, or None for "no mode" (a manual zoom). The
+        names match core.settings' view.default_fit_mode values so the two agree.
+        """
+        self._fit_mode = mode if mode in FIT_MODES else None
+        self._apply_fit_if_active()
+
+    def fit_mode(self):
+        return self._fit_mode
 
     def _apply_fit_if_active(self):
-        """Called after page load or resize — re-fits if fit mode is on."""
-        if self._fit_mode:
-            self.fit_page()
+        """Called after page load or resize. Re-applies the view mode if one is
+        set, so a fit survives a page turn and a window resize."""
+        fn = FIT_MODES.get(self._fit_mode)
+        if fn is not None:
+            fn(self)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1800,11 +1955,19 @@ class PDFCanvas(QGraphicsView):
         buf.close()
         image_bytes = bytes(buf.data())
 
+        # Snapshot the page content before the removal, so the lift itself can be
+        # undone. Only the placement-removal path below is reversible from this;
+        # see LiftImageCommand.
+        content_before = self._doc.page_content_snapshot(page_num)
+        placement_removed = False
+
         try:
             # Preferred: drop the image's single content-stream placement operator.
             # That removes the image while leaving the background behind it intact —
             # no white hole where it sat (the way a real editor moves an object).
-            if not self._doc.remove_image_placement(page_num, xref):
+            if self._doc.remove_image_placement(page_num, xref):
+                placement_removed = True
+            else:
                 # Fallback for images that aren't a tight `cm /Name Do` placement:
                 # redact PIXELS (blanks only the pixels under the rect, so it never
                 # wipes the whole-page background like IMAGE_REMOVE would — but it can
@@ -1847,6 +2010,14 @@ class PDFCanvas(QGraphicsView):
             self._embedded_images_page = page_num
         self._scene.clearSelection()
         item.setSelected(True)
+        # Record the lift so Ctrl+Z puts the image back into the page. Skipped on
+        # the redaction fallback, whose pixel wipe a content-stream restore can't
+        # reverse; the move that follows a lift is recorded either way, so an
+        # accidental drag is always at least recoverable to where the image sat.
+        if placement_removed and content_before is not None:
+            self._push(LiftImageCommand(
+                self, item, page_num, content_before,
+                self._doc.page_content_snapshot(page_num)))
         self.annotation_changed.emit()
         return item
 
@@ -1893,6 +2064,19 @@ class PDFCanvas(QGraphicsView):
     # ------------------------------------------------------------------
 
     def mousePressEvent(self, event):
+        # Middle-button drag pans from any tool, the way every drawing app does.
+        # Taken before the tool check so it works while drawing or selecting.
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._mid_pan_last = event.pos()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+
+        # Pan tool: the view scrolls and nothing on the page is touched.
+        if self._tool == "pan":
+            super().mousePressEvent(event)
+            return
+
         # A click can't be acted on until the page it targets is actually rendered.
         self._flush_pending_render()
         scene_pos = self.mapToScene(event.pos())
@@ -1900,7 +2084,6 @@ class PDFCanvas(QGraphicsView):
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_moved = False
             self._drag_total = QPointF(0, 0)
-            self._drag_is_lift = False
             if self._tool == "select":
                 res_item, res_handle = self._handle_at(scene_pos)
                 if res_item and res_handle:
@@ -2011,6 +2194,19 @@ class PDFCanvas(QGraphicsView):
         event.accept()
 
     def mouseMoveEvent(self, event):
+        if self._mid_pan_last is not None:
+            # Scroll by exactly the distance the cursor travelled, so the page
+            # follows the hand rather than lagging behind it.
+            delta = event.pos() - self._mid_pan_last
+            self._mid_pan_last = event.pos()
+            self._pan_view_by(delta.x(), delta.y())
+            event.accept()
+            return
+
+        if self._tool == "pan":
+            super().mouseMoveEvent(event)
+            return
+
         scene_pos = self.mapToScene(event.pos())
 
         # Any active gesture means the page is moving under the cursor → switch to
@@ -2108,7 +2304,6 @@ class PDFCanvas(QGraphicsView):
                         self._drag_applied = delta
                         self._drag_total = delta
                         self._drag_moved = True
-                        self._drag_is_lift = True
                         self._mark_interacting()
                     else:
                         # Lift failed → fall back to a marquee from here on.
@@ -2163,17 +2358,29 @@ class PDFCanvas(QGraphicsView):
                 self.setCursor(Qt.CursorShape.SizeAllCursor)
             elif self._embedded_image_at(scene_pos) is not None:
                 # Hovering a liftable embedded image — including images placed by
-                # other apps (e.g. pasted in Acrobat's Edit PDF). An open-hand
-                # cursor signals it's grabbable: click or drag lifts it into a
-                # movable object. The cursor is also a live detector — if it
-                # appears over a third-party image, detection is working.
-                self.setCursor(Qt.CursorShape.OpenHandCursor)
+                # other apps (e.g. pasted in Acrobat's Edit PDF). A move cursor,
+                # the same one an annotation gets, because that is what a drag
+                # here does: it lifts the image and MOVES it. This used to show an
+                # open hand, which reads as "drag to pan" in every other app and
+                # so promised the one thing the gesture does not do. The hand is
+                # now the pan tool's alone.
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
             else:
                 self.setCursor(Qt.CursorShape.ArrowCursor)
 
         event.accept()
 
     def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.MiddleButton and self._mid_pan_last is not None:
+            self._mid_pan_last = None
+            self._restore_tool_cursor()
+            event.accept()
+            return
+
+        if self._tool == "pan":
+            super().mouseReleaseEvent(event)
+            return
+
         if event.button() == Qt.MouseButton.LeftButton:
             if self._resize_item:
                 after = geometry_snapshot(self._resize_item)
@@ -2195,19 +2402,20 @@ class PDFCanvas(QGraphicsView):
                     self.annotation_changed.emit()
                     self._dup_clones = []
                     self._duplicating = False
-                elif self._drag_moved and not self._drag_is_lift:
-                    # An existing selection was moved — record one undoable step.
+                elif self._drag_moved:
+                    # The selection was moved, so record one undoable step. A drag
+                    # that lifted an embedded image out of the page counts too:
+                    # the lift is its own command underneath this one, so the
+                    # first Ctrl+Z puts the image back where it sat and a second
+                    # drops it back into the page.
                     self._push(MoveCommand(
                         self, list(self._drag_items),
                         self._drag_total.x(), self._drag_total.y()))
                     self.annotation_changed.emit()
-                elif self._drag_moved:
-                    self.annotation_changed.emit()  # lifted image moved (not undoable)
                 self._autoscroll_timer.stop()
                 self._drag_items = []
                 self._drag_start = None
                 self._drag_moved = False
-                self._drag_is_lift = False
                 self._drag_anchor = None
                 self._drag_applied = QPointF(0, 0)
 
@@ -2229,8 +2437,8 @@ class PDFCanvas(QGraphicsView):
                 # other apps are reachable with a click, not just an obscure drag.
                 # _embedded_image_at's near-full-page guard keeps a whole-page
                 # scan from being lifted, so this can't flip the page.
-                # (Note: a lift isn't on the undo stack — same as the drag path —
-                # but it's non-destructive: the image just becomes a movable copy.)
+                # The lift records itself on the undo stack (see LiftImageCommand),
+                # so a click that grabs an image by accident is Ctrl+Z-able.
                 # A Shift (additive) click never lifts: it preserves the selection.
                 if self._lift_candidate is not None and not self._press_additive:
                     self._lift_embedded_image(*self._lift_candidate)
@@ -2266,6 +2474,9 @@ class PDFCanvas(QGraphicsView):
         event.accept()
 
     def mouseDoubleClickEvent(self, event):
+        if self.is_panning():
+            super().mouseDoubleClickEvent(event)
+            return
         scene_pos = self.mapToScene(event.pos())
         if self._tool == "select":
             item = self._annotation_at(scene_pos)
@@ -2358,7 +2569,7 @@ class PDFCanvas(QGraphicsView):
         self.translate(delta.x(), delta.y())
         self._clamp_zoom_to_min()
         if self._fit_mode:
-            self._fit_mode = False
+            self._fit_mode = None
             self.fit_mode_broken.emit()
         self._mark_interacting()   # fast scaling while zooming, crisp on settle
         event.accept()
@@ -2429,7 +2640,12 @@ class PDFCanvas(QGraphicsView):
             Qt.Key.Key_Up: (0, -1), Qt.Key.Key_Down: (0, 1),
         }
 
-        if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+        if key == Qt.Key.Key_Space and not event.isAutoRepeat():
+            # Held space pans; the auto-repeat stream while it is down is ignored
+            # so the tool is swapped once, not on every repeat.
+            self.begin_space_pan()
+            event.accept()
+        elif key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             self.delete_selected()
         elif key == Qt.Key.Key_A and mods & Qt.KeyboardModifier.ControlModifier:
             for item in self._page_annotations.get(self._current_page, []):
@@ -2456,3 +2672,21 @@ class PDFCanvas(QGraphicsView):
             self.send_to_back()
         else:
             super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
+            self.end_space_pan()
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
+
+
+# The view modes the status-bar fit group offers, keyed by the name they are
+# stored under. These names match core.settings' view.default_fit_mode values so
+# a saved preference and this map never drift apart.
+FIT_MODES = {
+    "fit_page":   PDFCanvas.fit_page,
+    "fit_width":  PDFCanvas.fit_width,
+    "fit_height": PDFCanvas.fit_height,
+    "actual":     PDFCanvas.actual_size,
+}

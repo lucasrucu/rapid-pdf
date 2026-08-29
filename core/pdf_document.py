@@ -358,6 +358,36 @@ class PDFDocument:
                 return True
         return False
 
+    def page_content_snapshot(self, page_num: int) -> list | None:
+        """The raw bytes of every content stream on this page, with their xrefs.
+
+        Paired with restore_page_content() so an edit that only rewrites a content
+        stream (remove_image_placement) can be put back byte for byte. Returns
+        None when the page can't be read, which callers treat as "not undoable".
+        """
+        if not self.doc or page_num >= len(self.doc):
+            return None
+        try:
+            return [(sx, self.doc.xref_stream(sx))
+                    for sx in self.doc[page_num].get_contents()]
+        except Exception as e:
+            print(f"Content snapshot failed: {e}")
+            return None
+
+    def restore_page_content(self, page_num: int, snapshot) -> bool:
+        """Put a page_content_snapshot() back, and drop the page's cached pixmap."""
+        if not self.doc or not snapshot or page_num >= len(self.doc):
+            return False
+        try:
+            for sx, raw in snapshot:
+                self.doc.update_stream(sx, raw)
+        except Exception as e:
+            print(f"Content restore failed: {e}")
+            return False
+        # The page's content changed back, so the cached pixmap is stale.
+        self.invalidate_render_page(page_num)
+        return True
+
     def move_page(self, from_idx: int, to_idx: int):
         if self.doc:
             self.doc.move_page(from_idx, to_idx)

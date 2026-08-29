@@ -23,6 +23,7 @@ PRESETS = [
 # qtawesome glyph ids for each tool (graceful empty-icon fallback if not installed).
 _TOOL_ICONS = {
     "select": "mdi6.cursor-default-outline",
+    "pan":    "mdi6.hand-back-right-outline",
     "rect":   "mdi6.rectangle-outline",
     "line":   "mdi6.vector-line",
     "text":   "mdi6.format-text",
@@ -273,16 +274,21 @@ class ToolBar(QWidget):
 
         # --- Tools (always) — icon-led, accent-on-active rail buttons ---
         layout.addWidget(self._section_label("TOOLS"))
-        for tid, label in [
-            ("select",    "Select  V"),
-            ("rect",      "Rectangle  R"),
-            ("line",      "Line  L"),
-            ("text",      "Text  T"),
+        for tid, label, tip in [
+            ("select",    "Select  V",    "Select, move and resize objects"),
+            ("pan",       "Pan  H",       "Drag to move the page. Nothing on it can be "
+                                          "selected or moved.\nHold Space for the same "
+                                          "thing without leaving the current tool,\nor "
+                                          "drag with the middle mouse button."),
+            ("rect",      "Rectangle  R", "Draw a rectangle"),
+            ("line",      "Line  L",      "Draw a line"),
+            ("text",      "Text  T",      "Place a text box"),
         ]:
             btn = QPushButton("  " + label)
             btn.setObjectName("tool")
             btn.setCheckable(True)
             btn.setFixedHeight(36)
+            btn.setToolTip(tip)
             btn.setIcon(themed_icon(_TOOL_ICONS[tid], self._icon_color))
             btn.setIconSize(QSize(18, 18))
             btn.setCursor(Qt.CursorShape.PointingHandCursor)

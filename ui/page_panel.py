@@ -1,13 +1,13 @@
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem, QLabel,
-    QStyledItemDelegate, QStyle, QStyleOptionViewItem, QToolButton, QMenu,
+    QStyledItemDelegate, QStyle, QStyleOptionViewItem, QMenu,
     QAbstractItemView,
 )
 from PySide6.QtCore import Signal, Qt, QSize, QTimer, QRect, QEvent, QPoint
 from PySide6.QtGui import QIcon, QPixmap, QColor, QPainter, QPen, QDrag
 
 from ui.thumbnails import aspect_ratio_placeholder, draw_thumbnail, fit_size
-from ui.theme import LIGHT, themed_icon, qtawesome_available
+from ui.theme import LIGHT
 from ui.scrolling import TrackpadScrollFilter
 from core.page_ops import move_rows
 
@@ -385,8 +385,6 @@ class PagePanel(QWidget):
         _PageDelegate.sel_text_color = QColor(palette.accent_text)
         self._placeholder_color = QColor(palette.surface_raised)
         self._placeholder_cache.clear()
-        if qtawesome_available():
-            self._del_btn.setIcon(themed_icon("mdi6.trash-can-outline", palette.text))
         self._list.viewport().update()
 
     def _setup_ui(self):
@@ -401,23 +399,11 @@ class PagePanel(QWidget):
         self._title.setStyleSheet("font-weight: bold; font-size: 10px;")
         header.addWidget(self._title)
         header.addStretch()
-
-        # Always-visible delete affordance, so the feature is discoverable
-        # without knowing about the Delete key or the right-click menu.
-        self._del_btn = QToolButton()
-        if qtawesome_available():
-            self._del_btn.setIcon(themed_icon("mdi6.trash-can-outline", LIGHT.text))
-            self._del_btn.setIconSize(QSize(14, 14))
-        else:
-            # No icon font on this machine: a labelled button beats an empty
-            # square, and the strip is too narrow to carry both.
-            self._del_btn.setText("Delete")
-            self._del_btn.setStyleSheet("font-size: 10px;")
-        self._del_btn.setAutoRaise(True)
-        self._del_btn.setEnabled(False)
-        self._del_btn.setToolTip("Delete the selected page(s)  (Del)")
-        self._del_btn.clicked.connect(self._request_delete)
-        header.addWidget(self._del_btn)
+        # No delete button here on purpose. Deleting pages stays available where
+        # it belongs: the Delete key on a selection, the right-click menu, and the
+        # Organizer. A destructive button sitting permanently in the strip is one
+        # mis-click away from a page going, and it does not belong in what is
+        # otherwise a navigation rail.
         layout.addLayout(header)
 
         self._list = _PageList()
@@ -635,7 +621,6 @@ class PagePanel(QWidget):
 
     def _on_selection_changed(self):
         rows = self._list.selected_rows()
-        self._del_btn.setEnabled(bool(rows))
         self._title.setText(f"{len(rows)} selected" if len(rows) > 1 else "Pages")
 
     def _request_delete(self):
@@ -650,12 +635,21 @@ class PagePanel(QWidget):
         # is highlighted.
         if item is not None and not item.isSelected():
             self._list.setCurrentItem(item)
+        menu = self._build_context_menu()
+        if menu is None:
+            return
+        menu.exec(self._list.viewport().mapToGlobal(pos))
+
+    def _build_context_menu(self):
+        """The right-click menu for the current selection, or None if nothing is
+        selected. Split out from _show_context_menu so it can be built without
+        exec() handing control to the platform."""
         rows = self._list.selected_rows()
         if not rows:
-            return
+            return None
         menu = QMenu(self._list)
         label = "Delete Page" if len(rows) == 1 else f"Delete {len(rows)} Pages"
         menu.addAction(label, self._request_delete)
         menu.addSeparator()
         menu.addAction("Select All Pages", self._list.selectAll)
-        menu.exec(self._list.viewport().mapToGlobal(pos))
+        return menu
