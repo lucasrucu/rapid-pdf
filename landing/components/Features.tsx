@@ -1,7 +1,13 @@
 import {
+  ArrowLeftRight,
+  Copy,
+  Hand,
   Highlighter,
+  History,
   LayoutGrid,
   MousePointer2,
+  PanelsTopLeft,
+  Settings,
   Image as ImageIcon,
   Save,
   Zap,
@@ -10,6 +16,26 @@ import {
 import { Eyebrow } from "@/components/Eyebrow";
 
 const FEATURES = [
+  {
+    icon: PanelsTopLeft,
+    title: "Document tabs",
+    body: "Several PDFs open at once, one tab each. A second file gets its own tab instead of having its pages appended to the one you are reading. Drop a PDF on the window and it opens there too.",
+  },
+  {
+    icon: Copy,
+    title: "Several windows",
+    body: "Ctrl+Shift+N for a new one, or drag a tab off the bar and it tears into a window that follows your cursor. Drop it on another window's tab bar to dock it there.",
+  },
+  {
+    icon: ArrowLeftRight,
+    title: "Pages between tabs",
+    body: "Drag a page out of one document and into another in the same window, from the thumbnail strip or the Organizer. Hold Ctrl at the drop to copy instead of move. Unsaved markup travels with it.",
+  },
+  {
+    icon: Hand,
+    title: "Pan and fit",
+    body: "Press H for the pan tool, hold Space, or drag with the middle button. Fit page, fit width, fit height, and 100% sit as four icons in the status bar.",
+  },
   {
     icon: LayoutGrid,
     title: "Page manager",
@@ -36,6 +62,16 @@ const FEATURES = [
     body: "Markup is written as PDF-spec annotation objects on the original page. Nothing is re-encoded, resized, or clipped.",
   },
   {
+    icon: History,
+    title: "Picks up where you left off",
+    body: "Turn on session restore under Startup in Preferences and last run's windows and tabs come back, on the screen, page, and zoom you left them. Each one is read when you first look at it.",
+  },
+  {
+    icon: Settings,
+    title: "Preferences",
+    body: "Ctrl+, opens the lot on one page: theme, startup, where file dialogs open, what the X button does, and the fit a document opens at. Every control applies as you touch it.",
+  },
+  {
     icon: Zap,
     title: "Instant, always",
     body: "Nothing scans on open, so even a large A1 engineering drawing loads and edits without the wait. Need searchable scans? Run Enhance for Search whenever you choose.",
@@ -53,7 +89,8 @@ export function Features() {
           </h2>
           <p className="mt-4 text-lg text-muted-foreground">
             Acrobat runs OCR and form-field detection every time it opens a file. Rapid PDF skips all
-            of it and does only what field work needs: reorganize pages and add markup.
+            of it and does only what field work needs: reorganize pages and add markup, now across
+            as many documents as you have open.
           </p>
         </div>
 

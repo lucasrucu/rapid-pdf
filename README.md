@@ -12,8 +12,11 @@ Built in Python with PySide6 (Qt6) and PyMuPDF. Tabbed, multi-window, light and 
 
 - **Document tabs**: several PDFs open at once, one tab each, named by filename and disambiguated by folder when two match. Middle-click closes, `Ctrl+Tab` walks the tabs you were just in, and opening a file that is already open raises its tab instead of opening a second copy.
 - **Several windows**: `Ctrl+Shift+N` for a new one, or drag a tab off the bar and it tears into a window that appears under the cursor and follows it. Drop it on another window's tab bar to dock it there.
-- **Pages between tabs**: drag a page out of one document's thumbnail strip or Organizer and into another's. One undoable action across both documents, with unsaved markup carried along.
+- **Pages between tabs**: drag a page out of one document's thumbnail strip or Organizer and into another's in the same window, `Ctrl` at the drop to copy instead of move. One undoable action across both documents, with unsaved markup carried along.
 - **Session restore**: optionally reopen the windows and tabs you had open last time, with each document read when you first look at it rather than all at once. Off by default, under Startup in Preferences.
+- **Opens how you expect**: drop a PDF on a window and it opens as a tab there, `Ctrl+O` opens several at once, and selecting a few in Explorer and picking Combine with Rapid PDF merges them.
+- **Getting around**: pan with `H`, by holding `Space`, or with a middle-button drag, and four icon buttons in the status bar for fit page, fit width, fit height and 100%.
+- **Preferences** (`Ctrl+,`): startup, closing, theme, where file dialogs open, the page panel and the default fit, on one page, kept in `%LOCALAPPDATA%\Rapid PDF\settings.json`.
 - **Page manager**: open, combine, reorder, delete, and add pages, from the Editor's left thumbnail strip or the full Organizer grid. Shift/ctrl to select several, drag to move them, Delete to remove them, Ctrl+Z to take it back.
 - **Markup tools**: highlight, rectangle, and line annotations with an Office-style color picker, opacity presets, and line weights.
 - **Object editing**: select, move, resize with 8-point handles, Ctrl+drag to duplicate, marquee group-select, copy/paste, and full undo/redo.
@@ -100,14 +103,17 @@ The installer is currently unsigned, so Windows SmartScreen may show a "Windows 
 
 ## Updating
 
-GitHub Releases is the single source of truth for versions. The strategy rolls out in stages:
+GitHub Releases is the single source of truth for versions, so there's no server to run.
 
-- **Now:** download the newest release and reinstall over the top. The installer keeps a stable app id, so it upgrades in place and your shortcuts stay put.
-- **Near-future:** an in-app update check. On launch the app queries the GitHub Releases API, compares the latest tag against its own version using semver, and acts by bump type: a patch or minor offers a one-click "update available" prompt, a major shows the release notes and requires explicit confirmation before updating.
-- **Later:** a full background auto-updater (for example PyUpdater), still backed only by GitHub Releases, so there's no server to run. It downloads and stages the new version, then applies it on the next restart.
+The app checks for itself. On launch it queries the GitHub Releases API and compares the latest tag against `core/version.APP_VERSION` using semver, and offers the update if there is one. `Help > Check for Updates…` (also a button in Preferences) runs the same check on demand and says so when there is nothing to report. The version the app is running is right above it in the Help menu.
+
+Installing over the top by hand still works: the installer keeps a stable app id, so it upgrades in place and your shortcuts stay put.
+
+- **Later:** a full background auto-updater, downloading and staging the new version and applying it on the next restart.
 
 ## Documentation
 
+- [Changelog](docs/CHANGELOG.md): what shipped in each release.
 - [Architecture](docs/architecture.md): modules, coordinate system, save lifecycle, image-lift pipeline.
 - [Tabs and multi-window](docs/tabs-plan.md): the six-phase design record for tabs, several windows, the tear-off, pages between tabs and session restore. Read this before touching any of them.
 - [File structure](docs/file-structure.md): annotated tree of every file and its role.
