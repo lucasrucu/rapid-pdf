@@ -85,6 +85,7 @@ from ui.organizer import PageOrganizer
 from ui.page_commands import (
     DeletePagesCommand, ReorderPagesCommand, TransferPagesCommand,
 )
+from ui.page_drag import find_source_view
 from ui.page_panel import PagePanel
 from ui.search_bar import SearchBar
 from ui.theme import ThemeManager
@@ -232,9 +233,11 @@ class DocumentView(QWidget):
         editor_layout.setSpacing(0)
 
         self._page_panel = PagePanel()
+        self._page_panel.set_view(self)
         self._page_panel.page_selected.connect(self._on_page_selected)
         self._page_panel.pages_delete_requested.connect(self._delete_pages)
         self._page_panel.pages_reorder_requested.connect(self._reorder_pages)
+        self._page_panel.pages_transfer_requested.connect(self._on_pages_dropped)
         editor_layout.addWidget(self._page_panel)
 
         self._canvas = PDFCanvas()
@@ -279,6 +282,8 @@ class DocumentView(QWidget):
 
         # ---- Tab 1: Organizer ----
         self._organizer = PageOrganizer()
+        self._organizer.set_view(self)
+        self._organizer.pages_transfer_requested.connect(self._on_pages_dropped)
         self._organizer.page_activated.connect(self._on_organizer_page_activated)
         self._organizer.pages_reordered_perm.connect(self._on_pages_reordered_perm)
         self._organizer.pages_deleted.connect(self._on_pages_deleted)
@@ -1031,6 +1036,21 @@ class DocumentView(QWidget):
         count = len(moved_rows)
         self._update_status(
             f"Moved {count} page{'s' if count > 1 else ''}  (Ctrl+Z to undo)")
+
+    def _on_pages_dropped(self, payload: dict, at: int, copy: bool):
+        """Pages from another document landed in this one's strip or grid.
+
+        The widget has already checked the mime format and that the payload
+        names a different document; this resolves the payload to a live view
+        and hands it to the undoable edit. Resolving here rather than in the
+        widget keeps the widget ignorant of documents, which is the same rule
+        that stops it applying a reorder itself.
+        """
+        source = find_source_view(payload.get("doc_id", ""))
+        if source is None:
+            self._update_status("That document is no longer open")
+            return
+        self.transfer_pages_from(source, payload.get("rows", []), at, copy=copy)
 
     def transfer_pages_from(self, src_view, rows: list, at: int,
                             copy: bool = False) -> bool:

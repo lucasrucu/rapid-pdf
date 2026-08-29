@@ -67,6 +67,7 @@ APPLICATION, so only the first window runs it. See `_should_check_for_updates`.
 """
 
 import os
+import uuid
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
@@ -127,6 +128,12 @@ class MainWindow(QMainWindow):
         # a duplicate. Every DocumentView that lands here is handed this stack;
         # see ui/undo.py for the dirty-state rule that goes with it.
         self._undo_stack = WindowUndoStack(self)
+        # A stable name for this window, carried in a page drag's payload. The
+        # binding check at drop time is still a LIVE comparison of the two
+        # views' windows, because a tear-off can move a document to another
+        # window while the drag is in flight; this is the record of where the
+        # drag started. See ui/page_drag.py.
+        self._window_id = uuid.uuid4().hex
         # Theme: use the passed-in manager, or stand one up (e.g. tests/smoke).
         self._theme = theme or ThemeManager(QApplication.instance())
         # Every open document in this window, one tab each. Empty for now: the
@@ -638,6 +645,10 @@ class MainWindow(QMainWindow):
     def undo_stack(self) -> WindowUndoStack:
         """This window's single history. Every tab in it pushes here."""
         return self._undo_stack
+
+    def window_id(self) -> str:
+        """A stable name for this window, for a page drag's payload."""
+        return self._window_id
 
     def _sync_fit_group(self, view: DocumentView):
         """Show the fit the ARRIVING canvas is actually in.

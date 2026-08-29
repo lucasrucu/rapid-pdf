@@ -9,6 +9,7 @@ from PySide6.QtGui import QIcon, QPixmap, QColor, QPainter, QPen, QDrag
 from ui.thumbnails import aspect_ratio_placeholder, draw_thumbnail, fit_size
 from ui.theme import LIGHT
 from ui.scrolling import TrackpadScrollFilter
+from ui.page_drag import find_source_view, make_page_mime, read_page_mime
 from core.page_ops import move_rows
 from core.pdf_document import source_is_readable
 
@@ -43,6 +44,9 @@ class _PageDelegate(QStyledItemDelegate):
     hover_color = QColor(LIGHT.surface_hover)
     text_color = QColor(LIGHT.text_dim)
     sel_text_color = QColor(LIGHT.accent_text)
+    # The insertion line for a Ctrl+drop, which copies rather than moves.
+    # Derived from the accent in apply_palette so it stays in the theme.
+    copy_color = QColor(LIGHT.accent).lighter(135)
 
     # Even inset of the selection/hover backing inside the cell (all four sides),
     # so the rounded accent wraps the whole thumbnail evenly instead of bleeding
@@ -108,6 +112,10 @@ class _PageDelegate(QStyledItemDelegate):
         The strip is one column top to bottom, so the gap a page will land in is
         a horizontal line: above the row the drop resolves to, or below the last
         row when the drop is past the end.
+
+        Tinted differently for a copy (Ctrl held) than for a move, because by
+        phase 5 those are two genuinely different outcomes and the line is the
+        only thing on screen that can say which one is about to happen.
         """
         target = getattr(self.parent(), "drag_target_row", lambda: None)()
         if target is None:
@@ -120,8 +128,9 @@ class _PageDelegate(QStyledItemDelegate):
             y = option.rect.bottom() - self._DROP_LINE_H
         else:
             return
+        copying = getattr(self.parent(), "drag_is_copy", lambda: False)()
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(self.sel_color)
+        painter.setBrush(self.copy_color if copying else self.sel_color)
         painter.drawRoundedRect(
             QRect(option.rect.left() + self._PAD, y,
                   max(1, option.rect.width() - 2 * self._PAD), self._DROP_LINE_H),
@@ -160,6 +169,10 @@ class _PageList(QListWidget):
     # moved block once it has rebuilt the strip from the document.
     reorder_requested = Signal(list, list)
     delete_requested = Signal()
+    # (payload dict, insertion index, copy) — a drop from ANOTHER document's
+    # strip or grid. The host owns the edit for the same reason it owns the
+    # reorder: this widget never touches pages itself. Phase 5.
+    transfer_requested = Signal(dict, int, bool)
 
     _STACK_OFFSET_PX = 5
     _STACK_MAX_CARDS = 4
@@ -167,11 +180,29 @@ class _PageList(QListWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._drag_row = None   # drop-target row while a drag is over the strip
+        self._drag_copy = False  # the hovering drag is a copy, not a move
+        self._view = None        # the DocumentView this strip belongs to
+
+    def set_view(self, view):
+        """Name the document this strip shows, so a drag can say where it came
+        from and a drop can tell a foreign document from this one."""
+        self._view = view
+
+    def view(self):
+        return self._view
+
+    def doc_id(self) -> str:
+        return self._view.doc_id() if self._view is not None else ""
 
     def drag_target_row(self):
         """Row the drop indicator points at, or None when nothing is dragging.
         Read by the delegate to draw the insertion line."""
         return self._drag_row
+
+    def drag_is_copy(self) -> bool:
+        """Whether the hovering drag will copy rather than move. Read by the
+        delegate, which tints the insertion line differently for each."""
+        return self._drag_copy
 
     def selected_rows(self) -> list:
         return sorted({self.row(i) for i in self.selectedItems()})
@@ -182,9 +213,12 @@ class _PageList(QListWidget):
         rows = self.selected_rows()
         if not rows:
             return
-        mime = self.model().mimeData([self.model().index(r, 0) for r in rows])
-        if mime is None:
-            return
+        # OUR OWN MIME TYPE, not the model's default
+        # application/x-qabstractitemmodeldatalist. A page can now be dropped
+        # into a different document, so the receiver has to be able to tell a
+        # page drag from any other internal Qt drag, and to know which document
+        # it came out of. See ui/page_drag.py.
+        mime = make_page_mime(self._view, rows)
         drag = QDrag(self)
         drag.setMimeData(mime)
         pixmap, hotspot = self._stack_pixmap(rows)
@@ -241,8 +275,69 @@ class _PageList(QListWidget):
                          int((margin + cell_h / 2) * ratio))
         return scaled, hotspot
 
+    # -- who is allowed to drop here ----------------------------------------
+
+    def accepts(self, event) -> dict | None:
+        """The payload of a drag this strip will take, or None to refuse it.
+
+        THIS REPLACED `event.source() is not self`, and the plan spelled out
+        why: that check worked only while a page could never come from
+        anywhere else, and it rejects the one thing phase 5 is for. The guard
+        is the FORMAT now, with the source document named inside the payload.
+
+        `source() is self` is kept as a second way in, and it is not
+        belt-and-braces for its own sake: it is what a drag carrying no payload
+        at all (a test's stand-in event, a Qt-synthesised internal move) still
+        resolves to, and for this widget that can only ever mean a reorder.
+        """
+        payload = read_page_mime(getattr(event, "mimeData", lambda: None)())
+        if payload is not None:
+            return payload
+        if event.source() is self:
+            return {}
+        return None
+
+    def _is_foreign(self, payload: dict) -> bool:
+        """Whether a payload names a DIFFERENT document from this strip's."""
+        doc_id = payload.get("doc_id")
+        return bool(doc_id) and doc_id != self.doc_id()
+
+    def _transfer_refusal(self, payload: dict, copy: bool) -> str | None:
+        """Why a cross-document drop cannot land, or None when it can.
+
+        Answered at dragMoveEvent time as well as at drop time, so the user is
+        never left holding a drag that was going to be refused anyway.
+        """
+        source = find_source_view(payload.get("doc_id", ""))
+        if source is None or not source.has_document():
+            return "That document is no longer open"
+        if self._view is None or not self._view.has_document():
+            return "Open a document in this tab first"
+        if source.window() is not self._view.window():
+            # Two windows means two undo stacks, and the whole duplicate-page
+            # problem the per-window stack exists to avoid comes straight back.
+            # Refused with a reason rather than half-done. See ui/undo.py.
+            return "Pages can only move between tabs in the same window"
+        if not copy and source.page_count() - len(payload.get("rows", [])) < 1:
+            return "A document has to keep at least one page"
+        return None
+
+    @staticmethod
+    def _wants_copy(event) -> bool:
+        """Ctrl held = copy, anything else = move.
+
+        READ AT DROP TIME, not at press time. Ctrl+drag is already Duplicate in
+        this app and it is what Windows does everywhere else, and in both of
+        those the user is allowed to change their mind halfway through.
+        """
+        try:
+            mods = event.modifiers()
+        except AttributeError:
+            return False
+        return bool(mods & Qt.KeyboardModifier.ControlModifier)
+
     def dragEnterEvent(self, event):
-        if event.source() is not self:
+        if self.accepts(event) is None:
             event.ignore()
             return
         # Qt's own handler is what arms the edge autoscroll, so a drag can reach
@@ -252,14 +347,23 @@ class _PageList(QListWidget):
         event.acceptProposedAction()
 
     def dragMoveEvent(self, event):
-        if event.source() is not self:
+        payload = self.accepts(event)
+        if payload is None:
+            event.ignore()
+            return
+        copy = self._wants_copy(event)
+        if self._is_foreign(payload) and self._transfer_refusal(payload, copy):
+            # Refuse it HERE rather than at the drop, so the cursor says no
+            # while there is still time to aim somewhere else.
+            self._clear_drag()
             event.ignore()
             return
         super().dragMoveEvent(event)   # keeps the autoscroll fed
         event.acceptProposedAction()
         row = self._drop_row(self._event_pos(event))
-        if row != self._drag_row:
+        if row != self._drag_row or copy != self._drag_copy:
             self._drag_row = row
+            self._drag_copy = copy
             self.viewport().update()
 
     def dragLeaveEvent(self, event):
@@ -268,19 +372,32 @@ class _PageList(QListWidget):
 
     def dropEvent(self, event):
         self._clear_drag()
-        # Internal reorder only. Ignoring a foreign drop means the source sees a
-        # failed drop, so nothing anywhere gets removed.
-        if event.source() is not self:
+        # Ignoring a drop we cannot take means the source sees a failed drag,
+        # so nothing anywhere gets removed.
+        payload = self.accepts(event)
+        if payload is None:
             event.ignore()
             return
-        rows = self.selected_rows()
+        target = self._drop_row(self._event_pos(event))
+        if self._is_foreign(payload):
+            copy = self._wants_copy(event)
+            if self._transfer_refusal(payload, copy):
+                event.ignore()
+                return
+            event.acceptProposedAction()
+            self.transfer_requested.emit(payload, target, copy)
+            return
+        # Same document: the plain reorder, unchanged. A drop back into the
+        # document the pages came from can NEVER go through insert_pdf, which
+        # refuses to read a document into itself.
+        rows = payload.get("rows") or self.selected_rows()
         if not rows:
             event.ignore()
             return
-        order = move_rows(self.count(), rows, self._drop_row(self._event_pos(event)))
+        order = move_rows(self.count(), rows, target)
         event.acceptProposedAction()
         if order != list(range(self.count())):
-            self.reorder_requested.emit(order, rows)
+            self.reorder_requested.emit(order, sorted(rows))
 
     @staticmethod
     def _event_pos(event):
@@ -322,6 +439,7 @@ class _PageList(QListWidget):
             self.stopAutoScroll()
         if self._drag_row is not None:
             self._drag_row = None
+            self._drag_copy = False
             self.viewport().update()
 
     def _sel_color(self):
@@ -344,6 +462,9 @@ class PagePanel(QWidget):
     # and rebuilds this panel from it; the panel never edits pages itself.
     pages_delete_requested = Signal(list)
     pages_reorder_requested = Signal(list, list)
+    #: (payload, insertion index, copy) — pages dragged in from ANOTHER open
+    #: document. Republished from the list; the host owns the edit.
+    pages_transfer_requested = Signal(dict, int, bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -363,6 +484,15 @@ class PagePanel(QWidget):
         self._thumb_h = THUMB_H
         self._setup_ui()
         self.setFixedWidth(PANEL_W)
+
+    def set_view(self, view):
+        """Name the document this panel belongs to.
+
+        Only the drag payload needs it: a page leaving here has to say which
+        document it came out of, and a drop has to tell this document from a
+        foreign one. Passed straight down to the list. See ui/page_drag.py.
+        """
+        self._list.set_view(view)
 
     def release_render_source(self, render):
         """The host is about to close this clone. Stop naming it, and rebuild
@@ -395,6 +525,7 @@ class PagePanel(QWidget):
         """Theme the delegate (selection/hover/label) and placeholder fill, then
         repaint. Called once at start and on every light/dark toggle."""
         _PageDelegate.sel_color = QColor(palette.accent)
+        _PageDelegate.copy_color = QColor(palette.accent).lighter(135)
         _PageDelegate.hover_color = QColor(palette.surface_hover)
         _PageDelegate.text_color = QColor(palette.text_dim)
         _PageDelegate.sel_text_color = QColor(palette.accent_text)
@@ -436,7 +567,11 @@ class PagePanel(QWidget):
         # reorder. The drop indicator is drawn by the delegate, not by Qt, so
         # it can be a full-width line in the strip's own accent colour.
         self._list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self._list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
+        # DragDrop, not InternalMove. The move stopped being internal in phase
+        # 5: a page can come from another document's strip or grid, and
+        # InternalMove makes Qt reject a drag whose source is a different
+        # widget before our own guard ever sees it.
+        self._list.setDragDropMode(QListWidget.DragDropMode.DragDrop)
         self._list.setDefaultDropAction(Qt.DropAction.MoveAction)
         self._list.setDragEnabled(True)
         self._list.viewport().setAcceptDrops(True)
@@ -469,6 +604,7 @@ class PagePanel(QWidget):
         self._list.itemSelectionChanged.connect(self._on_selection_changed)
         self._list.delete_requested.connect(self._request_delete)
         self._list.reorder_requested.connect(self.pages_reorder_requested)
+        self._list.transfer_requested.connect(self.pages_transfer_requested)
         self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._list.customContextMenuRequested.connect(self._show_context_menu)
         # Fill in thumbnails as rows scroll into view.
