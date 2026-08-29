@@ -2,6 +2,7 @@ import sys
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QIcon
 
+from ui.session import restore_on_launch, save_session
 from ui.theme import apply_theme
 from ui.window_registry import WindowRegistry
 from core.resources import app_icon_path
@@ -61,6 +62,9 @@ def main():
     # core/settings.py). Built here, after the org/app names are set, because
     # those decide the path. Writes are debounced, so a last flush on the way
     # out catches a change made in the final quarter-second.
+    # Before the flush below, and the order is the point: the session is
+    # written INTO the store, and the flush is what puts the store on disk.
+    app.aboutToQuit.connect(save_session)
     app.aboutToQuit.connect(settings().flush)
 
     icon_path = app_icon_path()
@@ -81,6 +85,12 @@ def main():
     # else goes to the window last touched. See WindowRegistry.route_open.
     server.batch_ready.connect(registry.route_open)
     server.arm()      # nothing is emitted until the window is wired up
+
+    # Last run's windows and tabs, if `startup.restore_tabs` is on and this
+    # launch carried nothing. Both conditions live in `should_restore`; the
+    # forwarding branch above has already exited for a second launch, so this
+    # can only ever run in the primary.
+    restore_on_launch(window, registry, files, combine)
 
     window.show()
     sys.exit(app.exec())

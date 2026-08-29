@@ -106,6 +106,7 @@ from ui.document_area import DocumentArea
 from ui.document_view import DocumentView
 from ui.preferences_dialog import PreferencesDialog
 from ui.page_jump import PageJump
+from ui.session import recorder
 from ui.theme import ThemeManager, apply_mica, themed_icon, qtawesome_available, LIGHT
 from ui.undo import WindowUndoStack
 from ui.window_registry import WindowRegistry
@@ -360,7 +361,7 @@ class MainWindow(QMainWindow):
         # deliberately narrow: only a window whose ONLY tab is empty has a
         # placeholder to give up.
         placeholder = None
-        if self._area.count() == 1 and not self._area.view_at(0).has_document():
+        if self._area.count() == 1 and self._area.view_at(0).is_empty():
             placeholder = self._area.view_at(0)
         index = self._area.adopt(view, at)
         if placeholder is not None:
@@ -669,6 +670,16 @@ class MainWindow(QMainWindow):
     def _status_message(self, text: str):
         self._status.showMessage(text)
 
+    def show_status(self, text: str):
+        """Put a line in the status bar from outside this window.
+
+        Session restore is the caller: "3 files from the last session could not
+        be found" is one line about the whole window, and eight modal dialogs
+        for eight files on an offline mapped drive is the thing it exists to
+        avoid.
+        """
+        self._status_message(text)
+
     def _on_view_page_changed(self, page_num: int):
         """Keep the status bar's page box on the view's page.
 
@@ -927,6 +938,23 @@ class MainWindow(QMainWindow):
         self._area.add_view(view)
         return view
 
+    def tab_for_restore(self) -> DocumentView:
+        """An empty tab to stage a restored document into. Session restore only.
+
+        Two differences from `new_tab`, and both are about not reading a file.
+        It reuses the blank tab a new window comes up with, the way
+        `_target_view` does for an Open, so a restored window does not carry a
+        spare. And it adds every tab after that WITHOUT activating it: bringing
+        a tab to the front is exactly what opens a lazy one, so `new_tab` here
+        would read all eight documents on the way through. See ui/session.py.
+        """
+        view = self.view
+        if view is not None and view.is_empty():
+            return view
+        view = self._new_view()
+        self._area.add_view(view, activate=False)
+        return view
+
     def next_tab(self):
         """Ctrl+PgDn. Positional, and wrapping.
 
@@ -1000,11 +1028,16 @@ class MainWindow(QMainWindow):
         tab-or-window decision lands in `_on_view_close_requested`. An empty
         tab has nothing to prompt about, and the last empty tab is what an
         empty window looks like, so closing that one does nothing at all.
+
+        A RESTORED TAB THAT WAS NEVER OPENED counts as holding a document, and
+        `close_document` answers for it without a prompt. Asking
+        `has_document()` here would have made Ctrl+W dead on every tab of a
+        window that had just come back, since none of them has read its file.
         """
         view = self._area.view_at(index)
         if view is None:
             return False
-        if view.has_document():
+        if not view.is_empty():
             return view.request_close()
         if self._area.count() <= 1:
             return False
@@ -1045,7 +1078,7 @@ class MainWindow(QMainWindow):
         new one. This is what makes the very first Open reuse the tab that is
         already there instead of leaving a blank one behind it."""
         view = self.view
-        if view is not None and not view.has_document():
+        if view is not None and view.is_empty():
             return view
         return self.new_tab()
 
@@ -1088,7 +1121,7 @@ class MainWindow(QMainWindow):
         if not paths:
             return
         view = self.view
-        borrowed = view is not None and not view.has_document()
+        borrowed = view is not None and view.is_empty()
         if not borrowed:
             view = self.new_tab()
         view.combine_paths(list(paths))
@@ -1383,6 +1416,10 @@ class MainWindow(QMainWindow):
            anywhere aborts the whole close;
         4. `close.confirm_multiple_tabs` asks before several tabs go at once,
            and only when nothing is dirty (see _confirm_closing_several_tabs).
+
+        THE SESSION IS RECORDED ON EVERY PATH THAT ACTUALLY CLOSES, and always
+        before `_teardown_for_quit`, which closes the documents it would have
+        been read from. See `_record_session` for the one decision it makes.
         """
         # Windows is shutting down. Anything that stalls here is what makes it
         # put up "this app is preventing shutdown", so there is no prompt and,
@@ -1390,8 +1427,10 @@ class MainWindow(QMainWindow):
         # it would be in any app that does not implement the full session
         # protocol, which is the accepted trade for not blocking the machine.
         if self._session_is_ending():
+            self._record_session()
             self._teardown_for_quit()
             self._registry.unregister(self)
+            recorder().save()
             super().closeEvent(event)
             event.accept()
             return
@@ -1407,11 +1446,15 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
             view.clear_document()
+            recorder().save()   # the window stays, and it holds one tab less
             event.ignore()      # the window stays, empty
             return
 
         views = self._area.views()
-        open_docs = [v for v in views if v.has_document()]
+        # A restored tab counts even though it has not read its file yet. This
+        # warning is about losing your PLACE, and a window of eight tabs the
+        # user has not clicked into is exactly the place it is about.
+        open_docs = [v for v in views if not v.is_empty()]
         any_dirty = any(v.is_dirty() for v in open_docs)
 
         # The count warning, and only when nothing is dirty: a dirty tab is
@@ -1430,9 +1473,25 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
 
+        self._record_session()
         self._teardown_for_quit()
         # Leaving the registry is what ends the application when this was the
         # last window. Nothing here decides that: `main.py` turns Qt's own
         # quit-on-last-window off precisely so one place does.
         self._registry.unregister(self)
+        # After the unregister, so the windows still open are the ones read.
+        recorder().save()
         super().closeEvent(event)
+
+    def _record_session(self):
+        """Fix this window's entry in the session, on the way out.
+
+        The one decision: whether this close is part of the APPLICATION going
+        down. If it is, the window stays in the session, because the whole
+        arrangement is what gets remembered and by `aboutToQuit` its views have
+        been torn down. If the app carries on without it, the user closed it on
+        purpose and it drops out. See ui/session.py.
+        """
+        shutting_down = (self._force_quit or self._session_is_ending()
+                         or self._registry.count() <= 1)
+        recorder().note_closing(self, shutting_down)
