@@ -339,7 +339,17 @@ def test_activating_a_lazy_tab_opens_it_where_it_was_left(
 
 
 def test_a_lazy_tab_restores_a_hand_set_zoom(qt_app, registry, store, tmp_path):
-    """No fit mode was active, so the remembered scale is what comes back."""
+    """No fit mode was active, so the PICTURE that comes back is the saved one.
+
+    CHANGED WITH ADAPTIVE RASTER SCALING, and the change is the point of the
+    test rather than a concession to it. A view scale is scene pixels per
+    screen pixel and the scene is the page rendered at its raster scale, so the
+    number alone does not describe a picture. This session carries no
+    `raster_scale`, which means it was written by a build that rendered
+    everything at 1.5, while these A4 pages now render at 3.0. The same picture
+    is therefore half the number, and coming back at 0.42 would be coming back
+    at twice the size the user left it.
+    """
     a = make_pdf(tmp_path, "alpha.pdf")
     store.session.windows = [{
         "geometry": None, "screen": None, "current": 0,
@@ -349,6 +359,30 @@ def test_a_lazy_tab_restores_a_hand_set_zoom(qt_app, registry, store, tmp_path):
     restore_session(window, registry)
     view = window.document_area().view_at(0)
     assert view.fit_mode() is None
+    # The invariant is the product: view scale times raster scale is screen
+    # pixels per PDF point, which is what the user actually sees.
+    assert view.view_scale() * view.raster_scale() == pytest.approx(
+        0.42 * 1.5, rel=0.01)
+
+
+def test_a_hand_set_zoom_survives_a_round_trip_at_the_new_scale(
+        qt_app, registry, store, tmp_path):
+    """A session written by THIS build restores to the number it saved.
+
+    The conversion above only fires when the two scales differ. A session saved
+    and restored on one build records the scale it was measured against, so the
+    ratio is 1 and the zoom comes back untouched.
+    """
+    a = make_pdf(tmp_path, "alpha.pdf")
+    store.session.windows = [{
+        "geometry": None, "screen": None, "current": 0,
+        "tabs": [{"path": a, "page": 0, "zoom": 0.42, "fit_mode": None,
+                  "raster_scale": 3.0}],
+    }]
+    window = restored_window(qt_app, registry)
+    restore_session(window, registry)
+    view = window.document_area().view_at(0)
+    assert view.raster_scale() == 3.0
     assert view.view_scale() == pytest.approx(0.42, rel=0.01)
 
 
