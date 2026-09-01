@@ -453,7 +453,7 @@ def test_the_view_publishes_the_title_and_the_window_paints_it(win, pdf_path):
     win.view.title_changed.connect(lambda: seen.append(win.view.document_name()))
     win.view._mark_dirty()
     assert seen[-1] == os.path.basename(pdf_path)
-    assert win.windowTitle().startswith("Rapid PDF — ")
+    assert win.windowTitle().startswith("Rapid PDF - ")
     assert win.isWindowModified()
 
 

@@ -14,7 +14,7 @@
 #define AppVersion "1.6.0"
 #define AppPublisher "Lucas Ruiz"
 #define AppExeName "rapid-pdf.exe"
-; Stable GUID for upgrades/uninstall â€” keep this fixed across versions.
+; Stable GUID for upgrades/uninstall. Keep this fixed across versions.
 #define AppId "{{A7E3C9F1-4B2D-4E6A-9C8F-1D5B7A0E3F42}"
 
 [Setup]
@@ -154,7 +154,7 @@ Root: HKCU; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueN
 Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
 
 ; -----------------------------------------------------------------------------
-; CODE SIGNING (deferred â€” see docs/build.md "Adding code signing later").
+; CODE SIGNING (deferred, see docs/build.md "Adding code signing later").
 ; When you have a signing cert/SignTool configured, define a sign tool in the
 ; Inno IDE (Tools -> Configure Sign Tools) named e.g. "signtool", then uncomment:
 ;   SignTool=signtool
