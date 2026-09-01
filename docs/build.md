@@ -68,15 +68,20 @@ Programs.
 
 ### Bumping the version
 
-Keep THREE files in sync:
+Keep FOUR files in sync:
 
 1. `APP_VERSION` in `core/version.py`, the one the running app reads and the
    one the self-updater compares against the newest GitHub release.
 2. `filevers`/`prodvers` + the `FileVersion`/`ProductVersion` strings in
    `packaging/version_info.txt`.
 3. `#define AppVersion` in `rapid-pdf.iss`.
+4. `export const VERSION` in `landing/lib/site.ts`. The landing page builds
+   both download filenames out of it, so a stale one gives the site two
+   buttons that 404. This one is outside `tests/test_version.py`, which reads
+   the three build inputs only, so nothing catches it but this list.
 
-`tests/test_version.py` fails if they drift, so run the suite before tagging.
+`tests/test_version.py` fails if the first three drift, so run the suite
+before tagging.
 The `AppId` GUID in the .iss must stay FIXED across versions (it's how Windows
 tracks upgrades/uninstall).
 

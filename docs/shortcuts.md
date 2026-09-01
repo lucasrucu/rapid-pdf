@@ -122,8 +122,9 @@ them to one folder instead.
 | `Ctrl+W` | Close the current tab |
 | `Ctrl+PgDn` / `Ctrl+PgUp` | Next / previous tab by POSITION, wrapping |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab by RECENT USE |
+| Click the `+` button | New tab |
 | Middle-click a tab | Close it |
-| Double-click empty bar space | New tab |
+| Double-click empty bar space | Maximise or restore the window |
 | Drag a tab sideways | Reorder it |
 | Drag a tab off the bar | Tear it into its own window |
 | Right-click a tab | Close, Close Others, Close to the Right, Move to New Window, Duplicate Tab, Copy Full Path, Open Containing Folder |
@@ -162,6 +163,18 @@ are always asked about, whatever that setting says.
 | `Ctrl+Shift+N` | New window, empty |
 | Right-click a tab > Move to New Window | Move that document into a window of its own |
 | Drag a tab off the bar | Same thing, by hand |
+| Drag empty tab-strip space | Move the window |
+| Double-click empty tab-strip space | Maximise or restore |
+| `Alt+Space`, or right-click the top row or the app icon | The window system menu |
+
+The tabs are in the title bar, so the top row of the window is doing two jobs
+at once. Anything that is not a tab, a tab close button, the chevron, the `+`
+or a window control counts as caption: it drags the window, double-clicks to
+maximise, and right-clicks to the system menu. That is why double-clicking
+bare bar space no longer opens a tab, which is what it did up to 1.6.0. Use
+`Ctrl+T` or the `+` button. Resting the pointer on the maximise button opens
+the Windows 11 Snap Layouts flyout, and the window resizes from every edge and
+corner as usual.
 
 Closing a window closes everything in it. Closing the last one quits. The Quit
 menu asks every window in turn and the first one to refuse (a cancelled save
