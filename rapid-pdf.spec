@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec for rapid-pdf — onedir, windowed (no console), Qori icon +
+PyInstaller spec for rapid-pdf: onedir, windowed (no console), Qori icon +
 version metadata. See docs/build.md for the full build + installer steps.
 
 Build:  .venv\\Scripts\\pyinstaller rapid-pdf.spec --noconfirm

@@ -1,6 +1,14 @@
-﻿# PyInstaller version-info resource for rapid-pdf.exe.
+# PyInstaller version-info resource for rapid-pdf.exe.
 # Embeds product name / version / publisher so right-click -> Properties ->
 # Details reads like a shipped app. Keep AppVersion in rapid-pdf.iss in sync.
+#
+# FileDescription IS THE NAME WINDOWS SHOWS. Explorer's "Open with" list, the
+# Task Manager process row and the taskbar tooltip all read FileDescription,
+# not ProductName. Up to 1.6.0 it held a whole tagline, so "Open with" offered
+# a menu entry the width of the dialog. It is now just the app name, the same
+# string as ProductName, because that is all any of those places have room for.
+# The tagline lives where a tagline belongs: the About box, the installer's
+# ApplicationDescription, and the landing site.
 VSVersionInfo(
   ffi=FixedFileInfo(
     filevers=(1, 6, 0, 0),
@@ -19,7 +27,7 @@ VSVersionInfo(
           '040904B0',
           [
             StringStruct('CompanyName', 'Lucas Ruiz'),
-            StringStruct('FileDescription', 'Rapid PDF â€” fast PDF annotation and page organization'),
+            StringStruct('FileDescription', 'Rapid PDF'),
             StringStruct('FileVersion', '1.6.0.0'),
             StringStruct('InternalName', 'rapid-pdf'),
             StringStruct('LegalCopyright', 'Copyright (c) 2026 Lucas Ruiz'),

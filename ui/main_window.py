@@ -862,7 +862,7 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self, "About Rapid PDF",
             f"<b>Rapid PDF {APP_VERSION}</b>"
-            "<p>Fast PDF annotation and page organization.</p>"
+            "<p>Fast PDF page management and markup.</p>"
             "<p>Copyright (c) 2026 Lucas Ruiz</p>")
 
     def _maybe_save_every_tab(self) -> bool:
@@ -1298,6 +1298,10 @@ class MainWindow(QMainWindow):
         Qt renders the '[*]' placeholder as '*' only while windowModified is True.
         The view says WHEN (title_changed); the name and the dirty flag are read
         back off it here, because the title bar is the window's.
+
+        The separator is a plain hyphen. It used to be an em dash, which reads
+        badly at title-bar size and does not survive every place a window title
+        gets copied into (taskbar previews, screenshots, bug reports).
         """
         view = self.view
         name = view.document_name() if view is not None else None
@@ -1306,7 +1310,7 @@ class MainWindow(QMainWindow):
             self.setWindowTitle("Rapid PDF")
             return
         self.setWindowModified(view.is_dirty())
-        self.setWindowTitle(f"Rapid PDF — {name}[*]")
+        self.setWindowTitle(f"Rapid PDF - {name}[*]")
 
     def _quit_app(self):
         """Quit menu / Ctrl+Q. Quits the APPLICATION, not this window.

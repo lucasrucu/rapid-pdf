@@ -10,6 +10,20 @@ Releases before 1.6.0 were written up on the
 [Releases page](https://github.com/lucasrucu/rapid-pdf/releases) and are not
 backfilled here.
 
+## [Unreleased]
+
+### Fixed
+
+- **The app is called "Rapid PDF" and nothing more.** The Windows version
+  resource carried a whole tagline in `FileDescription`, and that field is what
+  Explorer prints in the "Open with" list, what Task Manager shows in the
+  process row, and what the taskbar tooltip reads. So "Open with" offered an
+  entry the width of the dialog. It is now the app name on its own. The
+  description still exists where there is room for one: the About box, the
+  installer's Default Apps entry, and the site.
+- The window title separates the app name from the filename with a plain
+  hyphen instead of an em dash.
+
 ## [1.6.0] - 2026-08-29
 
 The tabs release. Several PDFs open at once, in one window or several, and
