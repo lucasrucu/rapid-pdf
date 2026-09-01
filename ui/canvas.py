@@ -12,6 +12,7 @@ from PySide6.QtGui import (
     QUndoStack, QUndoCommand,
 )
 
+from core.render_scale import RENDER_SCALE_LADDER
 from ui.theme import LIGHT
 from ui.scrolling import (
     TRACKPAD_NOTCH_PX, WHEEL_NOTCH, scroll_area_by_pixels, wheel_pixels,
@@ -739,7 +740,12 @@ class PDFCanvas(QGraphicsView):
 
         self._doc = None
         self._current_page = 0
-        self._zoom = 1.5
+        # The RASTER scale: how many pixels a page is drawn at per PDF point.
+        # Not the view zoom (see view_scale). Replaced in set_document by
+        # whatever the document decided for itself; the ladder's floor is the
+        # value to sit at while there is no document, because it is what every
+        # build before adaptive scaling used for everything.
+        self._zoom = RENDER_SCALE_LADDER[0]
         self._bg_item: QGraphicsPixmapItem | None = None
 
         self._page_annotations: dict[int, list] = {}
@@ -1011,6 +1017,13 @@ class PDFCanvas(QGraphicsView):
 
     def set_document(self, doc):
         self._doc = doc
+        # Settle the raster scale BEFORE anything renders. The document decides
+        # it once from its own page geometry and answers the same way forever
+        # after, so re-entering here (a save reopens the file in place, a strip
+        # or a reload calls this again) cannot move the markup, which is stored
+        # in scene coordinates and therefore in units of this number. See
+        # PDFDocument.render_scale.
+        self._zoom = doc.render_scale() if doc else RENDER_SCALE_LADDER[0]
         self._page_annotations.clear()
         self._embedded_images = None
         self._embedded_images_page = -1
@@ -1224,10 +1237,21 @@ class PDFCanvas(QGraphicsView):
         """How far the view is zoomed, as the scale on its transform.
 
         NOT `self._zoom`, which is the RASTER scale the page was rendered at
-        and is a fixed 1.5. This is the number a fit mode sets and Ctrl+wheel
-        changes, so it is the one worth remembering between runs.
+        and is chosen per document from its page size. This is the number a fit
+        mode sets and Ctrl+wheel changes, so it is the one worth remembering
+        between runs.
+
+        IT IS ONLY MEANINGFUL ALONGSIDE THE RASTER SCALE, which is why
+        `raster_scale` exists and why the saved session records both. The scene
+        is the page rendered at `_zoom`, so the same picture on screen is this
+        number halved when the raster scale doubles. Remember one without the
+        other and a restored tab comes back at the wrong size.
         """
         return self.transform().m11()
+
+    def raster_scale(self) -> float:
+        """The scale this document's pages are rasterised at. See `view_scale`."""
+        return self._zoom
 
     def set_view_scale(self, scale: float):
         """Put the view back at a remembered zoom.

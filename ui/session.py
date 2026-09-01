@@ -115,6 +115,9 @@ def capture_window(window) -> dict | None:
             "path": path,
             "page": view.current_page(),
             "zoom": view.view_scale(),
+            # The zoom above is measured against this, so the pair travels
+            # together. See DocumentView.raster_scale.
+            "raster_scale": view.raster_scale(),
             "fit_mode": view.fit_mode(),
         })
     if not tabs:
@@ -308,7 +311,8 @@ def _fill_window(window, record: dict, tabs: list) -> None:
         view = window.tab_for_restore()
         view.stage_path(tab["path"], page=tab.get("page") or 0,
                         zoom=tab.get("zoom") or 0.0,
-                        fit_mode=tab.get("fit_mode"))
+                        fit_mode=tab.get("fit_mode"),
+                        raster_scale=tab.get("raster_scale") or 0.0)
 
     current = record.get("current") or 0
     area.set_current_index(min(max(current, 0), area.count() - 1))
