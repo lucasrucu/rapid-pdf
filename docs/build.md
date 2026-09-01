@@ -20,7 +20,10 @@ Prerequisites (one-time):
   second Qt binding makes PyInstaller grab the wrong one or abort.
 - `pip install -r requirements.txt` plus the build tools: `pip install pyinstaller pillow`.
 - **Inno Setup 6** installed (https://jrsoftware.org/isdl.php) for the installer
-  step. It puts `ISCC.exe` at `C:\Program Files (x86)\Inno Setup 6\ISCC.exe`.
+  step. On this machine it is a PER-USER install, so `ISCC.exe` is at
+  `%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe`, NOT the Program Files path.
+  Believing the Program Files path is why 1.3.0 and 1.4.0 shipped without an
+  installer at all. Check both before concluding it is not installed.
 
 Files that drive the build (all committed):
 
@@ -59,7 +62,7 @@ Confirm: window opens themed, a PDF opens, annotate/save works, light/dark toggl
 ### 2. Wrap with Inno Setup
 
 ```
-"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" rapid-pdf.iss
+"%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" rapid-pdf.iss
 ```
 
 Output: `installer_output\rapid-pdf-setup-<version>.exe` (e.g. `rapid-pdf-setup-1.2.1.exe`). Double-click to install
