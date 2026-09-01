@@ -658,11 +658,18 @@ def test_duplicate_tab_opens_a_second_independent_document(win, area, three_page
 
 def test_the_tab_menu_offers_move_to_new_window(win, area, three_pages):
     """Phase 3 put it in. It was left out of phase 2 because there was no
-    registry owning second windows to move a document into yet."""
+    registry owning second windows to move a document into yet.
+
+    Phase 7 put the three ticking entries next to it, so this list is also what
+    pins the order: ticking a tab and moving the ticked ones sit with the
+    singular move rather than in a menu of their own.
+    """
     win.open_paths([three_pages])
     labels = [a.text() for a in area.build_tab_menu(0).actions() if a.text()]
     assert labels == ["Close", "Close Others", "Close to the Right",
-                      "Move to New Window", "Duplicate Tab", "Copy Full Path",
+                      "Move to New Window", "Select Tab",
+                      "Move Selected to New Window", "Clear Selection",
+                      "Duplicate Tab", "Copy Full Path",
                       "Open Containing Folder"]
 
 

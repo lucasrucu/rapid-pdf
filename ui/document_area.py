@@ -68,10 +68,31 @@ CHEVRON_WIDTH = 26
 # The unsaved-changes dot, drawn in place of the close X.
 DIRTY_DOT_RADIUS = 3.5
 
-# The line drawn where a torn-off tab would land. Two pixels, in the accent, and
-# full height: it has to read as "between these two tabs" from the corner of the
-# eye, while the thing actually being looked at is the window under the cursor.
-DROP_LINE_WIDTH = 2
+# The line drawn where a torn-off tab would land. In the accent, and full
+# height: it has to read as "between these two tabs" from the corner of the eye,
+# while the thing actually being looked at is the window under the cursor.
+#
+# It was two pixels and that was not enough. Two pixels of accent, on a strip
+# the floating window was sitting on top of, was a signal nobody reported
+# seeing: the drop worked and looked like luck. So the line is wider, and it is
+# no longer alone: `set_drop_active` washes the whole target strip in the accent
+# so the answer to "which window is this going into" is readable without hunting
+# for a hairline. See ui/tab_tear_off.py, where the floating window is also
+# moved down out of the way of both.
+DROP_LINE_WIDTH = 4
+
+# How much of the accent the target strip is washed in while a tear-off is over
+# it. Enough to read as "this one", not so much that the tab labels underneath
+# stop being legible.
+DROP_WASH_ALPHA = 46
+
+# The accent outline around the target strip, under the wash.
+DROP_OUTLINE_WIDTH = 2
+
+# The mark on a tab that has been ticked for "Move Selected to New Window". A
+# bar along the top edge of the tab, in the accent, because the tab's own
+# selected state already owns its background and its underline.
+CHECK_MARK_HEIGHT = 3
 
 
 def tab_titles(paths: list) -> list:
@@ -267,6 +288,15 @@ class DocumentTabBar(QTabBar):
         self._tear_off = None
         # x of the insertion line while a torn-off tab is over this bar, or None.
         self._drop_x = None
+        # Whether this window is the drop target at all. Separate from the line
+        # above because the dock zone is now the WHOLE window: the cursor can be
+        # down in the page view with this strip still being the thing that will
+        # receive the document, and the strip has to say so.
+        self._drop_active = False
+        # Tabs ticked for "Move Selected to New Window", by index. Pushed down
+        # from DocumentArea, which holds the real answer as VIEWS: an index goes
+        # stale the moment a tab is dragged along the bar.
+        self._checked = ()
         # Phase 5. Hover-switch while a PAGE drag is over the bar: which tab
         # the cursor is resting on, where it was when the countdown started,
         # and the countdown itself.
@@ -357,6 +387,34 @@ class DocumentTabBar(QTabBar):
         """Where the insertion line is, or None. Named for the tests, which
         cannot see pixels but can ask the question the pixels answer."""
         return self._drop_x
+
+    def set_drop_active(self, active: bool):
+        """Wash this strip in the accent, or stop.
+
+        The louder half of the drag feedback, and the half that answers the
+        question people actually ask mid-drag: not "between which two tabs" but
+        "is it going into THIS window". It is set whenever the cursor is
+        anywhere over this window, which since the dock zone was widened is most
+        of the screen area a drag crosses.
+        """
+        if active == self._drop_active:
+            return
+        self._drop_active = active
+        self.update()
+
+    def drop_active(self) -> bool:
+        return self._drop_active
+
+    def set_checked_indices(self, indices):
+        """Which tabs are ticked, for painting. DocumentArea owns the truth."""
+        indices = tuple(sorted(set(indices)))
+        if indices == self._checked:
+            return
+        self._checked = indices
+        self.update()
+
+    def checked_indices(self) -> tuple:
+        return self._checked
 
     def insertion_x(self, index: int) -> int:
         """The x a tab inserted at `index` would start at.
@@ -473,22 +531,50 @@ class DocumentTabBar(QTabBar):
 
     # -- gestures ------------------------------------------------------
 
-    def paintEvent(self, event):
-        """The tabs, and over them the insertion line if one is asked for.
+    def _accent(self) -> QColor:
+        return QColor(self._palette.accent) if self._palette is not None \
+            else QColor("#3b82f6")
 
-        Drawn on top rather than as part of a tab, because the line belongs to
-        the gap BETWEEN two tabs and there is no tab at the end of the bar for
-        it to belong to.
+    def paintEvent(self, event):
+        """The tabs, then the tick marks, then the drop feedback over the lot.
+
+        All three are drawn on top rather than as part of a tab, and for the
+        same reason in each case: they belong to somewhere a tab is not. The
+        insertion line belongs to the gap BETWEEN two tabs and there is no tab
+        at the end of the bar for it to belong to; the drop wash belongs to the
+        strip; and the tick marks are the only thing here that is per tab, kept
+        with the other two so one QPainter covers all of it.
         """
         super().paintEvent(event)
-        if self._drop_x is None:
+        if not self._checked and not self._drop_active and self._drop_x is None:
             return
         painter = QPainter(self)
-        colour = QColor(self._palette.accent) if self._palette is not None \
-            else QColor("#3b82f6")
-        left = max(0, min(int(self._drop_x) - DROP_LINE_WIDTH // 2,
-                          self.width() - DROP_LINE_WIDTH))
-        painter.fillRect(QRect(left, 0, DROP_LINE_WIDTH, self.height()), colour)
+        accent = self._accent()
+
+        for index in self._checked:
+            if 0 <= index < self.count():
+                rect = self.tabRect(index)
+                painter.fillRect(
+                    QRect(rect.left(), rect.top(), rect.width(),
+                          CHECK_MARK_HEIGHT), accent)
+
+        if self._drop_active:
+            wash = QColor(accent)
+            wash.setAlpha(DROP_WASH_ALPHA)
+            painter.fillRect(self.rect(), wash)
+            pen = QPen(accent)
+            pen.setWidth(DROP_OUTLINE_WIDTH)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            inset = DROP_OUTLINE_WIDTH // 2
+            painter.drawRect(self.rect().adjusted(
+                inset, inset, -inset - 1, -inset - 1))
+
+        if self._drop_x is not None:
+            left = max(0, min(int(self._drop_x) - DROP_LINE_WIDTH // 2,
+                              self.width() - DROP_LINE_WIDTH))
+            painter.fillRect(
+                QRect(left, 0, DROP_LINE_WIDTH, self.height()), accent)
 
     def mouseDoubleClickEvent(self, event):
         """Empty space opens a new tab. A double-click ON a tab does nothing.
@@ -535,10 +621,34 @@ class DocumentArea(QWidget):
     #: move because it needs the registry to make the destination.
     move_to_new_window_requested = Signal(object)
 
+    #: (list of views,) - the context menu's Move Selected to New Window. The
+    #: cheap half of multi-tab move: several tabs ticked one at a time, then one
+    #: command that takes all of them at once. Carries views rather than
+    #: indices, because the indices move as the first one leaves.
+    move_selected_to_new_window_requested = Signal(list)
+
+    #: () - which tabs are ticked has changed. The window watches it so nothing
+    #: else has to poll `checked_views()`.
+    checked_views_changed = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._current_view = None
         self._syncing = False       # a bar/stack edit is mid-flight
+        # Tabs ticked for "Move Selected to New Window", in tab order, held as
+        # VIEWS. Indices were the obvious choice and are wrong: dragging a tab
+        # along the bar renumbers every one of them, and so does closing a tab
+        # to the left of a ticked one.
+        #
+        # This is deliberately NOT a selection model on the QTabBar. QTabBar has
+        # exactly one current tab and no concept of a second selected one, and
+        # giving it one means reimplementing its painting, its keyboard handling
+        # and its drag reordering. The pages grid has a real selection model
+        # (ui/page_panel.py, ui/organizer.py) because a grid of pages is a
+        # QListWidget and gets one for free. A bar of tabs is not, so this is a
+        # ticked LIST plus a mark painted over the top, and the whole feature
+        # lives in the context menu where nobody has to discover a modifier.
+        self._checked: list = []
         # Most recently looked at FIRST. A visit history for TABS, which is not
         # the same list as the registry's activation order for WINDOWS: that
         # one answers "where does a new file go", this one answers Ctrl+Tab.
@@ -600,6 +710,16 @@ class DocumentArea(QWidget):
     def bar(self) -> DocumentTabBar:
         return self._bar
 
+    def header(self) -> QWidget:
+        """The strip holding the bar and the chevron.
+
+        Handed out so the window's title bar can HOST it: the tabs are the top
+        row of the window now (see ui/title_bar.py). Reparenting it changes
+        nothing about who owns it; every signal, every gesture and the invariant
+        below are still this widget's.
+        """
+        return self._header
+
     def stack(self) -> QStackedWidget:
         return self._stack
 
@@ -635,6 +755,59 @@ class DocumentArea(QWidget):
             if open_path and os.path.normcase(os.path.abspath(open_path)) == target:
                 return i
         return -1
+
+    # ------------------------------------------------------------------
+    # Ticked tabs, for "Move Selected to New Window"
+    # ------------------------------------------------------------------
+
+    def checked_views(self) -> list:
+        """The ticked tabs, in TAB ORDER rather than the order they were ticked.
+
+        Tab order is the order they will land in the new window, and it is the
+        order the eye reads them in, so it is the only one worth reporting.
+        """
+        live = self.views()
+        return [v for v in live if any(v is c for c in self._checked)]
+
+    def is_view_checked(self, view) -> bool:
+        return any(v is view for v in self._checked)
+
+    def set_view_checked(self, view, checked: bool):
+        if view is None or self.index_of(view) < 0:
+            return
+        already = self.is_view_checked(view)
+        if already == checked:
+            return
+        if checked:
+            self._checked.append(view)
+        else:
+            self._checked = [v for v in self._checked if v is not view]
+        self._sync_checked_marks()
+        self.checked_views_changed.emit()
+
+    def toggle_view_checked(self, view):
+        self.set_view_checked(view, not self.is_view_checked(view))
+
+    def clear_checked(self):
+        if not self._checked:
+            return
+        self._checked = []
+        self._sync_checked_marks()
+        self.checked_views_changed.emit()
+
+    def _forget_checked(self, view):
+        """A view left this window. Quietly, without announcing a change the
+        caller is in the middle of making anyway."""
+        if self.is_view_checked(view):
+            self._checked = [v for v in self._checked if v is not view]
+            self._sync_checked_marks()
+
+    def _sync_checked_marks(self):
+        """Push the ticked VIEWS down to the bar as indices, which is what it
+        paints with. Re-run after anything that renumbers the tabs."""
+        self._checked = [v for v in self._checked if self.index_of(v) >= 0]
+        self._bar.set_checked_indices(
+            [self.index_of(v) for v in self._checked])
 
     def check_invariant(self):
         """The bar and the stack are index-parallel. Nothing else keeps them
@@ -779,6 +952,7 @@ class DocumentArea(QWidget):
             self._syncing = False
         self._disconnect_view(view)
         self._forget_visit(view)
+        self._forget_checked(view)
         self._refresh_titles()
         self._sync_header_visibility()
         self._resync_current()
@@ -809,6 +983,7 @@ class DocumentArea(QWidget):
             self._syncing = False
         self._disconnect_view(view)
         self._forget_visit(view)
+        self._forget_checked(view)
         view.teardown()
         view.setParent(None)
         view.deleteLater()
@@ -999,6 +1174,7 @@ class DocumentArea(QWidget):
             path = view.document_path()
             self._bar.setTabToolTip(i, path or title)
         self._refresh_dirty()
+        self._sync_checked_marks()
         self._sync_header_visibility()
 
     def _refresh_dirty(self, _=None):
@@ -1065,6 +1241,37 @@ class DocumentArea(QWidget):
         move_out.setEnabled(self.count() > 1)
         move_out.triggered.connect(
             lambda: self.move_to_new_window_requested.emit(view))
+
+        # THE CHEAP HALF OF MULTI-TAB MOVE. Tick as many tabs as you want, one
+        # right-click each, then move the lot in one go. Shift-click range
+        # select was the other candidate and was ruled out: it needs a real
+        # selection model on a QTabBar, which does not have one and cannot be
+        # given one without taking over its painting, its keyboard handling and
+        # its drag reordering.
+        #
+        # Ticking lives on the same menu as the command that consumes it, so
+        # there is nothing to discover: right-click a tab and both are there.
+        select = menu.addAction("Select Tab")
+        select.setCheckable(True)
+        select.setChecked(self.is_view_checked(view))
+        select.triggered.connect(lambda: self.toggle_view_checked(view))
+
+        checked = self.checked_views()
+        move_selected = menu.addAction(
+            f"Move Selected to New Window ({len(checked)})" if checked
+            else "Move Selected to New Window")
+        # Disabled on "all of them" for the same reason the singular one is
+        # disabled on a lone tab: moving every document out of a window and
+        # closing the window behind it hands back the window you started with,
+        # minus its size and position.
+        move_selected.setEnabled(bool(checked) and len(checked) < self.count())
+        move_selected.triggered.connect(
+            lambda: self.move_selected_to_new_window_requested.emit(
+                self.checked_views()))
+
+        clear = menu.addAction("Clear Selection")
+        clear.setEnabled(bool(checked))
+        clear.triggered.connect(self.clear_checked)
 
         menu.addSeparator()
 

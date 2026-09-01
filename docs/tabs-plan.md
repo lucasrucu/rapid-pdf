@@ -224,6 +224,7 @@ implements it. No custom event handling needed.
 | 4 | Tear-off drag gesture | 1-1.5 d | **done**, `feat/tab-tear-off` |
 | 5 | Pages between tabs | 4 d | **done**, `feat/pages-between-tabs` |
 | 6 | Session restore | 0.5-1 d | **done**, `feat/session-restore` |
+| 7 | Tabs in the title bar, frameless window | 2-3 d | **done**, `feat/tabs-in-title-bar` |
 
 The order is not arbitrary. Each phase leaves the app shippable, and phases 3
 and 4 are split specifically so the hard, testable half lands before the
@@ -614,6 +615,80 @@ back. But restore is OFF by default, so flipping the warning's default would
 take the safety net away from everybody who has not opted in. The honest
 sequence is: ship this, and revisit the default if and when restore becomes the
 default. Not in this phase.
+
+### Phase 7: tabs in the title bar
+
+Branch `feat/tabs-in-title-bar`. New: `ui/frameless.py`, `ui/title_bar.py`,
+`tests/test_title_bar.py`, `tests/test_tab_multi_move.py`.
+
+**What was wrong.** Lucas, looking at the window: "tabs should be literal top of
+everything, you should drag a window by grabbing the top, these icons we have
+right now for tabs are below, even below the edit file options." The stack was
+system title bar, menu bar, tab strip, Editor/Organizer switcher. The strip you
+grab to drag the window and the strip that holds the tabs were two different
+strips with a menu bar between them, which is the arrangement Chrome, Edge and
+Firefox all abandoned.
+
+**There is no way to put a widget in the system title bar,** so the system title
+bar had to go, and everything it did for free had to be given back: dragging,
+double-click to maximise, Aero Snap, Snap Layouts, the system menu on right
+click and on Alt+Space, eight resize directions, the drop shadow, the minimise
+animation, and correct maximised geometry on every monitor at every scale.
+
+**`FramelessWindowHint` alone does none of that,** because it makes a `WS_POPUP`
+and Windows does not treat a `WS_POPUP` as a window. So the HWND keeps
+`WS_THICKFRAME` (snap, resizing) and `WS_CAPTION` (shadow, animations, the
+Alt+Space menu) and the frame is removed by answering `WM_NCCALCSIZE` with "the
+client area is the whole window". `WM_NCHITTEST` is then ours and is the entire
+interface of `ui/frameless.py`: every pixel has to be handed back to Windows
+with a name, and the names are what make each behaviour work.
+
+**The menu bar went DOWN a row, not into a hamburger.** Chrome uses a hamburger
+because Chrome has no menu bar to lose. This app has five menus with thirty-odd
+items, and a hamburger costs Alt+F, costs the screen reader its menu, turns
+every menu into two clicks, and spends title bar width on a button to save a row
+that costs 22 pixels. The complaint was that the tabs were BELOW the menu; they
+are above it now, which is the whole of what was asked for.
+
+**Mica.** The backdrop still applies (it is a DWM attribute on the HWND). What
+stopped meaning anything is `change_header_color` / `change_title_color`, which
+coloured the system caption. Nothing is lost: they were painting it in
+`palette.window` and `ui/title_bar.py` paints the row that replaced it in the
+same token. Both calls stay, because on a machine where the frameless setup
+cannot take, the system caption comes back and they are what keep it in the
+app's colours.
+
+**The drag feedback was fixed at the same time, because it lives next door.**
+Three separate problems, all of them the same complaint from the other side:
+
+- The dock zone was the target's bar plus `DOCK_MARGIN` either side, a strip
+  about 46 px tall. Missing it did not fail loudly; the document became a second
+  window on the desktop and nothing said why. The whole target window is the
+  zone now, and only the insertion INDEX still depends on aiming.
+- The source window is the one exception, and has to be: tearing a tab off is
+  dragging it down out of the bar, and down out of the bar is still inside the
+  window it came from. Give that window a body-sized zone and the tear-off stops
+  existing. Its bar keeps the narrow band, which is how you change your mind.
+- The floating window sat exactly under the cursor, on top of the strip the
+  feedback is painted on. It is held `DROP_CLEARANCE` below the cursor now.
+- Two pixels of accent was not a signal. The target strip is washed in the
+  accent and outlined, and the insertion line is four pixels.
+
+**Multi-tab move, the cheap route.** Shift-click range select needs a real
+selection model on a `QTabBar`, which does not have one and cannot be given one
+without taking over its painting, its keyboard handling and its drag reordering.
+So: "Select Tab" (checkable) and "Move Selected to New Window" on the tab's own
+context menu, with the ticked set held as VIEWS in `DocumentArea` and painted as
+an accent bar along the top of each ticked tab. Views and not indices because
+three ordinary things renumber the bar. `MainWindow.move_views_to_new_window` is
+one new plural entry point that makes the destination once and then runs the
+SINGULAR move per document into it; the reparent order stays in one place, and
+what the plural version saves is the window per document and the raise per
+document, which is what the flicker would have been.
+
+**What it cost.** Double-clicking empty tab strip space used to open a new tab.
+It maximises the window now, which is what a title bar does. `Ctrl+T` and the
+new `+` button in the strip are the two ways to open a tab.
 
 ## Design decisions
 
