@@ -109,7 +109,8 @@ def test_the_defaults_match_the_documented_schema():
     assert set(DEFAULTS["appearance"]) == {"theme"}
     assert set(DEFAULTS["files"]) == {"default_folder_mode", "default_folder"}
     assert set(DEFAULTS["view"]) == {
-        "page_panel_visible", "default_fit_mode", "organizer_zoom_index"}
+        "page_panel_visible", "default_fit_mode", "organizer_zoom_index",
+        "render_scale"}
     assert set(DEFAULTS["startup"]) == {"restore_tabs"}
     assert set(DEFAULTS["session"]) == {"windows"}
     assert DEFAULTS["schema_version"] == SCHEMA_VERSION == 1

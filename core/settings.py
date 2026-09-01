@@ -49,6 +49,9 @@ from typing import Callable
 
 from PySide6.QtCore import QCoreApplication, QSettings, QStandardPaths, QTimer
 
+from core.render_scale import (
+    AUTO as RENDER_SCALE_AUTO, RENDER_SCALE_CHOICES, RENDER_SCALE_LADDER)
+
 # The legacy QSettings scope, kept only so the one-time migration below can
 # find it. Nothing else in the app constructs a QSettings any more.
 LEGACY_ORG = "Lucas"
@@ -92,6 +95,7 @@ DEFAULTS: dict = {
         "page_panel_visible": True,
         "default_fit_mode": "fit_page",
         "organizer_zoom_index": _DEFAULT_ORGANIZER_ZOOM_INDEX,
+        "render_scale": RENDER_SCALE_AUTO,
     },
     "startup": {
         "restore_tabs": False,
@@ -233,6 +237,13 @@ def _as_session_tab(raw) -> dict | None:
         "path": path,
         "page": _clean_int(raw.get("page"), 0, low=0),
         "zoom": _clean_float(raw.get("zoom"), 0.0),
+        # The raster scale the saved zoom was measured against. A session
+        # written before adaptive scaling has no such key, and every build
+        # before it rendered everything at 1.5, so that is the right default
+        # rather than 0: it makes an old session restore exactly, not
+        # approximately. See DocumentView.ensure_loaded.
+        "raster_scale": _clean_float(raw.get("raster_scale"),
+                                     RENDER_SCALE_LADDER[0]),
         "fit_mode": fit if fit in FIT_MODE_NAMES else None,
     }
 
@@ -362,6 +373,13 @@ class ViewSection(_Section):
     # test_preferences.py asserts the two sets stay equal.
     default_fit_mode = _Field(_as_str, allowed=FIT_MODE_NAMES)
     organizer_zoom_index = _Field(_as_int)
+    # How sharply pages are rasterised: "auto", or one rung of
+    # core.render_scale.RENDER_SCALE_LADDER as a string. Stored as a string
+    # because "auto" has to share the field with the numbers, and one type per
+    # key is worth more than the tidiness of storing 1.5 as a float. Read once
+    # per document on open, by PDFDocument.render_scale, and deliberately NOT
+    # applied to documents that are already open: see that method.
+    render_scale = _Field(_as_str, allowed=RENDER_SCALE_CHOICES)
 
 
 class StartupSection(_Section):

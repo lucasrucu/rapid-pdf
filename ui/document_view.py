@@ -375,6 +375,15 @@ class DocumentView(QWidget):
         """
         return self._canvas.view_scale()
 
+    def raster_scale(self) -> float:
+        """The scale this document's pages are rasterised at.
+
+        Saved with the session for one reason: `view_scale` is measured against
+        it, so a zoom restored into a document rendered at a different raster
+        scale is the wrong zoom. See PDFCanvas.view_scale.
+        """
+        return self._canvas.raster_scale()
+
     def refresh_chrome(self):
         """Re-announce everything the window's chrome reads off this view.
 
@@ -649,7 +658,8 @@ class DocumentView(QWidget):
         return True
 
     def stage_path(self, path: str, page: int = 0, zoom: float = 0.0,
-                   fit_mode: str | None = None) -> bool:
+                   fit_mode: str | None = None,
+                   raster_scale: float = 0.0) -> bool:
         """Claim this empty view for a file WITHOUT opening it. Restore only.
 
         The tab that results is named after `path` and behaves like an open tab
@@ -662,7 +672,8 @@ class DocumentView(QWidget):
         if self._doc.doc or not path:
             return False
         self._pending_path = path
-        self._pending_view = {"page": page, "zoom": zoom, "fit_mode": fit_mode}
+        self._pending_view = {"page": page, "zoom": zoom, "fit_mode": fit_mode,
+                              "raster_scale": raster_scale}
         self.title_changed.emit()
         return True
 
@@ -701,6 +712,20 @@ class DocumentView(QWidget):
                 # No fit mode was active when this was saved, so the canvas was
                 # at a hand-set zoom. `_apply_default_fit` has already put a fit
                 # on it by now; taking that off is what restores what was there.
+                #
+                # THE SAVED ZOOM IS IN THE OLD RASTER SCALE'S UNITS. A view
+                # scale is scene pixels to screen pixels and the scene is the
+                # page rendered at the raster scale, so the same picture is a
+                # different number at a different scale. A document sharpened
+                # since the session was written (the setting changed, or the
+                # build gained adaptive scaling) would otherwise come back at
+                # twice the size. Convert through the ratio; a session with no
+                # recorded scale was written by a build that used 1.5 for
+                # everything, which is what the settings reader defaults it to.
+                was = wanted.get("raster_scale") or 0.0
+                now = self._canvas.raster_scale()
+                if was > 0 and now > 0:
+                    zoom = zoom * was / now
                 self._canvas.set_fit_mode(None)
                 self._canvas.set_view_scale(zoom)
         return True

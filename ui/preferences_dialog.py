@@ -1,6 +1,6 @@
 """Edit > Preferences (Ctrl+,): everything the app remembers, on one page.
 
-WHY ONE PAGE. There are seven settings. A category sidebar for seven settings
+WHY ONE PAGE. There are eight settings. A category sidebar for eight settings
 is navigation for its own sake, and it hides half of them behind a click for no
 gain. Five QGroupBoxes on one column is the whole design, and it stays the
 design until the list is long enough that scrolling it is worse than clicking.
@@ -57,6 +57,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from core.render_scale import AUTO as RENDER_SCALE_AUTO
 from core.settings import dialog_start_dir, settings
 from core.version import APP_VERSION
 from ui.theme import ThemeMode
@@ -71,6 +72,21 @@ _THEME_CHOICES = [
     ("light", "Light"),
     ("dark", "Dark"),
 ]
+
+
+# The page-sharpness dropdown, in the order it is shown. Words, not numbers:
+# "3.0" is meaningless to anybody who does not already know it is a raster
+# scale, and the numbers are not even comparable between page sizes, since the
+# same 3.0 is a cheap A4 and an unaffordable A1. Deliberately a fixed list and
+# not a slider, for the same reason: a slider invites dragging to the end,
+# which on a big drawing is a several-hundred-megabyte cache and a visibly
+# frozen window, with nothing on the way to warn anybody.
+RENDER_SCALE_LABELS = (
+    (RENDER_SCALE_AUTO, "Automatic"),
+    ("1.5", "Standard"),
+    ("2", "Sharp"),
+    ("3", "Sharpest"),
+)
 
 
 def _left(widget) -> QHBoxLayout:
@@ -312,10 +328,38 @@ class PreferencesDialog(QDialog):
             self._fit_combo.addItem(label, mode)
         self._fit_combo.currentIndexChanged.connect(self._on_fit_chosen)
         form.addRow("Default page fit", _left(self._fit_combo))
+
+        self._scale_combo = QComboBox()
+        for value, label in RENDER_SCALE_LABELS:
+            self._scale_combo.addItem(label, value)
+        index = self._scale_combo.findData(settings().view.render_scale)
+        self._scale_combo.setCurrentIndex(max(index, 0))
+        self._scale_combo.currentIndexChanged.connect(self._on_render_scale_chosen)
+        form.addRow("Page sharpness", _left(self._scale_combo))
         col.addLayout(form)
+
+        # The one control on this page that does NOT apply instantly, so it is
+        # the one control that has to say so. It cannot: a page's rendered
+        # pixels are the coordinate space its annotations are stored in, so
+        # re-rendering an open document at a new scale would mean moving every
+        # mark on it in step. Rather than leave the user to discover that
+        # nothing happened, the hint sits under the dropdown and tells them
+        # where the change will show up.
+        hint = QLabel("Applies to documents opened from now on. "
+                      "Automatic sharpens ordinary pages and leaves large "
+                      "drawings at their current speed.")
+        hint.setObjectName("PreferencesHint")
+        hint.setWordWrap(True)
+        hint.setEnabled(False)          # reads as a hint, not as a control
+        col.addWidget(hint)
 
         self._window.fit_mode_chosen.connect(self._sync_fit_combo)
         return box
+
+    def _on_render_scale_chosen(self, index: int) -> None:
+        value = self._scale_combo.itemData(index)
+        if value:
+            settings().view.render_scale = value
 
     def _on_fit_chosen(self, index: int) -> None:
         mode = self._fit_combo.itemData(index)

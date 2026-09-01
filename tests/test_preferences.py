@@ -24,13 +24,13 @@ about the transform it would have applied.
 
 import pytest
 
-from PySide6.QtWidgets import QApplication, QMenu
+from PySide6.QtWidgets import QApplication, QLabel, QMenu
 
 from core.settings import DEFAULTS, Settings, set_settings, settings
 from core.version import APP_VERSION
 from ui.canvas import FIT_MODES
 from ui.main_window import MainWindow
-from ui.preferences_dialog import PreferencesDialog
+from ui.preferences_dialog import RENDER_SCALE_LABELS, PreferencesDialog
 from ui.theme import ThemeMode
 
 
@@ -76,7 +76,8 @@ def test_the_dialog_adds_no_settings_of_its_own(store):
     assert set(DEFAULTS["appearance"]) == {"theme"}
     assert set(DEFAULTS["files"]) == {"default_folder_mode", "default_folder"}
     assert set(DEFAULTS["view"]) == {
-        "page_panel_visible", "default_fit_mode", "organizer_zoom_index"}
+        "page_panel_visible", "default_fit_mode", "organizer_zoom_index",
+        "render_scale"}
 
 
 def test_every_fit_mode_the_app_has_is_a_legal_setting():
@@ -84,6 +85,49 @@ def test_every_fit_mode_the_app_has_is_a_legal_setting():
     could be chosen and never remembered."""
     field = type(settings().view).default_fit_mode
     assert set(field._allowed) == set(FIT_MODES)
+
+
+def test_every_render_scale_the_app_has_is_a_legal_setting(prefs):
+    """Same failure mode as `fit_height` had: a dropdown offering a value the
+    settings field rejects, so choosing it silently does nothing."""
+    field = type(settings().view).render_scale
+    offered = {value for value, _label in RENDER_SCALE_LABELS}
+    assert offered == set(field._allowed)
+
+
+def test_the_sharpness_dropdown_says_words_and_not_raster_scales(prefs):
+    """A raster scale is meaningless to a user, and the same number means
+    different things on different page sizes."""
+    labels = [prefs._scale_combo.itemText(i)
+              for i in range(prefs._scale_combo.count())]
+    assert labels == ["Automatic", "Standard", "Sharp", "Sharpest"]
+
+
+def test_choosing_a_sharpness_writes_it_through(prefs, store):
+    index = prefs._scale_combo.findData("3")
+    assert index >= 0
+    prefs._scale_combo.setCurrentIndex(index)
+    assert store.view.render_scale == "3"
+
+
+def test_the_sharpness_dropdown_opens_on_the_stored_value(window, store):
+    """Every other control here follows the value it edits, and so does this
+    one, even though nothing else in the app can change it while it is open."""
+    store.view.render_scale = "2"
+    dialog = PreferencesDialog(window)
+    try:
+        assert dialog._scale_combo.currentData() == "2"
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+
+
+def test_the_sharpness_control_admits_it_is_not_instant(prefs):
+    """The one setting on this page that cannot apply to an open document, so
+    the only one that owes the user a sentence saying where it will show up."""
+    hints = [w.text() for w in prefs.findChildren(QLabel)
+             if w.objectName() == "PreferencesHint"]
+    assert any("opened from now on" in text for text in hints)
 
 
 def test_the_organizer_zoom_has_no_control(prefs):

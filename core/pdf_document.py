@@ -6,7 +6,9 @@ import tempfile
 from collections import OrderedDict
 from PySide6.QtGui import QPixmap, QImage
 
+from core.render_scale import AUTO, choose_render_scale
 from core.resources import bundled_tessdata_dir
+from core.settings import settings
 
 
 def _resolve_tessdata() -> str | None:
@@ -91,6 +93,11 @@ class PDFDocument:
         # correctness regression worse than slowness. See invalidate_* below and
         # the call sites in canvas/main_window.
         self._render_cache: "OrderedDict[tuple, QPixmap]" = OrderedDict()
+        # The raster scale this document's pages are drawn at, decided once from
+        # page geometry on first ask and then never again. None means "not yet
+        # decided"; see render_scale() for why it is settled once and not
+        # recomputed when the setting changes.
+        self._render_scale: float | None = None
 
     # ------------------------------------------------------------------
     # Rendered-page pixmap cache
@@ -141,6 +148,7 @@ class PDFDocument:
         if self.doc:
             self.doc.close()
         self.invalidate_render_cache()
+        self._render_scale = None    # different document, different geometry
         self.doc = fitz_doc
         self.path = None
 
@@ -161,6 +169,7 @@ class PDFDocument:
             if self.doc:
                 self.doc.close()
             self.invalidate_render_cache()   # new document — no stale pixmaps
+            self._render_scale = None        # and a fresh scale decision
             self.doc = fitz.open(path)
             if getattr(self.doc, "needs_pass", False):
                 self.doc.close()
@@ -184,6 +193,7 @@ class PDFDocument:
         self.path = None
         self.clear_transfer_ledger()
         self.invalidate_render_cache()
+        self._render_scale = None
 
     def is_open(self) -> bool:
         """Whether there is a document here that can still be read.
@@ -201,6 +211,41 @@ class PDFDocument:
         # page.bound() gives the visible dimensions after rotation; page.rect does not.
         r = self.doc[page_num].bound()
         return (r.width, r.height)
+
+    def render_scale(self) -> float:
+        """The raster scale for THIS document, decided once and then fixed.
+
+        Asked for on the open path, before anything is drawn, and answered from
+        `page.bound()` on the first page, which costs nothing: the page's size
+        is in the PDF's own structure, so no rasterisation is needed to learn
+        it. See core/render_scale.py for the megapixel budget behind the choice
+        and the measurements that set it.
+
+        MEMOISED ON PURPOSE, and the memo is the feature rather than an
+        optimisation. Annotations live in scene space, which is rendered-pixel
+        space, so the scale is baked into the coordinates of every mark on the
+        document and into the undo stack behind them. Changing it while a
+        document is open would mean rescaling all of that in step. So the
+        answer is computed on first use and returned unchanged forever after:
+        the canvas can call this on every page load, a settings change lands on
+        the next tab the user opens, and a save (which reopens the file in
+        place) keeps the scale the markup was drawn against.
+
+        Reset only where a genuinely different document takes this object over:
+        `open`, `adopt` and `close`.
+        """
+        if self._render_scale is None:
+            width, height = self.get_page_size(0)
+            try:
+                setting = settings().view.render_scale
+            except Exception:
+                # A settings store that cannot be built must not stop a file
+                # opening. Auto is the default anyway, so this loses nothing
+                # but an explicit override nobody can read.
+                setting = AUTO
+            self._render_scale = choose_render_scale(
+                width, height, self.page_count(), setting)
+        return self._render_scale
 
     @staticmethod
     def _render_page_at_zoom(page, zoom: float) -> QPixmap:
