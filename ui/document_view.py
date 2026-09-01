@@ -784,7 +784,7 @@ class DocumentView(QWidget):
             return
         n = self._canvas.copy_selected()
         if n:
-            self._update_status(f"Copied {n} object(s) — Ctrl+V to paste")
+            self._update_status(f"Copied {n} object(s), Ctrl+V to paste")
 
     def paste(self):
         """Paste in-app copied annotations if any, else fall back to a clipboard image."""
@@ -793,7 +793,7 @@ class DocumentView(QWidget):
             return
         if self._canvas.has_clipboard_items():
             self._canvas.paste_clipboard_items()
-            self._update_status("Pasted — drag to move, drag handles to resize")
+            self._update_status("Pasted, drag to move, drag handles to resize")
         else:
             self.paste_image()
 
@@ -806,7 +806,7 @@ class DocumentView(QWidget):
             self._update_status("Clipboard has no image to paste")
             return
         self._canvas._paste_from_clipboard()
-        self._update_status("Pasted image — drag to move, drag handles to resize")
+        self._update_status("Pasted image, drag to move, drag handles to resize")
 
     def request_close(self) -> bool:
         """File > Close PDF (Ctrl+W): close the document and tell the shell
@@ -1531,7 +1531,7 @@ class DocumentView(QWidget):
         self._update_title()
         if self._doc.doc:
             name = self._doc.path or "Untitled"
-            base = f"{name}  —  page {self._current_page + 1} of {self._doc.page_count()}"
+            base = f"{name}  |  page {self._current_page + 1} of {self._doc.page_count()}"
             self.status_message.emit(f"{base}  {extra}".strip())
         else:
             self.status_message.emit(extra or "Open a PDF to start  (Ctrl+O)")
