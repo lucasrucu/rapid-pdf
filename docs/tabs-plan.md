@@ -1222,7 +1222,7 @@ as a bug.
 
 **Genuinely outstanding.**
 
-- **Not released yet.** All three version inputs read 1.6.0 and the notes are
+- **Not released yet.** The four version inputs read 1.7.0 and the notes are
   in `docs/CHANGELOG.md`, but no installer has been cut and no tag pushed. See
   Standing constraints.
 - **`docs/architecture.md` and `docs/file-structure.md` still describe the

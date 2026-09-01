@@ -10,7 +10,51 @@ Releases before 1.6.0 were written up on the
 [Releases page](https://github.com/lucasrucu/rapid-pdf/releases) and are not
 backfilled here.
 
-## [Unreleased]
+## [1.7.0] - 2026-09-02
+
+The title bar release. The tabs moved into the top row of the window, and how
+sharply a page is rasterised now depends on how big the page is.
+
+### Added
+
+- **Page sharpness**, under View in `Edit > Preferences`. Four choices:
+  Automatic, Standard, Sharp and Sharpest. Automatic is the size rule described
+  below. The other three pin every document to one raster scale, which is the
+  way to force a large drawing sharper than the rule would give it, and to pay
+  for that in render time. Like the default fit, the choice applies to
+  documents opened after it, not to the ones already open, because the scale is
+  the coordinate space every annotation on a live document is stored in.
+
+### Changed
+
+- **The tabs are in the title bar.** The strip you grab to drag the window is
+  now the same strip the documents sit on, the way Chrome, Edge and Firefox
+  have done it for years. Up to 1.6.0 it was three separate rows: the system
+  title bar, the menu bar, and the tab strip under both of them. The window is
+  frameless now and draws its own top row, carrying the app icon, the tabs, a
+  button to open a new one, and the minimise, maximise and close buttons.
+  Everything a real title bar does still works: Snap Layouts open when the
+  pointer rests on the maximise button, the system menu opens on right click
+  and on `Alt+Space`, and the window resizes from every edge and corner. The
+  menu bar moved down a row and is otherwise untouched.
+  - **Dragging a tab now shows where it will land.** The strip that counted as
+    a dock target was about 46 pixels around the target window's tab bar, and
+    the floating window being dragged covered the insertion line, so aiming at
+    another window looked like nothing was happening at all.
+  - **Double-clicking bare tab strip maximises the window** instead of opening
+    a tab, which is what a title bar does everywhere else. `Ctrl+T` and the new
+    tab button still open one.
+  - **There is no window title text any more.** The document names are on the
+    tabs. `Alt+Tab` and the taskbar still read the window title.
+- **How sharply a page is drawn follows the page size.** Every document was
+  rasterised at a fixed 1.5, about 108 DPI, and zooming only magnified that
+  bitmap rather than rendering a new one, so small scanned text could not be
+  made readable by any means the app offered. A4 and Letter now render at 3.0
+  and A3 at 2.0. A2, A1 and A0 stay at 1.5, because raster cost is quadratic in
+  scale and linear in page area: a sharp A1 costs about four times the memory,
+  on the single most expensive page the app ever draws, and rendering happens
+  on the GUI thread. Large-format drawings are vector line work and are legible
+  already, so they are the pages that least need it and least afford it.
 
 ### Fixed
 
@@ -21,6 +65,10 @@ backfilled here.
   entry the width of the dialog. It is now the app name on its own. The
   description still exists where there is room for one: the About box, the
   installer's Default Apps entry, and the site.
+- **A hand-zoomed tab could come back at the wrong size** after session
+  restore. Found while changing the raster scale: the restored zoom was applied
+  before the document's first page had finished rendering, so a tab left at a
+  zoom you had set by hand reopened at a different one once the page arrived.
 - The window title separates the app name from the filename with a plain
   hyphen instead of an em dash.
 
