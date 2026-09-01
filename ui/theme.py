@@ -409,15 +409,49 @@ QTabBar::tab:selected {{
 }}
 QTabBar::tab:hover:!selected {{ color: {p.text_dim}; }}
 
+/* ---- the title bar --------------------------------------------------
+   The window has no system title bar; this row is it. See ui/title_bar.py.
+   It is painted in the window colour rather than the surface one because it IS
+   the top of the window, and a strip a shade off the app behind it reads as a
+   toolbar that has floated to the top. The three caption buttons paint their
+   own hover and press states (Windows' metrics, and Windows' close red), so
+   nothing here may give them a background. */
+#windowTitleBar {{
+    background-color: {p.window};
+}}
+#windowChrome {{
+    background-color: {p.window};
+    border-bottom: 1px solid {p.border};
+}}
+#titleBarDragGap, #titleBarTabHost, #titleBarIcon {{ background: transparent; }}
+QToolButton#titleBarNewTab {{
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    color: {p.text_dim};
+    font-size: 16px;
+    padding-bottom: 2px;
+}}
+QToolButton#titleBarNewTab:hover {{
+    background-color: {p.surface_hover};
+    color: {p.text};
+}}
+QToolButton#titleBarNewTab:pressed {{ background-color: {p.surface_active}; }}
+/* The menu bar is its own row directly under the tabs, so it carries no border
+   of its own: #windowChrome draws the one line under both of them. */
+QMenuBar#windowMenuBar {{ padding: 1px 4px; }}
+
 /* ---- document tabs --------------------------------------------------
    The bar across the top of the window, one tab per open PDF. Same underline
    language as the Editor/Organizer switcher above, but it has to shrink: the
    min-width up there is a floor for two fixed labels, and here it would stop
    tabs narrowing before the bar starts scrolling. The real widths come from
    DocumentTabBar.tabSizeHint; this only takes the floor off. */
+/* No bottom border. The strip lives inside the title bar now, and #windowChrome
+   draws the one line that closes off the title bar and the menu row together;
+   a second line halfway up the title bar reads as a seam. */
 #documentTabHeader {{
-    background-color: {p.window};
-    border-bottom: 1px solid {p.border};
+    background-color: transparent;
 }}
 QTabBar#documentTabBar::tab {{
     min-width: 0px;
@@ -539,7 +573,21 @@ def apply_mica(window: QWidget, dark: bool) -> bool:
     non-Win11 / when pywinstyles isn't installed, so it's safe to always call.
 
     Reads its colors from the palette, so the title bar follows a re-skin instead
-    of keeping whatever four literals were pasted in here."""
+    of keeping whatever four literals were pasted in here.
+
+    WHAT IS LEFT OF THIS SINCE THE WINDOW WENT FRAMELESS. The backdrop itself is
+    untouched: it is a DWM attribute on the HWND and it still applies, and it is
+    still only visible where the app does not paint, which was already nowhere.
+    The two calls under it are the ones that changed meaning. They coloured the
+    SYSTEM title bar, and there is no system title bar any more; both were
+    measured as harmless (they return without error and change nothing) and they
+    are left in place because the fallback matters more than the dead call: on a
+    machine where the frameless setup cannot take, the system caption comes back
+    and these two are what keep it in the app's colours.
+
+    Nothing is lost visually. `change_header_color` was painting the caption in
+    `palette.window`, and ui/title_bar.py now paints the row that replaced it in
+    exactly the same token."""
     p = DARK if dark else LIGHT
     try:
         import pywinstyles

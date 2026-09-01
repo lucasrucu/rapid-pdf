@@ -56,6 +56,30 @@ this class used to assume it was alone in deciding:
     the mechanism; the tab menu's "Move to New Window" and File > New Window
     are the only two things driving it. No gesture: phase 4.
 
+PHASE 7: THE WINDOW HAS NO SYSTEM TITLE BAR. The document tabs are the top
+row of the window now, which means the top row of the window is a widget and the
+system title bar had to go. What is left up here is the same chrome as before in
+a different order:
+
+  - `_title_bar` (ui/title_bar.py) is the top row: the app icon, the tab strip
+    HOSTED from the DocumentArea, the new-tab button, and the three window
+    controls. It is not a second owner of the tabs; `DocumentArea.header()`
+    hands the same widget over and every gesture on it is still that class's.
+  - the MENU BAR sits directly under it, on its own row, which is where Explorer
+    and Edge keep theirs. A hamburger in the title bar was the other candidate
+    and it loses Alt+F, loses the screen reader's menu, turns five one-click
+    menus into two clicks each, and spends title bar width on a button in order
+    to save a row that costs 22 pixels. The complaint this phase answers was
+    that the tabs were BELOW the menu; they are above it now, and that is the
+    whole of what was asked for.
+  - `_frameless` (ui/frameless.py) gives Windows back everything the system
+    title bar used to do: dragging, double-click to maximise, Aero Snap, Snap
+    Layouts, the system menu, and the eight resize edges.
+
+Both of the first two are put in place with `setMenuWidget`, which is the one
+slot QMainWindow keeps above the central widget. That is also why `menuBar()` is
+overridden below: QMainWindow's own would build a second, empty one.
+
 PER-WINDOW CHROME, WHICH IS THE THING THAT DOES NOT COME FREE. The QSS and the
 QPalette are set on the QApplication, so those cover every window at once. Two
 things do not, because they are properties of one native window: the Mica
@@ -71,7 +95,7 @@ import uuid
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
-    QMessageBox, QStatusBar, QApplication,
+    QMenuBar, QMessageBox, QStatusBar, QApplication,
     QToolButton, QButtonGroup,
 )
 from PySide6.QtCore import QEvent, QPoint, QTimer, Qt, QSize, Signal
@@ -104,6 +128,8 @@ from ui.update_notice import UpdateNotice
 from ui.canvas import FIT_MODES
 from ui.document_area import DocumentArea
 from ui.document_view import DocumentView
+from ui.frameless import FramelessHelper
+from ui.title_bar import TitleBar
 from ui.preferences_dialog import PreferencesDialog
 from ui.page_jump import PageJump
 from ui.session import recorder
@@ -147,6 +173,8 @@ class MainWindow(QMainWindow):
         self._area.duplicate_requested.connect(self._duplicate_tab)
         self._area.tab_close_requested.connect(self.close_tab)
         self._area.move_to_new_window_requested.connect(self.move_view_to_new_window)
+        self._area.move_selected_to_new_window_requested.connect(
+            self.move_views_to_new_window)
         self._force_quit = False # Quit menu wants a real app quit, not "close PDF"
         self._session_ending = False  # Windows is ending the session; never block it
         self._mica_applied = False  # the backdrop needs an HWND, so it waits for show()
@@ -161,7 +189,17 @@ class MainWindow(QMainWindow):
         icon_path = app_icon_path()
         if icon_path:
             self.setWindowIcon(QIcon(icon_path))
+        # No system title bar. Built before the UI so the title bar it drives
+        # can be handed to it as soon as that exists, and applied after, because
+        # applying it reaches for the native handle.
+        self._frameless = FramelessHelper(self)
         self._setup_ui()
+        self._frameless.set_title_bar(self._title_bar)
+        self._frameless.apply()
+        # The Qt-side resize fallback for the platforms with no WM_NCHITTEST.
+        # Inert on Windows, where the native path has already answered.
+        self.setMouseTracking(True)
+        self.installEventFilter(self._frameless)
         self._setup_menu()
         # The first tab. Last, because adding it makes it the front view, and
         # everything that fires on that reaches for chrome built above.
@@ -234,6 +272,7 @@ class MainWindow(QMainWindow):
             view.apply_palette(palette)
         self._area.apply_palette(palette)
         self._update_notice.apply_palette(palette)
+        self._title_bar.apply_palette(palette)
         self._retint_fit_icons(palette)
         if hasattr(self, "_theme_action"):
             dark = self._theme.is_dark
@@ -294,6 +333,9 @@ class MainWindow(QMainWindow):
         the window being read rather than the oldest one.
         """
         super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange:
+            self._sync_maximise_state()
+            return
         if event.type() != QEvent.Type.ActivationChange:
             return
         if self.isActiveWindow():
@@ -461,6 +503,47 @@ class MainWindow(QMainWindow):
             return None
         return target
 
+    def move_views_to_new_window(self, views) -> "MainWindow | None":
+        """Move SEVERAL open documents into one new window, in tab order.
+
+        The consumer of the ticked tabs (see DocumentArea.checked_views). It is
+        one entry point rather than a loop over `move_view_to_new_window`
+        because that method makes a window per call: three ticked tabs would
+        have made three windows, and looping over `move_view_to_window` alone
+        would have raised and focused the destination once per document, which
+        is three window activations and a visible flicker for one command.
+
+        So the window is made once, up front and empty, and then the SINGULAR
+        move runs per document into it. That is deliberate: `move_view_to_window`
+        is the one place the reparent order lives (destination adopts, source
+        detaches, source closes last) and a plural copy of that order is a
+        second thing to keep right. Nothing about it flickers when the window it
+        is moving into already exists.
+
+        Tab order, not tick order: it is the order they are read in and the
+        order they will be read in afterwards.
+        """
+        views = [v for v in self._area.views()
+                 if any(v is w for w in (views or []))]
+        if not views:
+            return None
+        target = self._registry.create_window(theme=self._theme, show=False)
+        target.resize(self.size())
+        target.move(self.pos() + QPoint(NEW_WINDOW_OFFSET, NEW_WINDOW_OFFSET))
+        # Real, and on screen, before anything leaves. Same rule as
+        # move_view_to_new_window: the reparent needs somewhere that exists.
+        target.show()
+        moved = 0
+        for view in views:
+            if self.move_view_to_window(view, target):
+                moved += 1
+        if not moved:
+            target.close()
+            return None
+        self._area.clear_checked()
+        target.raise_and_focus()
+        return target
+
     def new_window(self) -> "MainWindow":
         """File > New Window (Ctrl+Shift+N). An empty second window."""
         window = self._registry.create_window(theme=self._theme, show=False)
@@ -532,6 +615,8 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _setup_ui(self):
+        self._build_chrome_rows()
+
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
@@ -544,8 +629,8 @@ class MainWindow(QMainWindow):
         self._update_notice.staged_ready.connect(self._on_update_staged)
         root.addWidget(self._update_notice)
 
-        # The tab bar and the documents under it, in the same place in the
-        # layout the Editor/Organizer switcher used to sit.
+        # The documents. Its tab strip is no longer here: it has been hosted up
+        # in the title bar, and what is left of the DocumentArea is the stack.
         root.addWidget(self._area)
 
         self._status = QStatusBar()
@@ -559,6 +644,104 @@ class MainWindow(QMainWindow):
         self._status.addPermanentWidget(self._page_jump)
 
         self._status.addPermanentWidget(self._build_fit_group())
+
+    def _build_chrome_rows(self):
+        """The two rows above the documents: the title bar, then the menu bar.
+
+        `setMenuWidget` takes one widget, so both rows go into a column and the
+        column goes in the slot. That slot is the only one QMainWindow keeps
+        above the central widget, which is why the title bar is not simply the
+        first thing in the central layout: the update strip and the documents
+        live there, and the title bar has to be above the update strip too.
+        """
+        self._title_bar = TitleBar()
+        self._title_bar.set_app_icon(self.windowIcon())
+        # HOSTED, not owned. See DocumentArea.header().
+        self._title_bar.host_tabs(self._area.header())
+        self._title_bar.new_tab_requested.connect(self.new_tab)
+        self._title_bar.system_menu_requested.connect(self.show_system_menu)
+        controls = self._title_bar.controls()
+        controls.minimise_requested.connect(self.showMinimized)
+        controls.maximise_requested.connect(self.toggle_maximised)
+        controls.close_requested.connect(self.close)
+
+        # Built by hand rather than through `QMainWindow.menuBar()`, which would
+        # put it in the slot this column is about to take. `menuBar()` below
+        # returns this one, so every caller and every test still asks the same
+        # question of the same object.
+        self._menu_bar = QMenuBar()
+        self._menu_bar.setObjectName("windowMenuBar")
+
+        chrome = QWidget()
+        chrome.setObjectName("windowChrome")
+        column = QVBoxLayout(chrome)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(0)
+        column.addWidget(self._title_bar)
+        column.addWidget(self._menu_bar)
+        self.setMenuWidget(chrome)
+
+    def menuBar(self) -> QMenuBar:
+        """This window's menu bar, which QMainWindow did not put there.
+
+        Shadowing the base method rather than leaving it alone is the whole
+        point: `QMainWindow.menuBar()` builds and installs a menu bar the first
+        time it is asked for one, and installing it would evict the column of
+        chrome that holds the title bar. Six call sites and four tests ask this
+        question; they should all keep getting the real answer.
+        """
+        return self._menu_bar
+
+    def title_bar(self) -> TitleBar:
+        """The top row. For the tests, and for the frameless helper."""
+        return self._title_bar
+
+    def frameless_helper(self) -> FramelessHelper:
+        """The thing that gives Windows its window back. See ui/frameless.py."""
+        return self._frameless
+
+    # ------------------------------------------------------------------
+    # Being a window without a system title bar
+    # ------------------------------------------------------------------
+
+    def nativeEvent(self, event_type, message):
+        """Windows asks what every pixel of this window is; the helper answers.
+
+        None from the helper means "not one of ours", and the base class gets it
+        untouched. Never reached off Windows, and never under the offscreen
+        platform the tests run on, which is why everything the helper decides is
+        also reachable as a plain function (see ui/frameless.py).
+        """
+        handled = self._frameless.native_event(event_type, message)
+        if handled is not None:
+            return handled
+        return super().nativeEvent(event_type, message)
+
+    def toggle_maximised(self):
+        """The maximise/restore button, and a double-click on the strip."""
+        self._frameless.toggle_maximised()
+
+    def show_system_menu(self, global_pos=None):
+        """Move / Size / Minimize / Maximize / Close. Right-click and Alt+Space.
+
+        The position defaults to the top-left of the window, which is where
+        Windows puts it for the keyboard route and where the app icon is for the
+        pointer one.
+        """
+        if global_pos is None:
+            global_pos = self.mapToGlobal(QPoint(0, 0))
+        self._frameless.show_system_menu(global_pos)
+
+    def _sync_maximise_state(self):
+        """Swap the maximise glyph for the restore one, and back.
+
+        Driven from `changeEvent` rather than from the button, because the state
+        changes without the button being touched: Win+Up, Aero Snap, a drag to
+        the top of the screen, and a double-click on the strip all get there.
+        """
+        if hasattr(self, "_title_bar"):
+            self._title_bar.set_maximised(
+                self.isMaximized() or self.isFullScreen())
 
     # ------------------------------------------------------------------
     # Binding the chrome to whichever document is in front
@@ -922,6 +1105,12 @@ class MainWindow(QMainWindow):
                           ("l", "line"), ("t", "text")]:
             sc = QShortcut(key, self)
             sc.activated.connect(lambda t=tool: self.trigger_tool(t))
+        # Alt+Space is the system menu on every Windows window and it stops
+        # working the moment the caption stops being the system's. Windows would
+        # still handle it through DefWindowProc, but Qt eats the key first, so
+        # it is bound here and lands in the same place the right-click does.
+        system_menu = QShortcut("Alt+Space", self)
+        system_menu.activated.connect(self.show_system_menu)
 
     def trigger_tool(self, tool: str):
         view = self.view

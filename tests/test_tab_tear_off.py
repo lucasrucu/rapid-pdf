@@ -341,6 +341,116 @@ def test_dropping_past_the_last_tab_appends(qt_app, store, registry, tmp_path):
     assert other.document_area().view_at(2) is moving
 
 
+def test_the_whole_target_window_is_a_dock_zone(qt_app, store, registry,
+                                                tmp_path):
+    """Over the body of another window, nowhere near its tab strip.
+
+    The dock zone used to be the target's bar plus twelve pixels either side,
+    which is a strip about 46 px tall on a window that the floating one was
+    sitting on top of. Missing it did not fail loudly: the document became a
+    second window on the desktop, and nothing had said why. The whole window is
+    the zone now, and only the INDEX still depends on aiming.
+    """
+    source = _window(registry, tmp_path, ["a.pdf", "b.pdf"], at=(100, 100))
+    other = _window(registry, tmp_path, ["x.pdf", "y.pdf"], at=(2000, 100))
+    bar = source.document_area().bar()
+    other_bar = other.document_area().bar()
+    moving = source.document_area().view_at(0)
+
+    start = _tab_point(bar, 0)
+    _press(bar, start)
+    _move(bar, _below_bar(bar, start))
+    # The middle of the other window's PAGE area, hundreds of pixels below its
+    # tab bar.
+    body = other.mapToGlobal(QPoint(other.width() // 2, other.height() // 2))
+    _move(bar, body)
+
+    target = bar.tear_off().drop_target()
+    assert target is not None and target[0] is other
+    # No aim, so no claim about where: it goes on the end.
+    assert target[1] == other_bar.count()
+    # And the strip says so, which the 2px line alone never did.
+    assert other_bar.drop_active()
+
+    _release(bar, body)
+
+    assert other.document_area().count() == 3
+    assert other.document_area().view_at(2) is moving
+    assert not other_bar.drop_active()
+    assert other_bar.drop_indicator() is None
+    other.document_area().check_invariant()
+
+
+def test_the_window_it_came_from_keeps_the_narrow_band(qt_app, store, registry,
+                                                       tmp_path):
+    """The one window the widened zone must NOT apply to.
+
+    Tearing a tab off is dragging it DOWN out of the bar, and down out of the
+    bar is still inside the window it came from. Give that window a body-sized
+    dock zone and the tab re-docks the instant it leaves the bar, which is to
+    say the tear-off stops working at all.
+    """
+    source = _window(registry, tmp_path, ["a.pdf", "b.pdf"], at=(100, 100))
+    bar = source.document_area().bar()
+
+    start = _tab_point(bar, 0)
+    _press(bar, start)
+    _move(bar, _below_bar(bar, start))
+    body = source.mapToGlobal(QPoint(source.width() // 2,
+                                     source.height() // 2))
+    _move(bar, body)
+
+    assert bar.tear_off().drop_target() is None
+    _release(bar, body)
+    assert registry.count() == 2
+
+
+def test_going_back_up_to_the_source_bar_still_re_docks(qt_app, store, registry,
+                                                        tmp_path):
+    """Changing your mind mid-tear: the source's own bar is still a target, so
+    the narrow band above is a rule about the BODY, not about the window."""
+    source = _window(registry, tmp_path, ["a.pdf", "b.pdf"], at=(100, 100))
+    bar = source.document_area().bar()
+    moving = source.document_area().view_at(0)
+
+    start = _tab_point(bar, 0)
+    _press(bar, start)
+    _move(bar, _below_bar(bar, start))
+    back = _tab_point(bar, 0)
+    _move(bar, back)
+
+    target = bar.tear_off().drop_target()
+    assert target is not None and target[0] is source
+    _release(bar, back)
+
+    assert registry.count() == 1
+    assert source.document_area().count() == 2
+    assert moving.window() is source
+
+
+def test_the_floating_window_is_held_clear_of_the_drop_feedback(
+        qt_app, store, registry, tmp_path):
+    """It used to sit exactly under the cursor, covering the strip the insertion
+    line and the highlight are painted on. It is held below the cursor now."""
+    from ui.tab_tear_off import DROP_CLEARANCE
+
+    source = _window(registry, tmp_path, ["a.pdf", "b.pdf"], at=(100, 100))
+    other = _window(registry, tmp_path, ["x.pdf"], at=(2000, 100))
+    bar = source.document_area().bar()
+
+    start = _tab_point(bar, 0)
+    _press(bar, start)
+    _move(bar, _below_bar(bar, start))
+    over = _tab_point(other.document_area().bar(), 0)
+    _move(bar, over)
+
+    torn = bar.tear_off().floating_window()
+    assert torn.frameGeometry().top() > over.y()
+    assert torn.frameGeometry().top() - over.y() >= DROP_CLEARANCE - \
+        torn.document_area().header().height()
+    _release(bar, over)
+
+
 def test_the_floating_window_is_never_its_own_drop_target(
         qt_app, store, registry, tmp_path):
     """`QApplication.widgetAt()` would answer with the window being dragged

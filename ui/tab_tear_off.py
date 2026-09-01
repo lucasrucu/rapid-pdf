@@ -72,13 +72,32 @@ DETACH_MARGIN = 28
 # How far above and below a target bar still counts as "on" it. A tab bar is
 # about 30 px tall and the cursor is holding a whole window, so the band people
 # actually aim at is taller than the widget.
+#
+# THIS IS NO LONGER THE DOCK ZONE. It is only the band inside which the drop
+# gets a PRECISE index, the one the insertion line points at. The dock zone is
+# the whole target window: see `_hit_test`. The band and the zone used to be the
+# same thing and the result was a 46-pixel strip, on a window the floating one
+# was sitting on top of, that you had to find before a drop would land. Everyone
+# who missed it got a second window on the desktop instead of a docked tab, and
+# nothing on screen had said why.
 DOCK_MARGIN = 12
 
-# A window holding one empty tab hides its tab bar (see
-# DocumentArea._sync_header_visibility), so there is no bar to aim at. Its top
-# strip is still a legitimate place to drop, and MainWindow.adopt already
-# replaces the placeholder tab when a document lands there.
-EMPTY_DOCK_HEIGHT = 34
+# How far BELOW the cursor the floating window is held for the length of the
+# drag.
+#
+# It used to be held exactly under the cursor, with the grabbed tab beneath the
+# pointer where it was picked up. That is the right feel and it hides the one
+# thing the user needs to see: the cursor is on the target window tab strip,
+# which is precisely the strip the floating window is now covering, so the
+# insertion line and the highlight are drawn underneath a window and never
+# reach an eye. Dropping the window down by more than a title bar height
+# leaves the row under the cursor clear.
+#
+# It applies to the single-tab case too, where the window being dragged is the
+# source itself. That costs a visible step down at the moment the tear starts,
+# and it buys the same feedback in the case where a window with one document is
+# being merged into another, which is a gesture people do on purpose.
+DROP_CLEARANCE = 46
 
 
 def insertion_index(bar: QTabBar, local: QPoint) -> int:
@@ -333,8 +352,17 @@ class TabTearOff:
     def _track(self, global_pos: QPoint):
         if self._floating is None:
             return
-        self._floating.move(global_pos - self._offset)
+        self._floating.move(self.floating_position(global_pos))
         self._set_target(self._hit_test(global_pos))
+
+    def floating_position(self, global_pos: QPoint) -> QPoint:
+        """Where the floating window frame sits for a cursor at `global_pos`.
+
+        The grab offset, plus the clearance that keeps the window off the row
+        the drop feedback is painted on. Split out so the tests can assert the
+        clearance without a real pointer. See DROP_CLEARANCE.
+        """
+        return global_pos - self._offset + QPoint(0, DROP_CLEARANCE)
 
     def _hit_test(self, global_pos: QPoint):
         """The (window, insertion index) under the cursor, or None.
@@ -343,6 +371,27 @@ class TabTearOff:
         `QApplication.widgetAt()` or `topLevelAt()`: the window under the
         cursor is the one being dragged, by construction, and both of those
         round-trip to the OS on every mouse move for an answer we already have.
+
+        THE WHOLE WINDOW IS THE ZONE, FOR EVERY WINDOW BUT THE ONE IT CAME FROM.
+        Anywhere over another window docks into it. Only WHERE in its bar the
+        tab lands still depends on aiming: inside the bar band you get the index
+        under the cursor, and anywhere else in the window the tab goes on the
+        end. That split is the point. Precision should be available to the
+        people who want it and should never be the price of admission, and the
+        old arrangement charged it: miss a 46-pixel strip and the document
+        became a second window instead.
+
+        THE SOURCE WINDOW IS THE EXCEPTION, and it has to be. The tear gesture
+        is "drag the tab DOWN out of the bar", and down out of the bar is still
+        inside the window it came from: give that window a body-sized dock zone
+        and the tab re-docks into it the instant it leaves the bar, which is to
+        say the tear-off stops existing. So the window a tab is being torn out
+        of keeps the narrow band, and going back up to it is how you change your
+        mind. That is the rule Chrome uses too, for the same reason.
+
+        Activation order is what breaks the tie when two windows overlap under
+        the cursor, which is the same order Windows would pick and the reason
+        the registry is walked rather than the geometry being sorted.
         """
         floating = self._floating
         for window in WindowRegistry.instance().windows():
@@ -352,6 +401,8 @@ class TabTearOff:
                 continue
             if not hasattr(window, "document_area"):
                 continue
+            if not window.frameGeometry().contains(global_pos):
+                continue
             area = window.document_area()
             bar = area.bar()
             if bar.isVisible():
@@ -359,17 +410,28 @@ class TabTearOff:
                 band = bar.rect().adjusted(0, -DOCK_MARGIN, 0, DOCK_MARGIN)
                 if band.contains(local):
                     return window, insertion_index(bar, local)
+                if window is self._source_window:
+                    continue
+                # Over the window but not over its bar: append. The document
+                # still lands, which is the whole change.
+                return window, bar.count()
+            if window is self._source_window:
                 continue
-            # An empty window hides its header, so aim at the strip where the
-            # bar would be. Dropping there is what fills that window up.
-            local = area.mapFromGlobal(global_pos)
-            strip = QRect(0, 0, area.width(), EMPTY_DOCK_HEIGHT + DOCK_MARGIN)
-            if strip.contains(local):
-                return window, 0
+            # An empty window hides its header, so there is no bar to aim at
+            # and nowhere else for a document to go.
+            return window, 0
         return None
 
     def _set_target(self, target):
-        """Move the insertion line, and only repaint when it actually moved."""
+        """Move the feedback onto the window under the cursor, and only repaint
+        when it actually moved.
+
+        Two things are set, not one. The insertion line says WHERE, and it is
+        only ever meaningful when the cursor is near the bar; the highlight says
+        WHICH WINDOW, and it is on for as long as this window is the target,
+        which since the zone was widened is most of the time the cursor spends
+        over it. The second one is the one that was missing.
+        """
         previous = self._target
         if previous is not None:
             same_window = target is not None and target[0] is previous[0]
@@ -380,6 +442,7 @@ class TabTearOff:
             return
         window, index = target
         bar = window.document_area().bar()
+        bar.set_drop_active(True)
         bar.set_drop_indicator(bar.insertion_x(index))
 
     def _clear_indicator(self):
@@ -389,7 +452,9 @@ class TabTearOff:
     @staticmethod
     def _clear_indicator_on(window):
         try:
-            window.document_area().bar().set_drop_indicator(None)
+            bar = window.document_area().bar()
+            bar.set_drop_indicator(None)
+            bar.set_drop_active(False)
         except (AttributeError, RuntimeError):   # pragma: no cover - defensive
             pass
 
