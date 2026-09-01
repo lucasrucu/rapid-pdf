@@ -217,6 +217,38 @@ def cursor_for_edges(edges) -> Qt.CursorShape:
     return Qt.CursorShape.ArrowCursor
 
 
+def local_from_physical(rect_left: int, rect_top: int, x: int, y: int,
+                        ratio: float) -> QPoint:
+    """A point in PHYSICAL screen pixels, as a logical point in a window.
+
+    `rect_left` and `rect_top` are the window's own physical origin. The
+    subtraction happens FIRST, in physical pixels, and only the difference is
+    divided. That order is the whole point of this function: Qt's global
+    coordinate space is logical, every monitor contributes its own stretch of
+    it at its own scale, and there is no single divisor that turns a physical
+    screen point into a logical one across two monitors at 100% and 150%. A
+    window is on one monitor at a time, so its own ratio is exact for every
+    pixel of it, and this is the only conversion that uses it correctly.
+    """
+    ratio = ratio or 1.0
+    return QPoint(int(round((x - rect_left) / ratio)),
+                  int(round((y - rect_top) / ratio)))
+
+
+def physical_from_local(rect_left: int, rect_top: int, x: int, y: int,
+                        ratio: float) -> tuple:
+    """The inverse: a logical point in a window, as PHYSICAL screen pixels.
+
+    Win32 takes physical pixels everywhere and Qt hands out logical ones, so
+    anything given a Qt position and passed to Win32 needs this. Multiplying a
+    Qt GLOBAL position by the ratio is the mistake it exists to stop: that only
+    lands on the monitor whose logical origin happens to be its physical one,
+    and the second screen of a mixed-DPI desk is not it.
+    """
+    ratio = ratio or 1.0
+    return (rect_left + int(round(x * ratio)), rect_top + int(round(y * ratio)))
+
+
 def on_windows() -> bool:
     """Whether the REAL Windows platform plugin is behind this application.
 
@@ -493,14 +525,21 @@ class FramelessHelper(QObject):
         The window rect is also the client rect here, because `WM_NCCALCSIZE`
         above gave the whole window to the client area.
         """
+        rect = self._window_rect()
+        if rect is None:
+            return None
+        return local_from_physical(rect.left, rect.top, x, y,
+                                   self._window.devicePixelRatioF())
+
+    def _window_rect(self):
+        """This window's physical rectangle, or None. Also its client rect,
+        because WM_NCCALCSIZE gave the whole window to the client area."""
         try:
             rect = _Rect()
             if not ctypes.windll.user32.GetWindowRect(
                     int(self._window.winId()), ctypes.byref(rect)):
                 return None
-            ratio = self._window.devicePixelRatioF() or 1.0
-            return QPoint(int(round((x - rect.left) / ratio)),
-                          int(round((y - rect.top) / ratio)))
+            return rect
         except Exception:                        # pragma: no cover - defensive
             return None
 
@@ -540,14 +579,34 @@ class FramelessHelper(QObject):
         Qt's own hover, which is why only this one needs the extra plumbing.
         """
         if msg.wParam != HTMAXBUTTON:
-            self._set_max_hot(False)
+            self._release_max_button()
             return None
         self._set_max_hot(True)
         return True, 0
 
     def _on_ncmouseleave(self, msg):
-        self._set_max_hot(False)
+        self._release_max_button()
         return None
+
+    def _release_max_button(self):
+        """The pointer is no longer on the maximise button: drop both states.
+
+        The pressed one matters as much as the hover. Press the button, drag
+        off it and let go, and the release lands somewhere this never hears
+        about, so without this the button stays painted pressed until the next
+        time somebody clicks it. Windows' own does not do that, and the toggle
+        itself is already correct: only an UP that arrives ON the button acts.
+
+        The button is told directly rather than through `_set_max_hot`, which
+        is a cache and can disagree with it: the cache exists to skip repaints
+        while the pointer sits still, and letting go is the one moment worth
+        being certain about rather than cheap about.
+        """
+        self._max_button_hot = False
+        button = self._max_button()
+        if button is not None:
+            button.set_native_hover(False)
+            button.set_native_pressed(False)
 
     def _set_max_hot(self, hot: bool):
         if hot == self._max_button_hot:
@@ -633,16 +692,32 @@ class FramelessHelper(QObject):
                 user32.EnableMenuItem(
                     menu, item,
                     MF_BYCOMMAND | (MF_ENABLED if enabled else MF_GRAYED))
-            ratio = self._window.devicePixelRatioF() or 1.0
+            # TrackPopupMenu takes PHYSICAL pixels and `global_pos` is a Qt
+            # logical one, and the conversion is not a multiplication: see
+            # physical_from_local. Multiplying the global position was the
+            # first version of this and it puts the menu somewhere else
+            # entirely on the second monitor of a mixed-DPI desk, which is the
+            # same bug the hit test had in the other direction.
+            point = self._physical_point(global_pos)
+            if point is None:                    # pragma: no cover - defensive
+                return False
             command = user32.TrackPopupMenu(
-                menu, TPM_RETURNCMD | TPM_LEFTBUTTON,
-                int(global_pos.x() * ratio), int(global_pos.y() * ratio),
+                menu, TPM_RETURNCMD | TPM_LEFTBUTTON, point[0], point[1],
                 0, hwnd, None)
             if command:
                 user32.PostMessageW(hwnd, WM_SYSCOMMAND, command, 0)
             return True
         except Exception:                        # pragma: no cover - defensive
             return False
+
+    def _physical_point(self, global_pos: QPoint):
+        """A Qt global (logical) point as physical screen pixels, or None."""
+        rect = self._window_rect()
+        if rect is None:                         # pragma: no cover - defensive
+            return None
+        local = self._window.mapFromGlobal(global_pos)
+        return physical_from_local(rect.left, rect.top, local.x(), local.y(),
+                                   self._window.devicePixelRatioF())
 
     # ------------------------------------------------------------------
     # The Qt fallback for resizing

@@ -374,6 +374,25 @@ def test_the_other_two_controls_stay_qt_s(window):
         assert helper.hit_test(centre) == HTCLIENT
 
 
+def test_dragging_off_the_maximise_button_lets_it_go(window):
+    """Press it, drag off, let go somewhere else.
+
+    Its pixels are non-client, so the release lands where nothing of ours
+    hears about it, and the press state has to be dropped on the way out or
+    the button stays painted pressed until the next click. Both states go
+    together, which is what `_release_max_button` is.
+    """
+    helper = window.frameless_helper()
+    button = window.title_bar().maximise_button()
+    button.set_native_hover(True)
+    button.set_native_pressed(True)
+    assert button.is_pressed() and button.is_hovered()
+
+    helper._release_max_button()
+    assert not button.is_pressed()
+    assert not button.is_hovered()
+
+
 def test_the_state_follows_the_window_and_not_only_the_button(window):
     """Win+Up, Aero Snap and a drag to the top of the screen all maximise
     without the button being touched, so the glyph follows the WINDOW."""
@@ -408,6 +427,55 @@ def test_right_clicking_bare_strip_asks_for_the_system_menu(window):
     bar.contextMenuEvent(QContextMenuEvent(
         QContextMenuEvent.Reason.Mouse, point, bar.mapToGlobal(point)))
     assert len(asked) == 1
+
+
+def test_a_point_converts_to_the_window_and_back_at_any_scale(subtests):
+    """The two coordinate conversions, which are where mixed-DPI goes wrong.
+
+    Win32 speaks physical pixels and Qt speaks logical ones, and the mistake
+    both directions invite is to scale a GLOBAL position: Qt's global space is
+    logical, each monitor contributes its own stretch of it at its own scale,
+    and there is no single divisor across a 100% screen and a 150% one. Both
+    functions take the WINDOW's own physical origin and do the subtraction
+    before the division, which is exact wherever the window is, and the round
+    trip is what proves the pair agree.
+    """
+    from ui.frameless import local_from_physical, physical_from_local
+
+    # A window well out on a second monitor, which is where scaling the global
+    # position lands the answer somewhere else entirely.
+    for origin, ratio in ((0, 1.0), (2560, 1.5), (-1920, 1.25), (3840, 2.0)):
+        for local in (QPoint(0, 0), QPoint(23, 19), QPoint(1199, 799)):
+            with subtests.test(origin=origin, ratio=ratio, local=local):
+                x, y = physical_from_local(origin, origin // 2,
+                                           local.x(), local.y(), ratio)
+                assert x == origin + round(local.x() * ratio)
+                back = local_from_physical(origin, origin // 2, x, y, ratio)
+                assert back == local
+
+
+def test_the_system_menu_is_not_placed_by_scaling_a_global_point(window,
+                                                                 monkeypatch):
+    """TrackPopupMenu takes physical pixels, and the position handed to it has
+    to come off the window rather than off the multiplied global point."""
+    from ui import frameless
+
+    helper = window.frameless_helper()
+    monkeypatch.setattr(helper, "_window_rect",
+                        lambda: _rect_like(left=2560, top=0))
+    monkeypatch.setattr(window, "devicePixelRatioF", lambda: 1.5)
+
+    point = helper._physical_point(window.mapToGlobal(QPoint(40, 20)))
+    assert point == frameless.physical_from_local(2560, 0, 40, 20, 1.5)
+    assert point[0] >= 2560          # still on the monitor it started on
+
+
+class _rect_like:
+    """Enough of a Win32 RECT for the conversion to read."""
+
+    def __init__(self, left, top):
+        self.left = left
+        self.top = top
 
 
 def test_alt_space_is_bound(window):

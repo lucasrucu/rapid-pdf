@@ -690,6 +690,31 @@ document, which is what the flicker would have been.
 It maximises the window now, which is what a title bar does. `Ctrl+T` and the
 new `+` button in the strip are the two ways to open a tab.
 
+**Two things found on the pass that finished the phase.** Both native-only, so
+neither could show up in a headless run:
+
+- **The system menu was placed by scaling a Qt global point.** The hit test had
+  already been fixed to subtract the window's own physical origin BEFORE
+  dividing, because Qt's global space is logical and mixed DPI has no single
+  divisor; `show_system_menu` still had the same bug in the other direction and
+  would have opened the menu somewhere else entirely on a second monitor at a
+  different scale. Both directions are one pair of pure functions now,
+  `local_from_physical` and `physical_from_local`, and the round trip is a test.
+- **The maximise button could stick pressed.** Its pixels are `HTMAXBUTTON` and
+  therefore non-client, so pressing it and releasing somewhere else means the
+  release lands where nothing of ours hears about it. Leaving the button was
+  clearing the hover and not the press.
+
+**Checked against a real window, because the suite cannot be.** Built on the
+`windows` platform plugin with two documents open: the native path takes
+(`is_native()` true), the title bar is the top row at y=0 with the menu bar
+under it at y=38, all eight rim points answer their own `HT*` code, the app icon
+answers `HTSYSMENU`, the maximise button answers `HTMAXBUTTON` while the other
+two stay `HTCLIENT`, and a maximised window fills the work area exactly
+(2560x1392 of 2560x1392, which is the case the `WM_NCCALCSIZE` clamp exists
+for). With two tabs open there are 310 px of bare strip past the last tab plus
+the 80 px gap, so most of the row still drags the window.
+
 ## Design decisions
 
 ### `QTabBar` + `QStackedWidget`, not `QTabWidget`
@@ -1173,6 +1198,27 @@ as a bug.
   Organizer is a better way to do the same thing.
 - **`close.confirm_multiple_tabs` still defaults to true.** The reasoning is at
   the end of phase 6.
+- **Double-clicking bare tab strip no longer opens a tab, it maximises.** Phase
+  7, and it is what a title bar does. `Ctrl+T` and the `+` button remain.
+- **Multi-tab move is a tick list on the context menu, not shift-click.** Phase
+  7. Shift-click range select needs a selection model `QTabBar` does not have.
+
+**Phase 7, and honest about what the frameless window does not give back.**
+
+- **Off Windows, and anywhere the native setup cannot take, the window falls
+  back to `startSystemMove` / `startSystemResize`.** The gestures all exist,
+  but there are no Snap Layouts, and the resize cursor does not always change
+  because a child widget sitting on the rim eats the mouse move before the
+  filter on the window sees it. On Windows the native path answers first and
+  none of that applies.
+- **There is no window title text anywhere in the window.** The document names
+  are on the tabs, and `windowTitle` still feeds the taskbar and Alt+Tab. Same
+  as Chrome. Nobody has asked for it back.
+- **The drag strip shrinks as tabs fill the bar.** Past the last tab is
+  draggable, so with a few documents open most of the row is; with the bar
+  full, what is left is the 80 px gap before the window controls
+  (`DRAG_GAP_WIDTH`), which is the guarantee that there is always somewhere to
+  grab.
 
 **Genuinely outstanding.**
 
