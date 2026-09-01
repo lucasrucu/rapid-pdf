@@ -25,3 +25,5 @@ _invalidation_test.py
 # Both got swept in by a git add -A on 2026-08-27 and do not belong in the repo.
 graphify-out/
 _wt/
+.vercel
+.env*
