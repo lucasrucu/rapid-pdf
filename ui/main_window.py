@@ -1492,8 +1492,8 @@ class MainWindow(QMainWindow):
         badly at title-bar size and does not survive every place a window title
         gets copied into (taskbar previews, screenshots, bug reports).
 
-        The name is one word. It was "Rapid PDF" up to 1.7.0, and at title-bar
-        size the space read as two separate things. This string no longer
+        The name is one word. It was "Rapid PDF" in earlier releases, and at
+        title-bar size the space read as two separate things. This string no longer
         reaches the caption at all, because the tab strip is the title bar now,
         so where it actually lands is the taskbar button and Alt+Tab. The
         filename stays appended: with several windows open, dropping it would

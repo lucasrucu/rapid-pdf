@@ -72,6 +72,11 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 ; eng.traineddata (the OCR language data; PyMuPDF embeds the engine, this
 ; file is the only OCR dependency that must ship).
 Source: "dist\rapid-pdf\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; The .pdf FILE icon, copied to the app root on purpose. PyInstaller buries
+; bundled data under {app}\_internal\assets\, and the shell holds DefaultIcon
+; as a literal path forever; keeping it at {app}\pdf-document.ico means a
+; PyInstaller layout change can never leave every PDF on the machine iconless.
+Source: "assets\pdf-document.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [InstallDelete]
 ; 1.1.0 put its shortcuts in a "Rapid PDF" Start Menu FOLDER ({group}); from
@@ -88,10 +93,6 @@ Type: dirifempty; Name: "{autoprograms}\{#OldAppName}"
 ; sitting beside the new pair and the Start menu offers the app twice.
 Type: files; Name: "{autoprograms}\{#OldAppName}.lnk"
 Type: files; Name: "{autodesktop}\{#OldAppName}.lnk"
-; 1.6.0 and 1.7.0 copied a .pdf document icon here for RapidPDF.Document's
-; DefaultIcon. Nothing points at it any more (see [Registry] below), so it is
-; removed rather than left behind as a file with no reader.
-Type: files; Name: "{app}\pdf-document.ico"
 
 [Icons]
 ; Single shortcut at the Start Menu Programs ROOT: this is what makes the app
@@ -110,37 +111,40 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: deskto
 ; merges both and shows "Combine with Rapid PDF" twice.
 Root: HKCU; Subkey: "Software\Classes\RapidPDF.Document\shell\combine"; ValueType: none; Flags: deletekey
 ;
-; NO DefaultIcon. This installer does not tell Explorer what a PDF looks like.
+; DefaultIcon: a DOCUMENT icon, and the argument for deleting the key instead
+; was made and rejected. Read this before changing it a fourth time.
 ;
 ; DefaultIcon on this ProgID is the icon Explorer paints on EVERY .pdf on the
-; machine, and only while this ProgID owns the .pdf association. Two builds got
-; it wrong in opposite directions and both were visible to the user:
+; machine, and only while this ProgID owns the .pdf association. Three
+; positions have been held:
 ;   up to 1.5.0 it pointed at rapid-pdf.exe, so picking us as the default
-;   handler repainted every PDF with the gold app tile, which is the complaint
-;   this line exists to answer;
-;   1.6.0 and 1.7.0 pointed it at a document icon of our own drawing, which is
-;   better looking and still the wrong call: a PDF viewer has no business
-;   restyling somebody's entire file type on install.
-; So the value is not written at all, and the key is deleted, which leaves the
-; .pdf icon to whoever owns the association. On a machine where that is Edge or
-; Acrobat, PDFs simply keep the icon they already had.
+;   handler repainted every PDF on the machine with the gold app tile;
+;   1.6.0 and 1.7.0 pointed it at a document icon of our own drawing;
+;   a later change deleted the key outright, on the argument that a PDF viewer
+;   has no business restyling somebody's file type on install.
 ;
-; THE HONEST LIMIT, and it is worth knowing before this is "improved" again.
-; Windows has no generic PDF icon of its own to fall back to: the icon of a
-; file type IS the icon of the ProgID that owns it. With DefaultIcon absent the
-; shell falls back to the first icon of the exe in shell\open\command, so if a
-; user goes to Settings and makes RapidPDF the DEFAULT PDF app, their PDFs will
-; wear the app icon again. Deleting the key is the right default because almost
-; nobody does that, and the ones who do have asked for it; but "absent" is not
-; the same as "neutral", and there is no registry value that means "leave it
-; alone". If the app tile on PDFs ever needs answering for real, the fix is a
-; document icon here again (assets\pdf-document.ico is still in the repo,
-; regen: python tools\make_document_icon.py), not a third wrong direction.
+; THE DELETION WAS REVERTED, because its own reasoning does not hold for the
+; person this is built for. Windows has no generic PDF icon to fall back to:
+; the icon of a file type IS the icon of the ProgID that owns it. With
+; DefaultIcon absent the shell falls back to the FIRST ICON OF THE EXE in
+; shell\open\command, so a user who makes RapidPDF their default PDF app gets
+; the gold app tile back. The deletion was defended as safe because "almost
+; nobody does that". Lucas does, and his words on 2026-09-02 were: "if i select
+; rapid pdf they all turn into yellow icons and make no sense and confuses, id
+; like to let the icon maintain defaul pdf icon regular icon instead". Deleting
+; the key delivers him the exact thing he was complaining about.
 ;
-; deletekey, not just an absent line: 1.5.0 through 1.7.0 all wrote a value
-; here, and an upgrade that stops writing one leaves the old value in place
-; forever. This is what actually reverts an existing install.
-Root: HKCU; Subkey: "Software\Classes\RapidPDF.Document\DefaultIcon"; ValueType: none; Flags: deletekey
+; So this points at a document icon of our own: assets\pdf-document.ico, a
+; white page with a folded corner and a red PDF band, which is what a PDF has
+; looked like for twenty years. Regenerate with
+; python tools\make_document_icon.py. The exe, the Start-menu shortcut and the
+; window all still carry rapid-pdf.ico: the app icon identifies the APP and the
+; document icon identifies the FILE TYPE, and they are two different jobs.
+;
+; "Leave it alone" is not available. There is no registry value meaning that,
+; and absent is not neutral. Given the choice is between our document icon and
+; our app tile, the document icon is the one that answers the complaint.
+Root: HKCU; Subkey: "Software\Classes\RapidPDF.Document\DefaultIcon"; ValueType: string; ValueData: "{app}\pdf-document.ico,0"
 ;
 ; ProgID with a clean "open" verb: right-click a .pdf > Open with RapidPDF.
 Root: HKCU; Subkey: "Software\Classes\RapidPDF.Document"; ValueType: string; ValueData: "PDF Document"; Flags: uninsdeletekey
