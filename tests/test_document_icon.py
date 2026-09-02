@@ -208,3 +208,64 @@ def test_installer_refreshes_the_shell_icon_cache():
         "already have the gold icon cached against every PDF, and changing "
         "the registry value on its own does not repaint anything"
     )
+
+
+# ---------------------------------------------------------------------------
+# The half that was missing, and the reason 1.7.0 did not fix anyone's icons.
+#
+# The DefaultIcon change shipped in 1.6.0 and the icon file was added with it,
+# but the ONLY thing putting that file at {app}\pdf-document.ico was the
+# installer's [Files] line. An in-app update never runs the installer: it
+# downloads the portable zip, which is the PyInstaller onedir folder, and
+# robocopies it over the install (core/update/client.py, core/update/swap.py).
+# So on any machine that updated from inside the app, DefaultIcon pointed at a
+# file that was never delivered.
+#
+# PyInstaller 6 buries every `datas` entry under _internal/, so the spec has to
+# copy the icon to the onedir root itself, after COLLECT. These tests pin that.
+# ---------------------------------------------------------------------------
+
+SPEC = ROOT / "rapid-pdf.spec"
+
+
+def _spec_text() -> str:
+    return SPEC.read_text(encoding="utf-8", errors="replace")
+
+
+def test_the_spec_puts_the_document_icon_in_the_onedir_root():
+    """So the portable zip carries it, and so an in-app update delivers it."""
+    text = _spec_text()
+    assert "pdf-document.ico" in text, (
+        "rapid-pdf.spec must place assets/pdf-document.ico at the onedir "
+        "root. The installer's [Files] line only covers people who run the "
+        "installer; everyone who updates from inside the app gets the "
+        "portable zip, which is this folder, and would get a DefaultIcon "
+        "pointing at a file that is not there"
+    )
+    assert re.search(r"shutil\.copy2\(\s*_document_icon", text), (
+        "the icon has to be copied after COLLECT. A datas entry cannot do "
+        "this: PyInstaller 6 puts all bundled data under _internal/, and "
+        "DefaultIcon points at {app}\\pdf-document.ico"
+    )
+
+
+def test_the_spec_copy_targets_the_onedir_root_not_internal():
+    text = _spec_text()
+    assert re.search(r'_onedir_root\s*=\s*Path\(DISTPATH\)\s*/\s*"rapid-pdf"', text), (
+        "the copy must target dist/rapid-pdf/, the folder that becomes the "
+        "portable zip and the install root. Anything under _internal/ is the "
+        "path DefaultIcon deliberately avoids"
+    )
+    assert "_internal" not in text.split("shutil.copy2")[-1], (
+        "the copy destination must not be under _internal/"
+    )
+
+
+def test_the_spec_refuses_to_build_without_the_icon():
+    """A silent miss here is invisible until every PDF on a machine goes blank."""
+    text = _spec_text()
+    assert re.search(r"if not _document_icon\.is_file\(\)", text), (
+        "the spec must fail the build when assets/pdf-document.ico is "
+        "missing. Building without it produces an install whose DefaultIcon "
+        "points at nothing, and nobody notices until the icons disappear"
+    )
