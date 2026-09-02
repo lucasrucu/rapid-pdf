@@ -1,4 +1,9 @@
-"""The app is called "Rapid PDF", and nothing shipped says more than that.
+"""The app is called "RapidPDF", and nothing shipped says more than that.
+
+THE NAME IS ONE WORD, from 1.8.0. It was "Rapid PDF" with a space up to 1.7.0.
+One exception, and it is not cosmetic: main.py's setApplicationName() is an
+IDENTITY string, not a display string. It decides the settings directory, so it
+keeps the old spelling. SETTINGS_APP_NAME below carries that, separately.
 
 WHAT WENT WRONG. The Windows version resource carried
 "Rapid PDF <dash> fast PDF annotation and page organization" in FileDescription.
@@ -40,7 +45,20 @@ MAIN_WINDOW = ROOT / "ui" / "main_window.py"
 
 #: The whole name, and the only name. Anything that identifies the app to the
 #: user is this string exactly, with nothing appended.
-APP_NAME = "Rapid PDF"
+#:
+#: ONE WORD, from 1.8.0. It used to be "Rapid PDF" with a space. The taskbar
+#: and Alt+Tab are the only places the window title still surfaces now that the
+#: tab strip is the title bar, and the space read as two things there.
+APP_NAME = "RapidPDF"
+
+#: NOT the display name, and it must not follow the rename. QSettings and
+#: core.settings.default_settings_dir() both derive from
+#: QCoreApplication.applicationName(), so this string IS the path
+#: %LOCALAPPDATA%\Rapid PDF\settings.json. Changing it silently moves every
+#: user's preferences and restored session to a new folder and leaves the old
+#: one behind, which is a data loss dressed as a rename. The identity string
+#: and the display string are two different jobs; see core/settings.py.
+SETTINGS_APP_NAME = "Rapid PDF"
 
 #: A real em dash, an en dash, and the cp1252 double-encoding of an em dash
 #: that two of these files were actually carrying.
@@ -90,19 +108,27 @@ def test_installer_app_name_is_just_the_app_name():
     )
 
 
-def test_the_app_registers_itself_under_the_app_name():
-    assert f'setApplicationName("{APP_NAME}")' in _read(MAIN), (
-        f"main.py must call setApplicationName({APP_NAME!r}); QSettings and "
-        "the %LOCALAPPDATA% settings folder are both named off it"
+def test_the_app_registers_itself_under_the_settings_name():
+    """Deliberately the OLD spelling. See SETTINGS_APP_NAME above."""
+    assert f'setApplicationName("{SETTINGS_APP_NAME}")' in _read(MAIN), (
+        f"main.py must call setApplicationName({SETTINGS_APP_NAME!r}). This "
+        "is not the display name and does not follow the rename: QSettings "
+        "and the %LOCALAPPDATA% settings folder are both named off it, so "
+        "changing it orphans every existing install's preferences and session"
     )
 
 
 def test_the_window_title_is_the_name_then_the_file():
-    """No dash character in the separator, and the name still leads."""
+    """No dash character in the separator, and the name still leads.
+
+    ui/title_bar.py paints no title text, so this string reaches the taskbar
+    button and Alt+Tab and nowhere else. The filename stays: with several
+    windows open, dropping it would give Alt+Tab a row of identical entries.
+    """
     text = _read(MAIN_WINDOW)
     assert f'setWindowTitle(f"{APP_NAME} - {{name}}[*]")' in text, (
-        "the titled-window format must be 'Rapid PDF - <file>[*]' with a plain "
-        "hyphen; an em dash here reads badly at title-bar size"
+        f"the titled-window format must be '{APP_NAME} - <file>[*]' with a "
+        "plain hyphen; an em dash here reads badly at title-bar size"
     )
     assert f'setWindowTitle("{APP_NAME}")' in text, (
         "with no document open the title is the bare app name"

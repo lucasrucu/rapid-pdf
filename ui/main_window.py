@@ -1491,15 +1491,28 @@ class MainWindow(QMainWindow):
         The separator is a plain hyphen. It used to be an em dash, which reads
         badly at title-bar size and does not survive every place a window title
         gets copied into (taskbar previews, screenshots, bug reports).
+
+        The name is one word. It was "Rapid PDF" up to 1.7.0, and at title-bar
+        size the space read as two separate things. This string no longer
+        reaches the caption at all, because the tab strip is the title bar now,
+        so where it actually lands is the taskbar button and Alt+Tab. The
+        filename stays appended: with several windows open, dropping it would
+        give Alt+Tab a row of identical entries.
+
+        NOT renamed with it: main.py's setApplicationName(), which is an
+        identity string rather than a display one. QSettings and the
+        %LOCALAPPDATA% settings folder are both named off it, so changing it
+        would silently move every existing user's preferences and restored
+        session and leave the old folder behind. See tests/test_product_name.py.
         """
         view = self.view
         name = view.document_name() if view is not None else None
         if name is None:
             self.setWindowModified(False)
-            self.setWindowTitle("Rapid PDF")
+            self.setWindowTitle("RapidPDF")
             return
         self.setWindowModified(view.is_dirty())
-        self.setWindowTitle(f"Rapid PDF - {name}[*]")
+        self.setWindowTitle(f"RapidPDF - {name}[*]")
 
     def _quit_app(self):
         """Quit menu / Ctrl+Q. Quits the APPLICATION, not this window.

@@ -9,6 +9,10 @@
 # string as ProductName, because that is all any of those places have room for.
 # The tagline lives where a tagline belongs: the About box, the installer's
 # ApplicationDescription, and the landing site.
+#
+# THE NAME IS ONE WORD. "RapidPDF", not "Rapid PDF". Both fields carry the same
+# string and tests/test_product_name.py asserts they agree, because they drifted
+# once already and that is how the long one went unnoticed for four releases.
 VSVersionInfo(
   ffi=FixedFileInfo(
     filevers=(1, 7, 0, 0),
@@ -27,12 +31,12 @@ VSVersionInfo(
           '040904B0',
           [
             StringStruct('CompanyName', 'Lucas Ruiz'),
-            StringStruct('FileDescription', 'Rapid PDF'),
+            StringStruct('FileDescription', 'RapidPDF'),
             StringStruct('FileVersion', '1.7.0.0'),
             StringStruct('InternalName', 'rapid-pdf'),
             StringStruct('LegalCopyright', 'Copyright (c) 2026 Lucas Ruiz'),
             StringStruct('OriginalFilename', 'rapid-pdf.exe'),
-            StringStruct('ProductName', 'Rapid PDF'),
+            StringStruct('ProductName', 'RapidPDF'),
             StringStruct('ProductVersion', '1.7.0.0')
           ]
         )

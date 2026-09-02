@@ -453,7 +453,9 @@ def test_the_view_publishes_the_title_and_the_window_paints_it(win, pdf_path):
     win.view.title_changed.connect(lambda: seen.append(win.view.document_name()))
     win.view._mark_dirty()
     assert seen[-1] == os.path.basename(pdf_path)
-    assert win.windowTitle().startswith("Rapid PDF - ")
+    # One word from 1.8.0; the format string lives in MainWindow._sync_title
+    # and the rule is pinned in tests/test_product_name.py.
+    assert win.windowTitle().startswith("RapidPDF - ")
     assert win.isWindowModified()
 
 

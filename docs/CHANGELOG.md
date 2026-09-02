@@ -1,6 +1,6 @@
 # Changelog
 
-Everything worth knowing about each release of Rapid PDF. The shape follows
+Everything worth knowing about each release of RapidPDF. The shape follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the numbers follow
 [semver](https://semver.org/spec/v2.0.0.html), which is also how
 `core/update/release.py` decides whether a release is newer than the build you
@@ -9,6 +9,46 @@ are running.
 Releases before 1.6.0 were written up on the
 [Releases page](https://github.com/lucasrucu/rapid-pdf/releases) and are not
 backfilled here.
+
+## [Unreleased]
+
+Two things people see, and one they should stop seeing. The version literals
+are still 1.7.0: bumping them is the release commit's job and this is not one.
+
+### Changed
+
+- **The app is called RapidPDF.** One word, everywhere it names itself: the
+  Windows version resource Explorer reads in "Open with" and Task Manager, the
+  installer, the Start-menu and desktop shortcuts, the entry in
+  Settings > Default apps, both right-click verbs, and the window title that
+  reaches the taskbar and Alt+Tab. Upgrading removes the old shortcuts and the
+  old `Software\Rapid PDF` registration instead of leaving a second set beside
+  the new one. Two things keep the old spelling on purpose: an existing install
+  stays in the folder it is already in, and the settings directory
+  (`%LOCALAPPDATA%\Rapid PDF\settings.json`) is an identity rather than a
+  label, so renaming it would quietly abandon everyone's preferences and saved
+  session.
+
+### Fixed
+
+- **PDFs keep their own icon.** Picking this app as the default PDF handler used
+  to repaint every PDF on the machine: with the gold app tile up to 1.5.0, and
+  with a document icon of our own drawing from 1.6.0. The second was better
+  looking and still not the app's call to make. The installer now claims no
+  icon for the PDF document type at all, and deletes the value earlier builds
+  wrote, so a PDF goes back to whatever its real handler draws.
+  - A Windows limit, not a choice: there is no generic PDF icon to fall back
+    on. A file type's icon is the icon of the program that owns the type, and
+    with none named the shell uses the app's own. So this leaves PDFs alone on
+    every machine except one where somebody has deliberately made RapidPDF
+    their default PDF app, and there the app icon comes back.
+  - Explorer caches icons per file type in a database that survives a reboot.
+    The installer asks the shell to re-read associations, which is the whole of
+    what an installer can do; a machine still showing an old icon needs
+    `ie4uinit.exe -show`, or a sign-out.
+  - `pdf-document.ico` is deleted from the install folder and the build no
+    longer copies it beside the exe. The artwork stays in `assets/`, unwired,
+    so the decision is one registry line to reverse.
 
 ## [1.7.0] - 2026-09-02
 

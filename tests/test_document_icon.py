@@ -1,21 +1,30 @@
-"""The .pdf FILE icon has to stay a document, and stay wired up.
+"""The installer does not decide what a PDF looks like. These tests pin that.
 
+THE HISTORY, BECAUSE IT WENT WRONG TWICE IN OPPOSITE DIRECTIONS.
 Up to 1.5.0 the ProgID's DefaultIcon pointed at rapid-pdf.exe, so the moment a
-user picked Rapid PDF as their default PDF handler every PDF in Explorer turned
-into the gold app tile. Two different jobs got the same picture: the app icon
-says which program this is, the document icon says what the file is, and PDFs
-have read as a white page with a red label for as long as anyone has used one.
-Repainting them all is a confusing thing to do to somebody's machine.
+user picked this app as their default PDF handler, every PDF in Explorer turned
+into the gold app tile. 1.6.0 answered that by pointing DefaultIcon at a
+document icon of our own drawing, and 1.7.0 went further and shipped that icon
+down the in-app update path as well. Better looking, still the wrong call: a
+PDF viewer has no business restyling somebody's whole file type on install.
 
-So there are two icons now, and these tests pin both halves of that: the
-document icon really is a multi-resolution .ico with the sizes Explorer asks
-for (16px above all, which is what the details view draws), and the installer
-really points the file association at it while leaving the exe alone.
+WHAT IS PINNED NOW. The installer registers the ProgID, the open verb and the
+combine verb, and claims no DefaultIcon at all; it also DELETES the key, which
+is the only thing that reverts an install that already has a value there.
 
-The 16px frame in particular is checked for content, not just for existing.
-A frame that decoded to a blank or single-colour square would still be a valid
-.ico and would still install cleanly, and nobody would notice until a PDF went
-invisible in a file list.
+THE LIMIT, SO THE NEXT READER DOES NOT MISREAD THESE TESTS AS "PDFS ARE SAFE".
+Windows has no generic PDF icon to fall back on. The icon of a file type is the
+icon of the ProgID that owns it, and with DefaultIcon absent the shell uses the
+first icon of the exe in shell\\open\\command. So a user who deliberately makes
+this app their DEFAULT PDF app still gets the app tile on their PDFs. Deleting
+the key is right because almost nobody does that, and because it leaves every
+other machine alone; it is not the same as neutrality, and no registry value
+means "leave it alone".
+
+THE ARTWORK STAYS IN THE REPO, UNWIRED. assets/pdf-document.ico and its
+generator are kept, and the frame tests below still hold them to being a
+legible page at 16px, so putting the icon back is one registry line rather than
+a redraw. Nothing installed points at it today.
 """
 
 import re
@@ -58,10 +67,10 @@ def _ico_directory(path: Path):
 
 def test_document_icon_exists():
     assert ICON.exists(), (
-        "assets/pdf-document.ico is missing. Without it the installer copies "
-        "nothing to {app} and RapidPDF.Document\\DefaultIcon points at a file "
-        "that is not there, which leaves every PDF with a blank icon. "
-        "Regenerate: python tools/make_document_icon.py"
+        "assets/pdf-document.ico is missing. Nothing installed points at it "
+        "today, but it is the drawn answer to 'what if we have to give PDFs "
+        "an icon after all', and deleting it turns that back into an "
+        "afternoon of artwork. Regenerate: python tools/make_document_icon.py"
     )
 
 
@@ -152,39 +161,52 @@ def _iss_text() -> str:
     return ISS.read_text(encoding="utf-8", errors="replace")
 
 
-def test_installer_ships_the_icon_to_the_app_root():
+def test_the_installer_does_not_ship_a_document_icon_to_the_app_root():
+    """No reader, no file. Nothing points at {app}\\pdf-document.ico now."""
     text = _iss_text()
-    assert re.search(
+    assert not re.search(
         r'Source:\s*"assets\\pdf-document\.ico";\s*DestDir:\s*"\{app\}"', text
     ), (
-        "rapid-pdf.iss must copy assets\\pdf-document.ico to {app}. The "
-        "PyInstaller bundle puts assets under {app}\\_internal\\, and "
-        "DefaultIcon is stored as a literal path, so the icon needs its own "
-        "[Files] line at a path that will not move"
+        "rapid-pdf.iss still copies assets\\pdf-document.ico to {app}, but no "
+        "registry value points at it. Either the [Files] line is stale or the "
+        "DefaultIcon claim has come back without this test being updated"
     )
 
 
-def test_default_icon_points_at_the_document_icon_not_the_exe():
+def test_the_installer_claims_no_default_icon_for_pdfs():
+    """The whole point: Explorer keeps drawing PDFs the way it already did."""
     text = _iss_text()
-    match = re.search(
+    written = re.search(
         r'Subkey:\s*"Software\\Classes\\RapidPDF\.Document\\DefaultIcon";'
         r'[^\n]*ValueData:\s*"([^"]+)"',
         text,
     )
-    assert match, "rapid-pdf.iss no longer registers RapidPDF.Document\\DefaultIcon"
-    value = match.group(1)
-    assert "pdf-document.ico" in value, (
-        f"DefaultIcon is {value!r}. It has to be the document icon: this is "
-        "the image Explorer stamps on every .pdf on the machine once Rapid "
-        "PDF is the default handler"
+    assert not written, (
+        f"rapid-pdf.iss writes DefaultIcon = {written.group(1)!r} if it "
+        "matched. Whatever the picture is, setting this repaints every PDF on "
+        "the machine for anyone who makes this app their default handler, and "
+        "the decision was that the installer does not do that"
     )
-    # Both spellings: the .iss writes the exe through a preprocessor macro, so
-    # checking for the literal filename alone would miss a regression.
-    for banned in ("rapid-pdf.exe", "{#AppExeName}"):
-        assert banned not in value, (
-            f"DefaultIcon is {value!r}, which is the app icon again. That is "
-            "the 1.5.0 bug: choosing Rapid PDF turned every PDF gold"
-        )
+
+
+def test_the_installer_clears_a_stale_default_icon():
+    """The half that fixes machines that already have a value there.
+
+    1.5.0 through 1.7.0 all wrote DefaultIcon. Simply stopping writing it
+    leaves those installs exactly as they are forever, which is the shape of
+    defect that produced this whole thread: an in-app update never runs the
+    installer, so registry state from an August install is still live.
+    """
+    text = _iss_text()
+    assert re.search(
+        r'Subkey:\s*"Software\\Classes\\RapidPDF\.Document\\DefaultIcon";'
+        r'[^\n]*Flags:[^\n]*deletekey',
+        text,
+    ), (
+        "rapid-pdf.iss must delete Software\\Classes\\RapidPDF.Document\\"
+        "DefaultIcon. Not writing a value is not the same as removing the one "
+        "an earlier build wrote"
+    )
 
 
 def test_the_exe_still_wears_the_app_icon():
@@ -204,25 +226,26 @@ def test_the_exe_still_wears_the_app_icon():
 def test_installer_refreshes_the_shell_icon_cache():
     text = _iss_text()
     assert "SHChangeNotify" in text and "SHCNE_ASSOCCHANGED" in text, (
-        "the installer has to fire SHCNE_ASSOCCHANGED. Upgrading users "
-        "already have the gold icon cached against every PDF, and changing "
-        "the registry value on its own does not repaint anything"
+        "the installer has to fire SHCNE_ASSOCCHANGED. Upgrading users have "
+        "an icon cached against the whole .pdf type, and removing the "
+        "registry key on its own does not repaint anything"
     )
 
 
 # ---------------------------------------------------------------------------
-# The half that was missing, and the reason 1.7.0 did not fix anyone's icons.
+# The build side, which 1.7.0 added and this release removes again.
 #
-# The DefaultIcon change shipped in 1.6.0 and the icon file was added with it,
-# but the ONLY thing putting that file at {app}\pdf-document.ico was the
-# installer's [Files] line. An in-app update never runs the installer: it
-# downloads the portable zip, which is the PyInstaller onedir folder, and
-# robocopies it over the install (core/update/client.py, core/update/swap.py).
-# So on any machine that updated from inside the app, DefaultIcon pointed at a
-# file that was never delivered.
+# 1.7.0 noticed that the installer's [Files] line was the only thing putting
+# the icon at {app}\pdf-document.ico, and that an in-app update never runs the
+# installer: it downloads the portable zip, which is the PyInstaller onedir
+# folder, and robocopies it over the install (core/update/client.py,
+# core/update/swap.py). Its answer was a post-COLLECT copy in the spec, so both
+# delivery paths carried the file.
 #
-# PyInstaller 6 buries every `datas` entry under _internal/, so the spec has to
-# copy the icon to the onedir root itself, after COLLECT. These tests pin that.
+# Correct reasoning about the wrong goal. With no DefaultIcon there is nothing
+# to deliver, so the copy goes too. The test below is what stops it coming back
+# by habit, and the reasoning is preserved in the spec's comment so that a
+# future decision to reinstate the icon does not have to rediscover it.
 # ---------------------------------------------------------------------------
 
 SPEC = ROOT / "rapid-pdf.spec"
@@ -232,40 +255,28 @@ def _spec_text() -> str:
     return SPEC.read_text(encoding="utf-8", errors="replace")
 
 
-def test_the_spec_puts_the_document_icon_in_the_onedir_root():
-    """So the portable zip carries it, and so an in-app update delivers it."""
+def test_the_spec_does_not_copy_the_document_icon_to_the_onedir_root():
     text = _spec_text()
-    assert "pdf-document.ico" in text, (
-        "rapid-pdf.spec must place assets/pdf-document.ico at the onedir "
-        "root. The installer's [Files] line only covers people who run the "
-        "installer; everyone who updates from inside the app gets the "
-        "portable zip, which is this folder, and would get a DefaultIcon "
-        "pointing at a file that is not there"
-    )
-    assert re.search(r"shutil\.copy2\(\s*_document_icon", text), (
-        "the icon has to be copied after COLLECT. A datas entry cannot do "
-        "this: PyInstaller 6 puts all bundled data under _internal/, and "
-        "DefaultIcon points at {app}\\pdf-document.ico"
+    assert "shutil" not in text, (
+        "rapid-pdf.spec copies a file into the onedir root again. The only "
+        "thing that ever needed to be there was pdf-document.ico, for a "
+        "DefaultIcon value that no longer exists; if the icon is coming back, "
+        "rapid-pdf.iss has to claim it again first and these tests have to say so"
     )
 
 
-def test_the_spec_copy_targets_the_onedir_root_not_internal():
+def test_the_document_icon_ships_only_as_ordinary_bundled_data():
+    """Kept in assets/, kept out of the install root.
+
+    The datas entry sweeps all of assets/, so the file still lands in
+    _internal/assets/ and costs a few KB. That is fine and is not what the
+    DefaultIcon path cared about; what mattered was a literal path at the
+    install root that a PyInstaller layout change could never move, and
+    nothing needs one now.
+    """
     text = _spec_text()
-    assert re.search(r'_onedir_root\s*=\s*Path\(DISTPATH\)\s*/\s*"rapid-pdf"', text), (
-        "the copy must target dist/rapid-pdf/, the folder that becomes the "
-        "portable zip and the install root. Anything under _internal/ is the "
-        "path DefaultIcon deliberately avoids"
-    )
-    assert "_internal" not in text.split("shutil.copy2")[-1], (
-        "the copy destination must not be under _internal/"
-    )
-
-
-def test_the_spec_refuses_to_build_without_the_icon():
-    """A silent miss here is invisible until every PDF on a machine goes blank."""
-    text = _spec_text()
-    assert re.search(r"if not _document_icon\.is_file\(\)", text), (
-        "the spec must fail the build when assets/pdf-document.ico is "
-        "missing. Building without it produces an install whose DefaultIcon "
-        "points at nothing, and nobody notices until the icons disappear"
+    assert '("assets", "assets")' in text
+    assert "_onedir_root" not in text, (
+        "the onedir-root copy is gone; a leftover reference to it means the "
+        "removal was partial"
     )

@@ -334,7 +334,7 @@ def test_activating_a_lazy_tab_opens_it_where_it_was_left(
     assert not lazy.is_pending()
     assert lazy.current_page() == 1
     assert lazy.fit_mode() == "fit_width"
-    assert window.windowTitle().startswith("Rapid PDF")
+    assert window.windowTitle().startswith("RapidPDF")
     assert "beta.pdf" in window.windowTitle()
 
 
