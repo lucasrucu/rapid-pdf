@@ -69,3 +69,40 @@ coll = COLLECT(
     upx_exclude=[],
     name="rapid-pdf",
 )
+
+# ---------------------------------------------------------------------------
+# The .pdf FILE icon, placed at the onedir ROOT, next to the exe.
+#
+# WHY IT CANNOT BE A `datas` ENTRY. PyInstaller 6 puts every bundled data file
+# under `_internal/`, whatever destination you name: ("assets", "assets")
+# lands at `_internal/assets/`, and ("...ico", ".") would land at
+# `_internal/`, not beside the exe. There is no datas destination that reaches
+# the onedir root, so the copy has to happen after COLLECT has built it.
+#
+# WHY IT HAS TO BE AT THE ROOT AT ALL. The ProgID's DefaultIcon is
+# `{app}\pdf-document.ico` (see rapid-pdf.iss). The shell stores that as a
+# literal path and keeps it forever, so it must point somewhere a PyInstaller
+# layout change can never move.
+#
+# WHY THE INSTALLER'S [Files] LINE IS NOT ENOUGH. Inno copies this file to
+# {app} at INSTALL time, but an in-app update never runs Inno: it downloads
+# the portable zip, which is exactly this onedir folder, and robocopies it
+# over the install (core/update/swap.py). So anything that reaches users only
+# through the installer never reaches anyone who updates from inside the app.
+# That is the real 1.7.0 defect: the DefaultIcon fix shipped, and the file it
+# points at did not. Putting the icon in the onedir folder puts it in the zip,
+# which puts it on both paths.
+# ---------------------------------------------------------------------------
+import shutil
+from pathlib import Path
+
+_document_icon = Path(SPECPATH) / "assets" / "pdf-document.ico"
+_onedir_root = Path(DISTPATH) / "rapid-pdf"
+if not _document_icon.is_file():
+    raise SystemExit(
+        f"missing {_document_icon}: the .pdf document icon is what "
+        "RapidPDF.Document\\DefaultIcon points at, and a build without it "
+        "leaves every PDF on the machine with a blank icon. "
+        "Regenerate it with: python tools/make_document_icon.py"
+    )
+shutil.copy2(_document_icon, _onedir_root / "pdf-document.ico")
