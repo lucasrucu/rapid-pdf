@@ -29,26 +29,56 @@ are still 1.7.0: bumping them is the release commit's job and this is not one.
   label, so renaming it would quietly abandon everyone's preferences and saved
   session.
 
+- **The tabs look like tabs.** The strip was labels with an accent underline:
+  no border, no corner radius, nothing between one tab and the next, and an
+  active fill three values away from the background, so the only thing marking
+  the current document was a two-pixel line. It now reads the way a browser's
+  does. The active tab is a raised card with a border and rounded top corners,
+  inactive tabs take a fill under the pointer and a hairline between them, and
+  the hairline is dropped beside the active tab so the card reads as one shape.
+
+- **The new-tab button is next to the tabs.** It sat at the far right of the
+  caption, against the window controls, with an empty lane between it and the
+  strip it belongs to, because the tab bar was stretched across the whole row.
+  The bar now hugs its tabs, so the button follows the last one. A deliberate
+  gap is kept after that tab: it is the gap a browser leaves, and it is also
+  the only surface the double-click-to-open-a-tab gesture has to land on.
+
+- **The two strip controls line up.** The "all open documents" chevron had a
+  fixed width and no fixed height, so it stretched to the full height of the
+  row while the tab bar beside it sat at its own; and the plus carried two
+  stray pixels of bottom padding nudging its glyph off centre. Both are now
+  26 by 26 and vertically centred. The chevron has also moved to the left of
+  the tabs, where Edge puts the same control, and it draws its own arrowhead
+  instead of setting one as text: it was U+2304, a thinly covered codepoint
+  that renders as an empty box wherever a font does not carry it.
+
 ### Fixed
 
-- **PDFs keep their own icon.** Picking this app as the default PDF handler used
-  to repaint every PDF on the machine: with the gold app tile up to 1.5.0, and
-  with a document icon of our own drawing from 1.6.0. The second was better
-  looking and still not the app's call to make. The installer now claims no
-  icon for the PDF document type at all, and deletes the value earlier builds
-  wrote, so a PDF goes back to whatever its real handler draws.
-  - A Windows limit, not a choice: there is no generic PDF icon to fall back
-    on. A file type's icon is the icon of the program that owns the type, and
-    with none named the shell uses the app's own. So this leaves PDFs alone on
-    every machine except one where somebody has deliberately made RapidPDF
-    their default PDF app, and there the app icon comes back.
+- **The gold box while dragging a tab.** Tearing a tab off washes the target
+  strip in the accent and outlines it, which is how the drop target says "this
+  window". A window holding one empty document hides its tab strip, and the
+  wash and the outline were painted on it anyway: on a bar a few pixels wide
+  that is not a highlighted strip, it is a small gold square floating in the
+  caption. Drop feedback is now skipped on a strip too narrow to carry it.
+
+- **PDFs get a document icon, not the app tile.** Picking this app as the
+  default PDF handler used to repaint every PDF on the machine with the gold
+  app tile. It has pointed at a document icon of our own since 1.6.0, a white
+  page with a red PDF band, and an attempt to go further and claim no icon at
+  all is reverted here: with no icon named, Windows falls back to the app's
+  own, so on the one machine that matters, one where somebody has deliberately
+  made RapidPDF their default PDF app, claiming nothing delivers exactly the
+  gold tile it was meant to remove.
+  - A Windows limit worth knowing: there is no generic PDF icon to fall back
+    on, and no registry value meaning "leave it alone". A file type's icon is
+    the icon of the program that owns the type. The choice is our document
+    icon or our app tile, and the document icon is the one that answers the
+    complaint.
   - Explorer caches icons per file type in a database that survives a reboot.
     The installer asks the shell to re-read associations, which is the whole of
     what an installer can do; a machine still showing an old icon needs
     `ie4uinit.exe -show`, or a sign-out.
-  - `pdf-document.ico` is deleted from the install folder and the build no
-    longer copies it beside the exe. The artwork stays in `assets/`, unwired,
-    so the decision is one registry line to reverse.
 
 ## [1.7.0] - 2026-09-02
 

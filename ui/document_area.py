@@ -45,7 +45,7 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QPointF, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractButton, QHBoxLayout, QMenu, QSizePolicy, QStackedWidget, QStyle,
@@ -61,9 +61,37 @@ from ui.tab_tear_off import TabTearOff
 TAB_MIN_WIDTH = 92
 TAB_MAX_WIDTH = 240
 
-# Room kept at the right of the bar for the chevron, so the last tab is not
-# sitting underneath it.
+# The chevron button, which now sits to the LEFT of the tabs. Square, so it
+# lines up with the new-tab button at the other end of the strip.
 CHEVRON_WIDTH = 26
+CHEVRON_HEIGHT = 26
+
+# The arrowhead drawn inside it. Small: this is a disclosure mark, not an icon.
+CHEVRON_GLYPH_WIDTH = 8.0
+CHEVRON_GLYPH_HEIGHT = 3.0
+
+# Everything in the title-bar row that is NOT tabs: the app icon, the chevron,
+# the new-tab button, the drag gap and the three window controls. Subtracted
+# from the WINDOW width to get the room the tabs may share out.
+#
+# WHY THE WINDOW AND NOT THE BAR. The share used to be a function of the bar's
+# own width, which was fine while the bar was stretched across the whole strip.
+# It is not stretched any more: it hugs its tabs so the new-tab button can sit
+# against the last one, the way it does in a browser. A hugging widget takes its
+# width from its own size hint, so a hint computed from that same width is a
+# feedback loop that settles on whichever value it was seeded with. The window's
+# width does not depend on this bar, which is what makes it a usable budget.
+#
+# Over-estimating is safe and under-estimating is not: too small a budget only
+# means slightly narrower tabs, while too large lets the last tab slide under
+# the new-tab button.
+TAB_STRIP_RESERVE = 330
+
+# Empty bar kept after the last tab. Two jobs, and it would be worth keeping for
+# either one alone: it is the only surface the double-click-to-open-a-tab
+# gesture has left now that the bar hugs its tabs, and it is the gap a browser
+# leaves between the last tab and the plus button.
+TRAILING_SLACK = 28
 
 # The unsaved-changes dot, drawn in place of the close X.
 DIRTY_DOT_RADIUS = 3.5
@@ -88,6 +116,13 @@ DROP_WASH_ALPHA = 46
 
 # The accent outline around the target strip, under the wash.
 DROP_OUTLINE_WIDTH = 2
+
+# Below this width the strip is not painted with drop feedback at all. A wash
+# and an outline are a way of saying "this whole strip"; on a bar a few pixels
+# wide they say "here is a small gold box", which is what a user actually
+# reported seeing while dragging a tab. One tab at the floor width is the
+# smallest thing that can carry the message, so that is the threshold.
+DROP_FEEDBACK_MIN_WIDTH = TAB_MIN_WIDTH
 
 # The mark on a tab that has been ticked for "Move Selected to New Window". A
 # bar along the top edge of the tab, in the accent, because the tab's own
@@ -164,6 +199,51 @@ def _path_parts(path: str) -> list:
 def _label(parts: list, depth: int) -> str:
     depth = min(depth, len(parts) - 1)
     return "/".join(parts[len(parts) - 1 - depth:])
+
+
+class _TabListButton(QToolButton):
+    """The "all open documents" control, at the left of the strip.
+
+    IT PAINTS ITS OWN ARROWHEAD instead of setting one as text, and that is the
+    whole reason the class exists. It carried a text glyph before, U+2304 DOWN
+    ARROWHEAD, which is a thinly covered codepoint: where a font does not have
+    it the button renders as an empty box or as nothing at all, and where a
+    fallback font supplies it the size and baseline are whatever that font
+    happens to use, which is the other half of "it is not centred". Two lines
+    from a QPainter are the same shape in every font on every machine.
+
+    The close button next to every tab already draws its X this way, so this is
+    the established answer here rather than a new idea.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._glyph = QColor("#666666")
+
+    def apply_palette(self, palette):
+        self._glyph = QColor(palette.text_dim)
+        self.update()
+
+    def paintEvent(self, event):
+        # The stylesheet still owns the background, the radius and the hover and
+        # pressed fills; this only adds the mark on top.
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(self._glyph)
+        pen.setWidthF(1.4)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        centre = self.rect().center()
+        half = CHEVRON_GLYPH_WIDTH / 2
+        drop = CHEVRON_GLYPH_HEIGHT / 2
+        # A v, drawn as one polyline so the corner joins cleanly.
+        painter.drawPolyline([
+            QPointF(centre.x() - half, centre.y() - drop + 0.5),
+            QPointF(centre.x(), centre.y() + drop + 0.5),
+            QPointF(centre.x() + half, centre.y() - drop + 0.5),
+        ])
 
 
 class _TabCloseButton(QAbstractButton):
@@ -467,22 +547,49 @@ class DocumentTabBar(QTabBar):
         return QTabBar.ButtonPosition(side)
 
     def tabSizeHint(self, index: int) -> QSize:
-        """Equal shares, capped and floored.
+        """Equal shares of the strip's budget, capped and floored.
 
         Qt's own hint is the width of the text, which makes a long filename take
         half the bar. Sharing the room out instead is what makes tabs shrink
         before the bar starts scrolling, which is the behaviour asked for.
+
+        The budget is the WINDOW's width less TAB_STRIP_RESERVE, not this bar's
+        width. See that constant for why: the bar hugs its tabs now, so its own
+        width is downstream of this hint and cannot also be its input.
         """
         hint = super().tabSizeHint(index)
         count = max(1, self.count())
-        available = max(0, self.width() - CHEVRON_WIDTH)
-        share = available // count
+        share = self._share_budget() // count
         hint.setWidth(max(TAB_MIN_WIDTH, min(TAB_MAX_WIDTH, share)))
         return hint
 
+    def _share_budget(self) -> int:
+        """The width the tabs may divide between them."""
+        window = self.window()
+        reference = window.width() if window is not None else self.width()
+        return max(TAB_MIN_WIDTH, reference - TAB_STRIP_RESERVE)
+
+    def sizeHint(self) -> QSize:
+        """The tabs, plus a deliberate strip of nothing after the last one.
+
+        WHY THE SLACK EXISTS. Double-clicking empty bar space opens a new tab
+        (`mouseDoubleClickEvent`), and a bar that hugs its tabs exactly has no
+        empty space for that gesture to land on: the feature would still be in
+        the code and unreachable with a mouse. Hugging is what puts the new-tab
+        button against the last tab, so the answer is to hug with a margin
+        rather than to give the stretch back.
+
+        It is also what a browser looks like. Chrome and Edge both leave a gap
+        between the last tab and the plus, and neither butts them together.
+        """
+        hint = super().sizeHint()
+        hint.setWidth(hint.width() + TRAILING_SLACK)
+        return hint
+
     def resizeEvent(self, event):
-        # The share above is a function of the bar's width, so a resize has to
-        # re-ask for it.
+        # The share is a function of the WINDOW's width, and a window resize
+        # reaches this bar as a resize of its own, so this is still the right
+        # place to re-ask for the hint.
         super().resizeEvent(event)
         self.updateGeometry()
 
@@ -558,7 +665,19 @@ class DocumentTabBar(QTabBar):
                     QRect(rect.left(), rect.top(), rect.width(),
                           CHECK_MARK_HEIGHT), accent)
 
-        if self._drop_active:
+        # THE LITTLE YELLOW SQUARE, and why the drop feedback is now gated on a
+        # width. The wash and the outline are meant to light up a whole tab
+        # strip so it reads as "this window". They were painted on self.rect()
+        # unconditionally, and a bar with no tabs in it has a rect a few pixels
+        # wide: an alpha wash plus a 2px accent outline around that is not a
+        # highlighted strip, it is a small gold box floating in the caption,
+        # which is exactly what got reported. A window holding one empty
+        # document hides its header (see _sync_header_visibility), and the
+        # tear-off still names that window as the target and still calls
+        # set_drop_active on its bar, so the case is reached routinely rather
+        # than rarely. Since the bar now hugs its tabs it is narrower than it
+        # used to be, which would have made this more common, not less.
+        if self._drop_active and self.width() >= DROP_FEEDBACK_MIN_WIDTH:
             wash = QColor(accent)
             wash.setAlpha(DROP_WASH_ALPHA)
             painter.fillRect(self.rect(), wash)
@@ -570,7 +689,9 @@ class DocumentTabBar(QTabBar):
             painter.drawRect(self.rect().adjusted(
                 inset, inset, -inset - 1, -inset - 1))
 
-        if self._drop_x is not None:
+        # Same gate, same reason: a 4px line on a bar barely wider than 4px is
+        # the same artifact wearing a different shape.
+        if self._drop_x is not None and self.width() >= DROP_FEEDBACK_MIN_WIDTH:
             left = max(0, min(int(self._drop_x) - DROP_LINE_WIDTH // 2,
                               self.width() - DROP_LINE_WIDTH))
             painter.fillRect(
@@ -668,8 +789,34 @@ class DocumentArea(QWidget):
         header_row.setContentsMargins(0, 0, 0, 0)
         header_row.setSpacing(0)
 
+        # Every tab in one list, for when there are more than the bar can show
+        # at a readable width. It is the answer to "which of these is scrolled
+        # off", which scroll buttons alone never give you.
+        #
+        # IT IS FIRST IN THE ROW, to the left of the tabs, which is where Edge
+        # puts the same control. It used to be last, and because the bar was
+        # stretched across the whole strip "last" meant flung to the far right
+        # with a lane of empty caption between it and the tabs it belonged to.
+        #
+        # setFixedSize, not setFixedWidth. With only a width set, a QToolButton
+        # keeps its default Preferred height and grew to the full height of the
+        # row, while the tab bar beside it is vertically Fixed and sat at its own
+        # hint. Two neighbours on different heights is what "not centred" was.
+        self._chevron = _TabListButton()
+        self._chevron.setObjectName("documentTabChevron")
+        self._chevron.setToolTip("All open documents")
+        self._chevron.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._chevron.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._chevron.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._chevron.setFixedSize(CHEVRON_WIDTH, CHEVRON_HEIGHT)
+        self._chevron.clicked.connect(self._show_all_tabs_menu)
+        header_row.addWidget(self._chevron, 0, Qt.AlignmentFlag.AlignVCenter)
+
         self._bar = DocumentTabBar()
-        self._bar.setSizePolicy(QSizePolicy.Policy.Expanding,
+        # Preferred, not Expanding. The bar now hugs its tabs so that the
+        # new-tab button in the title bar lands against the last one instead of
+        # against the window controls. See TAB_STRIP_RESERVE.
+        self._bar.setSizePolicy(QSizePolicy.Policy.Preferred,
                                 QSizePolicy.Policy.Fixed)
         self._bar.currentChanged.connect(self._on_current_changed)
         self._bar.tabMoved.connect(self._on_tab_moved)
@@ -680,21 +827,11 @@ class DocumentArea(QWidget):
         # gesture then does goes back out through MainWindow's move methods.
         self._tear_off = TabTearOff(self._bar, self)
         self._bar.set_tear_off(self._tear_off)
-        header_row.addWidget(self._bar, stretch=1)
-
-        # Every tab in one list, for when there are more than the bar can show
-        # at a readable width. It is the answer to "which of these is scrolled
-        # off", which scroll buttons alone never give you.
-        self._chevron = QToolButton()
-        self._chevron.setObjectName("documentTabChevron")
-        self._chevron.setText("⌄")
-        self._chevron.setToolTip("All open documents")
-        self._chevron.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._chevron.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._chevron.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        self._chevron.setFixedWidth(CHEVRON_WIDTH)
-        self._chevron.clicked.connect(self._show_all_tabs_menu)
-        header_row.addWidget(self._chevron)
+        # No trailing stretch here on purpose. This header hugs its two widgets
+        # so the title-bar row can put the new-tab button immediately after the
+        # last tab; the stretch that fills the rest of the caption lives there,
+        # after that button. See ui/title_bar.py.
+        header_row.addWidget(self._bar, stretch=0)
 
         self._header = header
         root.addWidget(header)
@@ -1183,6 +1320,7 @@ class DocumentArea(QWidget):
 
     def apply_palette(self, palette):
         self._bar.apply_palette(palette)
+        self._chevron.apply_palette(palette)
 
     # ------------------------------------------------------------------
     # Menus

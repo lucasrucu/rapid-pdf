@@ -334,7 +334,12 @@ class TitleBar(QWidget):
         host_row.setContentsMargins(0, 0, 0, 0)
         host_row.setSpacing(0)
         self._tab_host_row = host_row
-        row.addWidget(self._tab_host, stretch=1)
+        # stretch=0: the host hugs the tab strip, so the button below lands
+        # against the last tab. It used to be stretch=1, which handed the host
+        # every spare pixel in the caption and left the new-tab button pinned to
+        # the far right with a lane of empty bar between it and the tabs. That
+        # is not where a browser puts it and it is not what it belongs to.
+        row.addWidget(self._tab_host, stretch=0)
 
         self._new_tab = QToolButton(self)
         self._new_tab.setObjectName("titleBarNewTab")
@@ -342,9 +347,17 @@ class TitleBar(QWidget):
         self._new_tab.setToolTip("New tab  (Ctrl+T)")
         self._new_tab.setCursor(Qt.CursorShape.PointingHandCursor)
         self._new_tab.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._new_tab.setFixedSize(30, 26)
+        # Square, and the same size as the chevron at the other end of the
+        # strip, so the two controls read as a pair rather than as two
+        # differently sized glyphs that happen to be nearby.
+        self._new_tab.setFixedSize(26, 26)
         self._new_tab.clicked.connect(self.new_tab_requested)
         row.addWidget(self._new_tab, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        # The spare caption width, all of it, in one place. Everything to the
+        # left of this is the tab strip and its two controls; everything to the
+        # right is the drag gap and the window controls.
+        row.addStretch(1)
 
         # The gap between the new-tab button and the controls. Nothing is drawn
         # in it and that is its job: it is the part of the strip that is always

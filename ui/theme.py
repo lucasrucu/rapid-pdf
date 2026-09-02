@@ -430,7 +430,6 @@ QToolButton#titleBarNewTab {{
     border-radius: 4px;
     color: {p.text_dim};
     font-size: 16px;
-    padding-bottom: 2px;
 }}
 QToolButton#titleBarNewTab:hover {{
     background-color: {p.surface_hover};
@@ -442,34 +441,76 @@ QToolButton#titleBarNewTab:pressed {{ background-color: {p.surface_active}; }}
 QMenuBar#windowMenuBar {{ padding: 1px 4px; }}
 
 /* ---- document tabs --------------------------------------------------
-   The bar across the top of the window, one tab per open PDF. Same underline
-   language as the Editor/Organizer switcher above, but it has to shrink: the
-   min-width up there is a floor for two fixed labels, and here it would stop
-   tabs narrowing before the bar starts scrolling. The real widths come from
-   DocumentTabBar.tabSizeHint; this only takes the floor off. */
-/* No bottom border. The strip lives inside the title bar now, and #windowChrome
-   draws the one line that closes off the title bar and the menu row together;
-   a second line halfway up the title bar reads as a seam. */
+   The bar across the top of the window, one tab per open PDF.
+
+   THESE ARE CARDS, NOT LABELS, and that is a deliberate break from the
+   Editor/Organizer switcher above. That switcher is two fixed labels choosing a
+   mode, and an accent underline is the right weight for it. This strip is the
+   window's tab bar and people read it against Chrome and Edge, where a tab is a
+   shape you can point at. It was underlined labels up to 1.7.0 and the report
+   was that it did not look like tabs at all, which was accurate: with no border,
+   no radius, no separators and an active fill three values off the background,
+   the only thing distinguishing a tab was a 2px line under it.
+
+   The active tab is a raised card with a border and rounded top corners.
+   Inactive tabs are flat with a hover fill and a hairline between them, and the
+   hairline is suppressed next to the selected tab so the card reads as one
+   object. The real widths come from DocumentTabBar.tabSizeHint.
+
+   No bottom border on the strip. #windowChrome draws the one line that closes
+   off the title bar and the menu row together; a second line halfway up the
+   title bar reads as a seam. */
 #documentTabHeader {{
     background-color: transparent;
 }}
+QTabBar#documentTabBar {{
+    background: transparent;
+}}
 QTabBar#documentTabBar::tab {{
+    background: transparent;
+    color: {p.text_dim};
+    border: 1px solid transparent;
+    border-bottom: none;
+    border-top-left-radius: 8px;
+    border-top-right-radius: 8px;
     min-width: 0px;
-    padding: 6px 6px 6px 12px;
-    margin: 0px;
+    padding: 5px 6px 5px 12px;
+    margin: 5px 0px 0px 0px;
+}}
+/* The hairline between two inactive tabs. Dropped next to the selected one,
+   because a line butting into the card's border reads as a smudge. */
+QTabBar#documentTabBar::tab:!selected:!next-selected {{
+    border-right: 1px solid {p.border};
+}}
+QTabBar#documentTabBar::tab:hover:!selected {{
+    background-color: {p.surface_hover};
+    color: {p.text};
+    border-right-color: transparent;
 }}
 QTabBar#documentTabBar::tab:selected {{
-    background-color: {p.surface};
+    background-color: {p.surface_raised};
+    border: 1px solid {p.border};
+    border-bottom: none;
+    color: {p.text};
+    font-weight: 600;
 }}
+/* The two strip controls. Transparent at rest is what browsers do and it keeps
+   the caption quiet, but both get a real fill and a radius under the pointer so
+   there is no doubt they are pressable, and both are the same size so they sit
+   on one line. */
 QToolButton#documentTabChevron {{
     background: transparent;
     border: none;
+    border-radius: 4px;
     color: {p.text_dim};
-    font-size: 13px;
+    font-size: 12px;
 }}
 QToolButton#documentTabChevron:hover {{
     background-color: {p.surface_hover};
     color: {p.text};
+}}
+QToolButton#documentTabChevron:pressed {{
+    background-color: {p.surface_active};
 }}
 QToolButton#documentTabChevron::menu-indicator {{ image: none; }}
 
