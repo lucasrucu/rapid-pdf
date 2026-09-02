@@ -203,10 +203,16 @@ def test_a_press_on_empty_bar_space_arms_nothing(qt_app, store, registry, tmp_pa
 # 2. Tearing off
 # ======================================================================
 
-def test_crossing_the_threshold_creates_a_window_with_the_document_intact(
+def test_crossing_the_threshold_creates_nothing_and_the_drop_creates_the_window(
         qt_app, store, registry, tmp_path):
-    """The window is made ON THE CROSSING, not on the drop, which is what makes
-    the drop a no-op. The document has to survive the reparent."""
+    """The window is made ON THE DROP now, not on the crossing.
+
+    Mid-drag NOTHING has moved: the document is still in the window it came
+    from, still in its tab, and the only new object on screen is a ghost. That
+    is what removes the destroy-inside-the-release-handler crash path. The
+    document still has to survive the reparent, so every check that used to run
+    mid-drag runs after the drop instead.
+    """
     window = _window(registry, tmp_path, ["a.pdf", "b.pdf", "c.pdf"])
     area = window.document_area()
     bar = area.bar()
@@ -218,68 +224,98 @@ def test_crossing_the_threshold_creates_a_window_with_the_document_intact(
     _press(bar, start)
     _move(bar, _below_bar(bar, start))
 
+    # Mid-drag: a ghost, and not one thing else.
     assert bar.tear_off().is_dragging()
-    torn = bar.tear_off().floating_window()
-    assert torn is not None and torn is not window
+    assert bar.tear_off().ghost() is not None
+    assert bar.tear_off().floating_window() is None
+    assert registry.count() == 1
+    assert area.count() == 3
+    assert moving.window() is window
+    area.check_invariant()
+
+    far = QPoint(3000, 2000)          # nowhere near any window
+    _move(bar, far)
+    _release(bar, far)
+
+    assert not bar.tear_off().is_dragging()
+    assert bar.tear_off().ghost() is None
     assert registry.count() == 2
+    assert area.count() == 2
+    torn = moving.window()
+    assert torn is not window
     assert torn.document_area().count() == 1
     assert torn.document_area().view_at(0) is moving
-    assert area.count() == 2
     area.check_invariant()
     torn.document_area().check_invariant()
 
-    # Finding 2, re-verified through the gesture rather than the menu item.
+    # The document survived the reparent. Same scene, same fitz doc, no native
+    # handle, and the undo stack is the WINDOW's, so it joins the torn one.
     assert canvas.scene() is scene
-    # The stack is the WINDOW's since phase 5, so a torn-off view joins the
-    # torn window's history rather than carrying its own across (ui/undo.py).
     assert canvas.undo_stack is torn.undo_stack()
     assert moving._doc.doc is doc
     assert canvas.internalWinId() == 0
-    assert moving.window() is torn
-
-    _release(bar, _below_bar(bar, start))
-    assert registry.count() == 2
-    assert not bar.tear_off().is_dragging()
 
 
-def test_the_torn_window_follows_the_cursor(qt_app, store, registry, tmp_path):
-    """The real window moves, which is the reason this is not a QDrag. The grab
-    point stays under the pointer, so the offset between them is constant."""
+def test_the_ghost_follows_the_cursor_with_no_clearance(
+        qt_app, store, registry, tmp_path):
+    """The grab point stays under the pointer, so the offset is constant AND
+    it is the grab offset alone.
+
+    The old floating window was held 46 px below the cursor so it would not
+    cover the strip its own drop feedback was painted on. The ghost needs no
+    such dodge: it is tab-sized and the OS hit test passes through it. So the
+    thing being dragged is finally where the pointer is, which is the first of
+    the four symptoms this rewrite was for.
+    """
     window = _window(registry, tmp_path, ["a.pdf", "b.pdf"])
     bar = window.document_area().bar()
+    tear = bar.tear_off()
     start = _tab_point(bar, 0)
 
     _press(bar, start)
     first = _below_bar(bar, start)
     _move(bar, first)
-    torn = bar.tear_off().floating_window()
-    offset = first - torn.frameGeometry().topLeft()
+    ghost = tear.ghost()
+    assert ghost is not None
+    offset = first - tear.ghost_position(first)
 
-    _move(bar, first + QPoint(300, 220))
-    assert (first + QPoint(300, 220)) - torn.frameGeometry().topLeft() == offset
-    _release(bar, first + QPoint(300, 220))
+    moved = first + QPoint(300, 220)
+    _move(bar, moved)
+    assert moved - tear.ghost_position(moved) == offset
+
+    # No downward clearance: the ghost sits at the cursor less the grab point,
+    # and nothing else is added to it.
+    assert tear.ghost_position(moved).y() <= moved.y()
+    _release(bar, moved)
 
 
-def test_dropping_on_empty_desktop_leaves_the_window_where_it_was_let_go(
+def test_dropping_on_empty_desktop_makes_the_window_where_it_was_let_go(
         qt_app, store, registry, tmp_path):
-    """No target is not a failure. The window is already exactly where they
-    dropped it, which is what creating it up front buys."""
+    """No target means make one, at the point the button came up.
+
+    The old design got this for free by creating the window on the crossing.
+    The new one has to place it deliberately, and the guarantee the user cares
+    about is unchanged: the window appears where they let go, not at a corner.
+    """
     window = _window(registry, tmp_path, ["a.pdf", "b.pdf"], at=(100, 100))
     bar = window.document_area().bar()
+    tear = bar.tear_off()
+    moving = window.document_area().view_at(0)
     start = _tab_point(bar, 0)
 
     _press(bar, start)
     _move(bar, _below_bar(bar, start))
-    torn = bar.tear_off().floating_window()
     far = QPoint(3000, 2000)          # nowhere near any window
     _move(bar, far)
-    assert bar.tear_off().drop_target() is None
-    where = torn.frameGeometry().topLeft()
+    assert tear.drop_target() is None
+    expected = tear.ghost_position(far)
     _release(bar, far)
 
     assert registry.count() == 2
-    assert torn.frameGeometry().topLeft() == where
+    torn = moving.window()
+    assert torn is not window
     assert torn.document_area().count() == 1
+    assert torn.pos() == expected
 
 
 # ======================================================================
@@ -428,45 +464,60 @@ def test_going_back_up_to_the_source_bar_still_re_docks(qt_app, store, registry,
     assert moving.window() is source
 
 
-def test_the_floating_window_is_held_clear_of_the_drop_feedback(
+def test_the_ghost_is_small_enough_not_to_hide_the_drop_feedback(
         qt_app, store, registry, tmp_path):
-    """It used to sit exactly under the cursor, covering the strip the insertion
-    line and the highlight are painted on. It is held below the cursor now."""
-    from ui.tab_tear_off import DROP_CLEARANCE
+    """The reason the old window needed a 46 px dodge, removed at the source.
 
+    A window-sized object under the cursor covers the strip the insertion line
+    and the highlight are painted on, so it had to be pushed out of the way. A
+    ghost is one tab wide and one tab tall, so it cannot swallow a strip and
+    the clearance constant is gone.
+    """
     source = _window(registry, tmp_path, ["a.pdf", "b.pdf"], at=(100, 100))
     other = _window(registry, tmp_path, ["x.pdf"], at=(2000, 100))
     bar = source.document_area().bar()
+    other_bar = other.document_area().bar()
 
     start = _tab_point(bar, 0)
     _press(bar, start)
     _move(bar, _below_bar(bar, start))
-    over = _tab_point(other.document_area().bar(), 0)
+    over = _tab_point(other_bar, 0)
     _move(bar, over)
 
-    torn = bar.tear_off().floating_window()
-    assert torn.frameGeometry().top() > over.y()
-    assert torn.frameGeometry().top() - over.y() >= DROP_CLEARANCE - \
-        torn.document_area().header().height()
+    ghost = bar.tear_off().ghost()
+    assert ghost is not None
+    # No taller than the tab it is a picture of, so the target strip below the
+    # cursor is never covered by it.
+    assert ghost.height() <= bar.tabRect(0).height() + 2
+    assert bar.tear_off().drop_target() is not None
     _release(bar, over)
 
 
-def test_the_floating_window_is_never_its_own_drop_target(
-        qt_app, store, registry, tmp_path):
-    """`QApplication.widgetAt()` would answer with the window being dragged
-    every single time, which is why the hit-test walks the registry instead."""
+def test_the_ghost_is_never_a_drop_target(qt_app, store, registry, tmp_path):
+    """The ghost is not in the registry and is transparent to the OS hit test.
+
+    This is what makes cursor-based targeting possible at all. The old
+    objection to `QApplication.topLevelAt` was that it answered with the window
+    being dragged every time; a ghost carrying WindowTransparentForInput is
+    invisible to it, so the answer is the window underneath.
+    """
     window = _window(registry, tmp_path, ["a.pdf", "b.pdf"])
     bar = window.document_area().bar()
+    tear = bar.tear_off()
     start = _tab_point(bar, 0)
 
     _press(bar, start)
     _move(bar, _below_bar(bar, start))
-    torn = bar.tear_off().floating_window()
-    # Straight onto the floating window's own tab bar.
-    onto_itself = _tab_point(torn.document_area().bar(), 0)
-    _move(bar, onto_itself)
-    assert bar.tear_off().drop_target() is None
-    _release(bar, onto_itself)
+    ghost = tear.ghost()
+    assert ghost is not None
+    assert ghost.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+    assert bool(ghost.windowFlags() & Qt.WindowType.WindowTransparentForInput)
+    assert ghost not in list(registry.windows())
+
+    far = QPoint(3000, 2000)
+    _move(bar, far)
+    assert tear.drop_target() is None
+    _release(bar, far)
     assert registry.count() == 2
 
 
@@ -501,8 +552,15 @@ def test_insertion_index_picks_the_half_the_cursor_is_in(qt_app, store, registry
 # 4. Escape
 # ======================================================================
 
-def test_escape_re_docks_at_the_original_index(qt_app, store, registry, tmp_path):
-    """Back where it came from, at the number it came from, not appended."""
+def test_escape_leaves_everything_exactly_where_it_was(
+        qt_app, store, registry, tmp_path):
+    """There is nothing to undo, and that is the point.
+
+    Escape used to reverse a window that had already been created and a view
+    that had already been reparented. Nothing leaves its window until the drop
+    now, so a cancel is the ghost going away. The observable guarantee is the
+    same and strictly harder: not "put back at index 1" but "never moved".
+    """
     window = _window(registry, tmp_path, ["a.pdf", "b.pdf", "c.pdf"])
     area = window.document_area()
     bar = area.bar()
@@ -511,11 +569,13 @@ def test_escape_re_docks_at_the_original_index(qt_app, store, registry, tmp_path
     start = _tab_point(bar, 1)
     _press(bar, start)
     _move(bar, _below_bar(bar, start))
-    assert registry.count() == 2
+    assert registry.count() == 1          # nothing was created
+    assert area.index_of(moving) == 1     # and nothing moved
 
     _escape(bar)
 
     assert not bar.tear_off().is_dragging()
+    assert bar.tear_off().ghost() is None
     assert area.count() == 3
     assert area.index_of(moving) == 1
     assert moving.window() is window
@@ -550,14 +610,19 @@ def test_a_lone_tab_drags_its_own_window_and_spawns_nothing(
     _move(bar, _below_bar(bar, start))
 
     assert bar.tear_off().is_dragging()
-    assert bar.tear_off().floating_window() is window
+    assert bar.tear_off().ghost() is not None
     assert registry.count() == 1
 
-    _move(bar, _below_bar(bar, start) + QPoint(400, 300))
-    _release(bar, _below_bar(bar, start) + QPoint(400, 300))
+    drop = _below_bar(bar, start) + QPoint(400, 300)
+    _move(bar, drop)
+    expected = bar.tear_off().ghost_position(drop)
+    _release(bar, drop)
 
+    # Still one window, still one document, and the window has gone to the
+    # point it was let go at rather than a second one being made.
     assert registry.count() == 1
     assert area.count() == 1
+    assert window.pos() == expected
     area.check_invariant()
 
 
@@ -595,7 +660,11 @@ def test_escape_on_a_lone_tab_puts_the_window_back(qt_app, store, registry,
     start = _tab_point(bar, 0)
     _press(bar, start)
     _move(bar, _below_bar(bar, start) + QPoint(500, 400))
-    assert window.frameGeometry().topLeft() != home
+    # It does not move DURING the drag any more: the ghost does the moving and
+    # the window only follows on the drop. So the escape guarantee gets
+    # stronger, from "put back" to "never left".
+    assert window.frameGeometry().topLeft() == home
+    assert bar.tear_off().ghost() is not None
 
     _escape(bar)
 

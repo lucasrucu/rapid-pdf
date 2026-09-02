@@ -7,48 +7,43 @@ existing window, `MainWindow.move_view_to_new_window` for a drop on empty
 desktop, `DocumentArea.adopt` / `detach` under both. Nothing in here moves a
 document itself. It decides WHEN and WHERE, and calls phase 3.
 
-MANUAL MOUSE TRACKING, NOT QDrag. Three reasons, and the third is what settles
-it:
+A GHOST FOLLOWS THE CURSOR, AND THE WINDOW IS CREATED ON THE DROP.
 
-  1. QDrag follows the cursor with a static pixmap. We want the real window
-     following the cursor, because then the drop is a no-op and "the drop
-     failed, where did my document go" stops being a class of bug.
-  2. `QDrag.target()` is None on a rejected drop and carries no position, so
-     "dropped on empty desktop, make a window" and "drop refused" are the same
-     answer.
-  3. On Windows `QDrag::exec()` BLOCKS THE EVENT LOOP for the length of the
-     drag, which is exactly the wrong place to be creating a window and moving
-     it every few milliseconds.
+That ordering is the whole design and it is a reversal of the first one, which
+created the real window on the crossing and moved it under the cursor for the
+length of the drag. Four separate complaints came out of that: the window had
+to be held 46 px below the pointer so it would not cover its own drop feedback;
+steering it meant steering a window rather than a cursor; it arrived with a DWM
+shadow that popped in and out; and it had to be destroyed inside the release
+handler, which is the likeliest source of a 0xc000041d process kill. See
+`_DragGhost`.
 
-It also means the tab drag never enters Qt's drag-and-drop system at all, so it
-cannot be confused with the page drag (`QDrag`, item-model mime) or an OS file
-drop (`text/uri-list`). The three gestures in the plan's table stay separate by
-construction rather than by a guard anyone has to remember to write.
+STILL NOT QDrag, but for one reason rather than three. Two of the three
+originally given here do not survive checking: `QDrag.exec()` does not block the
+event loop, it runs a nested modal loop in which painting and timers still run,
+and its static-pixmap behaviour is exactly what is wanted rather than a problem.
+The reason that holds is separation: `DocumentView` already accepts a page drag
+and an OS `text/uri-list` file drop, and keeping the tab gesture out of Qt's
+drag system entirely means those three can never be confused for one another.
 
 THE SHAPE OF ONE GESTURE.
 
   press     record the position and the tab under it, then let QTabBar have the
             event so its own reorder and current-tab change still work.
   threshold DETACH_MARGIN px BEYOND the bar VERTICALLY, plus Qt's own
-            `startDragDistance`. The vertical part is the whole point: a sloppy
-            horizontal reorder must never become a tear, and horizontal
-            overshoot past the last tab is not a tear either.
-  crossing  grab the mouse (so moves keep arriving once the cursor has left the
-            bar), create the real window, and from here on just `move()` it.
-            The grab stays on the SOURCE bar for the whole gesture. Handing it
-            to the new window is the obvious alternative and is far harder to
-            reason about and to test.
-  release   `releaseMouse()` FIRST, always. A target means adopt at the index
-            under the cursor and let the emptied floating window close itself.
-            No target means there is nothing to do.
-  escape    re-dock into the source window at the index it came from.
+            `startDragDistance`. Sideways travel never counts, which is also
+            what Chromium does. Coming back costs only DOCK_MARGIN, and that
+            asymmetry is the hysteresis that stops the state flapping.
+  crossing  grab the mouse and show a picture of the tab. NOTHING MOVES.
+  release   `releaseMouse()` FIRST, always. Then, and only then: adopt into the
+            window under the cursor, or create a new one.
+  escape    nothing to undo, because nothing left.
 
-HIT-TESTING IS DONE AGAINST THE REGISTRY, NOT AGAINST Qt. Neither
-`QApplication.widgetAt()` nor `topLevelAt()` is usable here: both return the
-floating window that is under the cursor by definition, and both round-trip to
-the OS. So the windows are walked in activation order, the floating one and
-anything minimised or hidden are skipped, and the global position is mapped
-into each tab bar directly.
+HIT-TESTING ASKS THE OS FIRST. `QApplication.topLevelAt` gives true z-order,
+and the ghost is invisible to it because of `WindowTransparentForInput`. The
+registry is still walked, in activation order, as the tie-break and the
+fallback. The old objection to `topLevelAt`, that it always returned the window
+being dragged, died with the window being dragged.
 
 THE SINGLE-TAB CASE. A window with one tab drags ITSELF rather than spawning a
 second window. Without that you tear the only document out of a window, close
@@ -60,14 +55,21 @@ is disabled at one tab for the same reason.
 from __future__ import annotations
 
 from PySide6.QtCore import QPoint, QPointF, QRect, Qt
-from PySide6.QtGui import QGuiApplication, QMouseEvent
-from PySide6.QtWidgets import QApplication, QTabBar
+from PySide6.QtGui import QGuiApplication, QMouseEvent, QPainter
+from PySide6.QtWidgets import QApplication, QTabBar, QWidget
 
 from ui.window_registry import WindowRegistry
 
 # How far past the top or bottom edge of the bar the cursor has to go before a
 # reorder becomes a tear. Sideways travel never counts, however far it goes.
-DETACH_MARGIN = 28
+#
+# TWO NUMBERS, NOT ONE, AND THAT IS THE HYSTERESIS. Leaving costs 40 px and
+# coming back costs 18 (DOCK_MARGIN below), so the gesture does not flutter
+# between torn and docked while the cursor sits on the boundary. Chromium does
+# the same thing with the same asymmetry; its own vertical figure is SLACK THAT
+# KEEPS YOU ATTACHED rather than a distance that detaches you, and it has no
+# horizontal detach at all, which is why sideways travel is ignored here too.
+DETACH_MARGIN = 40
 
 # How far above and below a target bar still counts as "on" it. A tab bar is
 # about 30 px tall and the cursor is holding a whole window, so the band people
@@ -80,24 +82,65 @@ DETACH_MARGIN = 28
 # was sitting on top of, that you had to find before a drop would land. Everyone
 # who missed it got a second window on the desktop instead of a docked tab, and
 # nothing on screen had said why.
-DOCK_MARGIN = 12
+DOCK_MARGIN = 18
 
-# How far BELOW the cursor the floating window is held for the length of the
-# drag.
-#
-# It used to be held exactly under the cursor, with the grabbed tab beneath the
-# pointer where it was picked up. That is the right feel and it hides the one
-# thing the user needs to see: the cursor is on the target window tab strip,
-# which is precisely the strip the floating window is now covering, so the
-# insertion line and the highlight are drawn underneath a window and never
-# reach an eye. Dropping the window down by more than a title bar height
-# leaves the row under the cursor clear.
-#
-# It applies to the single-tab case too, where the window being dragged is the
-# source itself. That costs a visible step down at the moment the tear starts,
-# and it buys the same feedback in the case where a window with one document is
-# being merged into another, which is a gesture people do on purpose.
-DROP_CLEARANCE = 46
+# How solid the ghost is. Enough to read the tab's own title through, little
+# enough that the strip and the insertion line underneath stay legible, which
+# is the job the old downward offset was doing badly.
+GHOST_OPACITY = 0.78
+
+
+class _DragGhost(QWidget):
+    """A picture of the tab, following the cursor. Not a window in any sense
+    the user or the window manager cares about.
+
+    IT REPLACES A REAL WINDOW, and that is the whole change in this file.
+
+    What used to happen: crossing the threshold created the actual top-level
+    MainWindow and then move()d it under the cursor for the rest of the drag.
+    Four separate complaints came out of that one decision.
+
+      The window is enormous next to a cursor, so it had to be pushed 46 px
+      DOWN to stop it covering the strip its own drop feedback was painted on.
+      What you were dragging was therefore never under your pointer.
+
+      Because it is window-sized, getting the CURSOR onto a target meant
+      steering a whole window there. Every browser does the opposite: the
+      cursor picks the target and the dragged thing follows it.
+
+      A real top-level gets Mica and a DWM drop shadow the instant it appears,
+      which is the shading that "pops" on and off mid-gesture.
+
+      And creating a window on press meant DESTROYING one on release, inside
+      the release handler, which is the most likely source of the 0xc000041d
+      crash: Windows re-enters the app's native event hook while the widget is
+      half-dead. No window is created or destroyed while the button is down
+      any more, so that path is simply gone.
+
+    WS_EX_TRANSPARENT IS THE LOAD-BEARING FLAG. Qt.WindowTransparentForInput
+    maps to it, and it is what makes the OS hit test look straight THROUGH the
+    ghost. Without it `topLevelAt(cursor)` answers "the ghost" every time and
+    cursor-based targeting cannot work at all.
+    """
+
+    def __init__(self, pixmap):
+        super().__init__(
+            None,
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.WindowTransparentForInput
+            | Qt.WindowType.NoDropShadowWindowHint,
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setWindowOpacity(GHOST_OPACITY)
+        self._pixmap = pixmap
+        self.resize(pixmap.size() / max(1.0, pixmap.devicePixelRatio()))
+
+    def paintEvent(self, event):
+        QPainter(self).drawPixmap(0, 0, self._pixmap)
 
 
 def insertion_index(bar: QTabBar, local: QPoint) -> int:
@@ -150,12 +193,12 @@ class TabTearOff:
         self._press_index = -1
         self._grab_in_tab = QPoint()  # where in the tab the cursor took hold
         self._view = None
-        self._floating = None         # the window following the cursor
+        self._ghost = None            # the picture following the cursor
         self._source_window = None
         self._source_index = -1
         self._source_pos = QPoint()
         self._whole_window = False    # single-tab case: floating IS the source
-        self._offset = QPoint()       # cursor position inside the floating window
+        self._offset = QPoint()       # where in the tab the cursor took hold
         self._target = None           # (window, insertion index) under the cursor
         self._start_dpr = 1.0
 
@@ -164,9 +207,14 @@ class TabTearOff:
         paintEvent, which must not draw an insertion line into itself."""
         return self._dragging
 
+    def ghost(self):
+        """The picture currently following the cursor, or None. For the tests."""
+        return self._ghost
+
     def floating_window(self):
-        """The window currently following the cursor, or None."""
-        return self._floating
+        """Kept for callers that predate the ghost. There is no longer a window
+        following the cursor, so this is always None while dragging."""
+        return None
 
     def drop_target(self):
         """(window, index) under the cursor, or None. For the tests."""
@@ -262,14 +310,24 @@ class TabTearOff:
     # ------------------------------------------------------------------
 
     def _begin(self, global_pos: QPoint) -> bool:
-        """Take the mouse and put the real window on screen.
+        """Take the mouse and put a GHOST on screen. Create nothing else.
 
-        The window is created HERE, on the crossing, not on the drop. What the
-        user sees for the rest of the gesture is the result rather than a
-        preview of it, and `move_view_to_new_window` already builds it in the
-        order the reparent depends on (create, size, position, show, and only
-        then move the view across), so this passes it a geometry instead of
-        writing a second copy of that sequence.
+        NOTHING IS MOVED HERE ANY MORE. The document stays in the window it
+        came from for the whole gesture, and the only thing that appears is a
+        picture of the tab under the cursor. Where it ends up is decided on
+        release, by `_finish`, which is the one place a window is created.
+
+        That ordering is what the four reported symptoms all came down to. See
+        `_DragGhost` for the full account; the short version is that a real
+        window is the wrong size to hold under a pointer, brings its own
+        shadow, and has to be destroyed inside the release handler.
+
+        The cost, and it is worth naming: the source strip does not close up
+        while you drag, the way Edge's does. The tab stays in place and the
+        ghost is the thing that moves. That is a cosmetic gap rather than a
+        broken gesture, and closing it means detaching the view on the crossing
+        and holding it parentless, which is the class of thing this rewrite
+        exists to stop doing.
         """
         bar = self._bar
         area = self._area
@@ -293,21 +351,16 @@ class TabTearOff:
         self._source_index = index
         self._source_pos = source.pos()
         self._start_dpr = _device_pixel_ratio(global_pos, source)
+        self._whole_window = area.count() == 1
         self._dragging = True
         self._grab_input()
         try:
-            if area.count() == 1:
-                # One tab: drag the window itself. Tearing the only document
-                # out and closing the window behind it hands back the window
-                # you started with, minus its size and position.
-                self._whole_window = True
-                self._floating = source
-            else:
-                self._floating = source.move_view_to_new_window(
-                    view, geometry=QRect(source.pos(), source.size()))
-                if self._floating is None:
-                    raise RuntimeError("the new window was not created")
-            self._offset = self._offset_in_floating()
+            self._ghost = _DragGhost(bar.grab(bar.tabRect(index)))
+            # The hotspot is where in the tab the cursor took hold, so the
+            # ghost sits under the pointer exactly where the real tab was.
+            self._offset = QPoint(self._grab_in_tab)
+            self._ghost.move(self.ghost_position(global_pos))
+            self._ghost.show()
         except Exception:
             self._abort()
             raise
@@ -326,43 +379,25 @@ class TabTearOff:
             Qt.KeyboardModifier.NoModifier)
         QTabBar.mouseReleaseEvent(self._bar, event)
 
-    def _offset_in_floating(self) -> QPoint:
-        """Where inside the floating window the cursor should sit.
-
-        The same offset it took hold of the tab at, so the tab stays under the
-        pointer rather than jumping to a corner the moment the window appears.
-        Computed once: the tab can be re-laid-out during the drag and a
-        recomputed offset would make the window twitch.
-
-        Measured against `frameGeometry()`, NOT against the widget origin,
-        because `move()` positions the frame. Use the client origin and every
-        step of the drag is out by the title bar and the border.
-        """
-        area = self._floating.document_area()
-        bar = area.bar()
-        index = area.index_of(self._view)
-        rect = bar.tabRect(max(0, index))
-        local = rect.topLeft() + self._grab_in_tab
-        return bar.mapToGlobal(local) - self._floating.frameGeometry().topLeft()
-
     # ------------------------------------------------------------------
     # Tracking
     # ------------------------------------------------------------------
 
     def _track(self, global_pos: QPoint):
-        if self._floating is None:
+        if self._ghost is None:
             return
-        self._floating.move(self.floating_position(global_pos))
+        self._ghost.move(self.ghost_position(global_pos))
         self._set_target(self._hit_test(global_pos))
 
-    def floating_position(self, global_pos: QPoint) -> QPoint:
-        """Where the floating window frame sits for a cursor at `global_pos`.
+    def ghost_position(self, global_pos: QPoint) -> QPoint:
+        """Where the ghost sits for a cursor at `global_pos`.
 
-        The grab offset, plus the clearance that keeps the window off the row
-        the drop feedback is painted on. Split out so the tests can assert the
-        clearance without a real pointer. See DROP_CLEARANCE.
+        The grab offset and nothing else. There is no downward clearance any
+        more: the ghost is a tab-sized picture that the OS hit test passes
+        straight through, so it cannot hide the strip underneath it and does
+        not need to be pushed out of the way of its own feedback.
         """
-        return global_pos - self._offset + QPoint(0, DROP_CLEARANCE)
+        return global_pos - self._offset
 
     def _hit_test(self, global_pos: QPoint):
         """The (window, insertion index) under the cursor, or None.
@@ -393,10 +428,19 @@ class TabTearOff:
         the cursor, which is the same order Windows would pick and the reason
         the registry is walked rather than the geometry being sorted.
         """
-        floating = self._floating
-        for window in WindowRegistry.instance().windows():
-            if window is floating:
-                continue
+        # The cursor decides, and the OS is asked first. `topLevelAt` returns
+        # true z-order, which the registry's activation order can only
+        # approximate, and the ghost is invisible to it because of
+        # WindowTransparentForInput. That was the objection to using it before:
+        # the dragged thing was a real window sitting under the cursor, so the
+        # answer was always itself. There is no such window now.
+        under = QApplication.topLevelAt(global_pos)
+        ordered = list(WindowRegistry.instance().windows())
+        if under is not None and under in ordered:
+            ordered.remove(under)
+            ordered.insert(0, under)
+
+        for window in ordered:
             if not window.isVisible() or window.isMinimized():
                 continue
             if not hasattr(window, "document_area"):
@@ -471,42 +515,69 @@ class TabTearOff:
         """
         self._release_input()
         target = self._target
-        floating = self._floating
         view = self._view
+        source = self._source_window
         try:
             self._clear_indicator()
-            if target is not None and target[0] is not floating:
+            self._hide_ghost()
+            if target is not None:
                 window, index = target
-                # Phase 3's move, index and all. The floating window is left
-                # holding nothing and closes itself from inside it.
-                floating.move_view_to_window(view, window, index)
-                window.activate_view(view)
-            # No target is not a failure. The window is already exactly where
-            # they let go of it, which is the whole payoff of creating it on
-            # the crossing rather than on the drop.
+                if window is source:
+                    # Back where it started, or somewhere else in the same
+                    # strip. Nothing to move between windows; let the bar put
+                    # it at the index the cursor was over.
+                    landing = min(max(0, index), self._bar.count() - 1)
+                    if landing != self._source_index:
+                        self._bar.moveTab(self._source_index, landing)
+                else:
+                    source.move_view_to_window(view, window, index)
+                    window.activate_view(view)
+            elif self._whole_window:
+                # The only document in the window. There is no second window to
+                # make: the gesture just repositions the one it came from.
+                source.move(global_pos - self._offset)
+            else:
+                # THE ONLY PLACE A WINDOW IS CREATED, and it happens with the
+                # button already up and the ghost already gone.
+                source.move_view_to_new_window(
+                    view, geometry=QRect(global_pos - self._offset,
+                                         source.size()))
             self._settle_dpi(global_pos, view)
         finally:
             self._reset()
 
     def _cancel(self):
-        """Escape. Put it back where it came from, at the index it came from."""
+        """Escape. Nothing moved, so nothing has to be put back.
+
+        This used to undo a window that had already been created and a view
+        that had already been reparented. Now the document never left, so a
+        cancel is the ghost disappearing and the grabs coming back.
+        """
         self._release_input()
-        floating = self._floating
         try:
             self._clear_indicator()
-            if self._whole_window:
-                if floating is not None:
-                    floating.move(self._source_pos)
-            elif floating is not None and self._source_window is not None:
-                floating.move_view_to_window(
-                    self._view, self._source_window, self._source_index)
-                self._source_window.activate_view(self._view)
+            self._hide_ghost()
         finally:
             self._reset()
+
+    def _hide_ghost(self):
+        """Take the ghost off screen. Deleted on the next event loop pass
+        rather than here: this runs inside a mouse handler, and destroying a
+        top-level widget from inside one is the shape of the crash this
+        rewrite removed."""
+        ghost = self._ghost
+        if ghost is None:
+            return
+        try:
+            ghost.hide()
+            ghost.deleteLater()
+        except RuntimeError:                     # pragma: no cover - defensive
+            pass
 
     def _abort(self):
         """A failure part way through starting. Give the input back and forget."""
         self._release_input()
+        self._hide_ghost()
         self._reset()
 
     def _grab_input(self):
@@ -541,7 +612,7 @@ class TabTearOff:
         """
         if view is None or not hasattr(view, "rerender_for_screen_change"):
             return
-        if abs(_device_pixel_ratio(global_pos, self._floating)
+        if abs(_device_pixel_ratio(global_pos, self._source_window)
                - self._start_dpr) < 1e-3:
             return
         view.rerender_for_screen_change()

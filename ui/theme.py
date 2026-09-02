@@ -468,7 +468,7 @@ QTabBar#documentTabBar {{
 }}
 QTabBar#documentTabBar::tab {{
     background: transparent;
-    color: {p.text_dim};
+    color: {p.text_faint};
     border: 1px solid transparent;
     border-bottom: none;
     border-top-left-radius: 8px;
@@ -488,8 +488,8 @@ QTabBar#documentTabBar::tab:hover:!selected {{
     border-right-color: transparent;
 }}
 QTabBar#documentTabBar::tab:selected {{
-    background-color: {p.surface_raised};
-    border: 1px solid {p.border};
+    background-color: {p.surface_hover};
+    border: 1px solid {p.border_strong};
     border-bottom: none;
     color: {p.text};
     font-weight: 600;

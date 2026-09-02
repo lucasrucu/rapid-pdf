@@ -1,3 +1,5 @@
+import os
+import pathlib
 import sys
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QIcon
@@ -15,7 +17,51 @@ from core.single_instance import (
 )
 
 
+def _install_crash_guard():
+    """Turn a Python exception inside a Qt handler into a traceback instead of
+    a dead process.
+
+    WHY THIS IS NOT DECORATION. On Windows, an exception that escapes a Qt
+    virtual method escapes into the native window procedure that called it, and
+    the OS kills the process with STATUS_FATAL_USER_CALLBACK_EXCEPTION,
+    0xc000041d. No traceback, no dialog, no exit code worth reading: the window
+    simply vanishes. That is exactly what happened to a user dropping a dragged
+    tab, and the only reason the cause was findable at all is that Windows had
+    logged the exception code to the Application event log.
+
+    An excepthook cannot stop the unwinding, so this does not make the app
+    fault tolerant. What it does is make the NEXT one diagnosable, by getting
+    the traceback onto stderr and into a file before the process goes. That is
+    the difference between a report that says "it closed" and one that names a
+    line.
+    """
+    import traceback
+    from datetime import datetime, timezone
+
+    folder = pathlib.Path(os.environ.get("LOCALAPPDATA", ".")) / "Rapid PDF"
+    previous = sys.excepthook
+
+    def hook(kind, value, tb):
+        text = "".join(traceback.format_exception(kind, value, tb))
+        try:
+            sys.stderr.write(text)
+            sys.stderr.flush()
+        except Exception:                        # pragma: no cover - defensive
+            pass
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            with open(folder / "crash.log", "a", encoding="utf-8") as handle:
+                handle.write(f"\n===== {stamp} =====\n{text}")
+        except Exception:                        # pragma: no cover - defensive
+            pass
+        previous(kind, value, tb)
+
+    sys.excepthook = hook
+
+
 def main():
+    _install_crash_guard()
     files, combine = parse_cli(sys.argv)
 
     # The QApplication must exist BEFORE forwarding: QLocalSocket's async
