@@ -189,6 +189,19 @@ def build_qss(p: Palette) -> str:
 
     Solid fills only. No gradient function may appear here (tested).
     """
+    # THE TAB STRIP IS THE ONE PLACE THE RAMP HAS TO BE READ IN BOTH
+    # DIRECTIONS, and getting it wrong once is what produced a light theme
+    # where the ACTIVE tab looked greyed out and the inactive ones looked live.
+    #
+    # The rule every browser follows: the active tab is the surface CLOSEST to
+    # the content, and the strip it sits in is one step further away. In a dark
+    # theme "further away" means darker, so the strip is `window` and the tab
+    # lifts above it. In a light theme it means DARKER TOO, so the strip has to
+    # step DOWN to surface_raised and the tab sits at `window`, the lightest
+    # value in the palette. Using one pair for both themes inverts one of them,
+    # which is exactly what happened.
+    strip_bg = p.window if p.is_dark else p.surface_raised
+    tab_active_bg = p.surface_hover if p.is_dark else p.window
     return f"""
 /* ---- base ---------------------------------------------------------- */
 QMainWindow, QWidget {{
@@ -417,7 +430,7 @@ QTabBar::tab:hover:!selected {{ color: {p.text_dim}; }}
    own hover and press states (Windows' metrics, and Windows' close red), so
    nothing here may give them a background. */
 #windowTitleBar {{
-    background-color: {p.window};
+    background-color: {strip_bg};
 }}
 #windowChrome {{
     background-color: {p.window};
@@ -488,7 +501,7 @@ QTabBar#documentTabBar::tab:hover:!selected {{
     border-right-color: transparent;
 }}
 QTabBar#documentTabBar::tab:selected {{
-    background-color: {p.surface_hover};
+    background-color: {tab_active_bg};
     border: 1px solid {p.border_strong};
     border-bottom: none;
     color: {p.text};

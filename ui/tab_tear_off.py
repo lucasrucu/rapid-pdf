@@ -355,12 +355,24 @@ class TabTearOff:
         self._dragging = True
         self._grab_input()
         try:
-            self._ghost = _DragGhost(bar.grab(bar.tabRect(index)))
-            # The hotspot is where in the tab the cursor took hold, so the
-            # ghost sits under the pointer exactly where the real tab was.
-            self._offset = QPoint(self._grab_in_tab)
-            self._ghost.move(self.ghost_position(global_pos))
-            self._ghost.show()
+            if self._whole_window:
+                # ONE TAB: DRAG THE WINDOW ITSELF, LIVE. There is no second
+                # window to make and nothing to preview, so a ghost would be a
+                # picture of a tab floating over the window it never left. His
+                # words: "if one tab only exists in one window, it shouldnt
+                # move, me dragging the tab should move the window".
+                #
+                # This is the one case the create-on-drop rule does not apply
+                # to, and it is safe for the same reason: no window is created
+                # or destroyed. An existing one is moved.
+                self._offset = global_pos - source.frameGeometry().topLeft()
+            else:
+                self._ghost = _DragGhost(bar.grab(bar.tabRect(index)))
+                # The hotspot is where in the tab the cursor took hold, so the
+                # ghost sits under the pointer exactly where the real tab was.
+                self._offset = QPoint(self._grab_in_tab)
+                self._ghost.move(self.ghost_position(global_pos))
+                self._ghost.show()
         except Exception:
             self._abort()
             raise
@@ -384,9 +396,13 @@ class TabTearOff:
     # ------------------------------------------------------------------
 
     def _track(self, global_pos: QPoint):
-        if self._ghost is None:
+        if self._whole_window:
+            if self._source_window is not None:
+                self._source_window.move(self.ghost_position(global_pos))
+        elif self._ghost is not None:
+            self._ghost.move(self.ghost_position(global_pos))
+        else:
             return
-        self._ghost.move(self.ghost_position(global_pos))
         self._set_target(self._hit_test(global_pos))
 
     def ghost_position(self, global_pos: QPoint) -> QPoint:
@@ -533,9 +549,9 @@ class TabTearOff:
                     source.move_view_to_window(view, window, index)
                     window.activate_view(view)
             elif self._whole_window:
-                # The only document in the window. There is no second window to
-                # make: the gesture just repositions the one it came from.
-                source.move(global_pos - self._offset)
+                # Already exactly where they let go of it: the window has been
+                # following the cursor for the whole gesture. Nothing to do.
+                pass
             else:
                 # THE ONLY PLACE A WINDOW IS CREATED, and it happens with the
                 # button already up and the ghost already gone.
@@ -557,6 +573,10 @@ class TabTearOff:
         try:
             self._clear_indicator()
             self._hide_ghost()
+            if self._whole_window and self._source_window is not None:
+                # The one thing a cancel still has to undo, because it is the
+                # one thing that moved.
+                self._source_window.move(self._source_pos)
         finally:
             self._reset()
 

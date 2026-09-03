@@ -609,17 +609,20 @@ def test_a_lone_tab_drags_its_own_window_and_spawns_nothing(
     _press(bar, start)
     _move(bar, _below_bar(bar, start))
 
+    # A lone tab drags the WINDOW, live, and makes no ghost. There is no second
+    # window to preview, so a picture of a tab floating over the window it never
+    # left would be a lie about what is happening.
     assert bar.tear_off().is_dragging()
-    assert bar.tear_off().ghost() is not None
+    assert bar.tear_off().ghost() is None
     assert registry.count() == 1
 
     drop = _below_bar(bar, start) + QPoint(400, 300)
     _move(bar, drop)
     expected = bar.tear_off().ghost_position(drop)
+    # It has ALREADY moved, before the button comes up.
+    assert window.pos() == expected
     _release(bar, drop)
 
-    # Still one window, still one document, and the window has gone to the
-    # point it was let go at rather than a second one being made.
     assert registry.count() == 1
     assert area.count() == 1
     assert window.pos() == expected
@@ -659,12 +662,16 @@ def test_escape_on_a_lone_tab_puts_the_window_back(qt_app, store, registry,
 
     start = _tab_point(bar, 0)
     _press(bar, start)
+    # TWO moves, and the second one is the point. The first crosses the
+    # threshold and takes the grab offset from wherever the window already is,
+    # which is what stops it jumping under the cursor the instant a drag
+    # begins; only travel AFTER that displaces it.
+    _move(bar, _below_bar(bar, start))
     _move(bar, _below_bar(bar, start) + QPoint(500, 400))
-    # It does not move DURING the drag any more: the ghost does the moving and
-    # the window only follows on the drop. So the escape guarantee gets
-    # stronger, from "put back" to "never left".
-    assert window.frameGeometry().topLeft() == home
-    assert bar.tear_off().ghost() is not None
+    # The window itself is what moves in the lone-tab case, so escape has
+    # something real to undo here, unlike every other cancel path.
+    assert window.frameGeometry().topLeft() != home
+    assert bar.tear_off().ghost() is None
 
     _escape(bar)
 
