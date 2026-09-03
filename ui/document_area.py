@@ -91,7 +91,12 @@ TAB_STRIP_RESERVE = 330
 # either one alone: it is the only surface the double-click-to-open-a-tab
 # gesture has left now that the bar hugs its tabs, and it is the gap a browser
 # leaves between the last tab and the plus button.
-TRAILING_SLACK = 28
+#
+# IT WAS 28 AND THAT READ AS "FAR AWAY". Chrome and Edge leave about eight
+# pixels, and at 28 the plus looked detached from the strip it belongs to,
+# which was the complaint. Ten is enough to double-click into and close enough
+# that the button reads as part of the tabs.
+TRAILING_SLACK = 10
 
 # The unsaved-changes dot, drawn in place of the close X.
 DIRTY_DOT_RADIUS = 3.5
