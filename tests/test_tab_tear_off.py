@@ -343,16 +343,20 @@ def test_dropping_on_another_bar_docks_at_the_index_under_the_cursor(
     target = bar.tear_off().drop_target()
     assert target is not None
     assert target[0] is other and target[1] == 1
-    assert other_bar.drop_indicator() is not None
+
+    # IT IS ALREADY THERE, before the button comes up. That is the change: an
+    # insertion line promising where it would go has been replaced by the tab
+    # actually going there, and the strip reflowing around it.
+    assert other.document_area().count() == 4
+    assert other.document_area().view_at(1) is moving
+    assert source.document_area().count() == 1
 
     _release(bar, over)
 
     assert other.document_area().count() == 4
     assert other.document_area().view_at(1) is moving
     assert other.document_area().view_at(1).document_path() == name
-    assert other_bar.drop_indicator() is None
     other.document_area().check_invariant()
-    # The window that was created on the crossing is emptied and closes itself.
     assert registry.count() == 2
     assert source.document_area().count() == 1
 
@@ -403,17 +407,18 @@ def test_the_whole_target_window_is_a_dock_zone(qt_app, store, registry,
 
     target = bar.tear_off().drop_target()
     assert target is not None and target[0] is other
-    # No aim, so no claim about where: it goes on the end.
-    assert target[1] == other_bar.count()
-    # And the strip says so, which the 2px line alone never did.
-    assert other_bar.drop_active()
+    # No aim, so no claim about where: it went on the end. The index was
+    # computed against the bar BEFORE the tab joined it, so it is one less than
+    # the count now, which is the arithmetic of a live insert.
+    assert target[1] == other_bar.count() - 1
+    # And it is already in, which is what the accent wash used to be promising.
+    assert other.document_area().count() == 3
+    assert other.document_area().view_at(2) is moving
 
     _release(bar, body)
 
     assert other.document_area().count() == 3
     assert other.document_area().view_at(2) is moving
-    assert not other_bar.drop_active()
-    assert other_bar.drop_indicator() is None
     other.document_area().check_invariant()
 
 

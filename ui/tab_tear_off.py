@@ -55,7 +55,7 @@ is disabled at one tab for the same reason.
 from __future__ import annotations
 
 from PySide6.QtCore import QPoint, QPointF, QRect, Qt
-from PySide6.QtGui import QGuiApplication, QMouseEvent, QPainter
+from PySide6.QtGui import QCursor, QGuiApplication, QMouseEvent, QPainter
 from PySide6.QtWidgets import QApplication, QTabBar, QWidget
 
 from ui.window_registry import WindowRegistry
@@ -194,12 +194,14 @@ class TabTearOff:
         self._grab_in_tab = QPoint()  # where in the tab the cursor took hold
         self._view = None
         self._ghost = None            # the picture following the cursor
+        self._pixmap = None           # what the ghost draws, grabbed once
         self._source_window = None
         self._source_index = -1
         self._source_pos = QPoint()
         self._whole_window = False    # single-tab case: floating IS the source
         self._offset = QPoint()       # where in the tab the cursor took hold
         self._target = None           # (window, insertion index) under the cursor
+        self._attached_to = None      # the window whose strip is holding it now
         self._start_dpr = 1.0
 
     def is_dragging(self) -> bool:
@@ -367,12 +369,14 @@ class TabTearOff:
                 # or destroyed. An existing one is moved.
                 self._offset = global_pos - source.frameGeometry().topLeft()
             else:
-                self._ghost = _DragGhost(bar.grab(bar.tabRect(index)))
                 # The hotspot is where in the tab the cursor took hold, so the
                 # ghost sits under the pointer exactly where the real tab was.
                 self._offset = QPoint(self._grab_in_tab)
-                self._ghost.move(self.ghost_position(global_pos))
-                self._ghost.show()
+                self._pixmap = bar.grab(bar.tabRect(index))
+                self._attached_to = source
+                # It starts life attached to the window it came from, so the
+                # first move out of the strip detaches it exactly as a move out
+                # of any other strip does. One rule, not two.
         except Exception:
             self._abort()
             raise
@@ -396,14 +400,91 @@ class TabTearOff:
     # ------------------------------------------------------------------
 
     def _track(self, global_pos: QPoint):
+        target = self._hit_test(global_pos)
+        self._set_target(target)
+
         if self._whole_window:
+            # A LONE TAB KEEPS THE DEFERRED DROP, and it is not an oversight.
+            # Live re-attach earns its keep by letting you watch a strip reflow
+            # around the tab you are carrying; with one tab there is no strip
+            # to reflow, and the thing following the cursor is the window
+            # itself. Merging it into another window mid-drag would mean
+            # emptying and closing the very window under the pointer.
             if self._source_window is not None:
                 self._source_window.move(self.ghost_position(global_pos))
-        elif self._ghost is not None:
-            self._ghost.move(self.ghost_position(global_pos))
-        else:
             return
-        self._set_target(self._hit_test(global_pos))
+
+        if target is not None:
+            self._attach_to_strip(*target)
+
+        # The ghost is shown only while the cursor is off the strip that holds
+        # the tab. On the strip, the tab itself is the feedback and a second
+        # picture of it would be one too many.
+        holder = self._attached_to
+        if holder is not None and self._over_strip(holder, global_pos):
+            self._hide_ghost()
+        else:
+            self._show_ghost(global_pos)
+            if self._ghost is not None:
+                self._ghost.move(self.ghost_position(global_pos))
+
+    def _over_strip(self, window, global_pos: QPoint) -> bool:
+        """Whether the cursor is on `window`'s strip, give or take DOCK_MARGIN.
+
+        Asymmetric on purpose, and this is the hysteresis: arriving costs
+        DOCK_MARGIN and leaving costs DETACH_MARGIN, so the tab does not
+        flicker between two strips while the cursor sits on a boundary.
+        """
+        try:
+            bar = window.document_area().bar()
+            local = bar.mapFromGlobal(global_pos)
+        except (AttributeError, RuntimeError):   # pragma: no cover - defensive
+            return False
+        return bar.rect().adjusted(0, -DOCK_MARGIN, 0, DOCK_MARGIN).contains(local)
+
+    def _attach_to_strip(self, window, index: int):
+        """Put the tab INTO that strip, now, rather than promising to.
+
+        THIS IS THE POINT OF THE CHANGE. What used to happen on approach was a
+        wash over the target strip and an insertion line showing where the tab
+        WOULD go, with the real move deferred until the button came up. Edge
+        does not do that: get close and the tab is simply there, and the strip
+        reflows around it. His words: "instead of the highlight showing where
+        the tab will be displayed, if it get close just add the tab".
+
+        THE VIEW IS NEVER HOMELESS, and that constraint shapes the whole
+        gesture. `DocumentArea.adopt` and `detach` are a matched pair: adopt
+        reparents the live widget into the destination stack and detach only
+        then tidies the source, because the other order closes the source
+        window while it is still the widget's parent and the view dies with it.
+        So there is no "in mid-air" state for the DOCUMENT. It sits in whichever
+        window last claimed it, and the ghost is only a picture of the thing
+        being carried.
+
+        Safe for the same reason create-on-drop is safe: this moves a live view
+        between two windows that BOTH ALREADY EXIST, which is exactly what
+        `move_view_to_window` was built for. Nothing is constructed or destroyed
+        while the button is down, so the crash path stays closed.
+        """
+        holder = self._attached_to
+        if holder is None or self._view is None:
+            return
+        try:
+            if window is holder:
+                area = window.document_area()
+                at = area.index_of(self._view)
+                if at < 0:
+                    return
+                landing = min(max(0, index), area.count() - 1)
+                if landing != at:
+                    area.bar().moveTab(at, landing)
+            else:
+                if not holder.move_view_to_window(self._view, window, index):
+                    return
+                window.activate_view(self._view)
+                self._attached_to = window
+        except (AttributeError, RuntimeError):   # pragma: no cover - defensive
+            return
 
     def ghost_position(self, global_pos: QPoint) -> QPoint:
         """Where the ghost sits for a cursor at `global_pos`.
@@ -483,40 +564,15 @@ class TabTearOff:
         return None
 
     def _set_target(self, target):
-        """Move the feedback onto the window under the cursor, and only repaint
-        when it actually moved.
+        """Kept as the tests' window onto where a drop would land.
 
-        Two things are set, not one. The insertion line says WHERE, and it is
-        only ever meaningful when the cursor is near the bar; the highlight says
-        WHICH WINDOW, and it is on for as long as this window is the target,
-        which since the zone was widened is most of the time the cursor spends
-        over it. The second one is the one that was missing.
+        IT NO LONGER PAINTS ANYTHING. The accent wash, the outline and the
+        insertion line all said "this is where the tab would go if you let go
+        now", and they were answering a question the tab itself now answers by
+        being there. Removing them also removes the gold box that was appearing
+        mid-drag, at the source rather than by suppressing the symptom.
         """
-        previous = self._target
-        if previous is not None:
-            same_window = target is not None and target[0] is previous[0]
-            if not same_window:
-                self._clear_indicator_on(previous[0])
         self._target = target
-        if target is None:
-            return
-        window, index = target
-        bar = window.document_area().bar()
-        bar.set_drop_active(True)
-        bar.set_drop_indicator(bar.insertion_x(index))
-
-    def _clear_indicator(self):
-        if self._target is not None:
-            self._clear_indicator_on(self._target[0])
-
-    @staticmethod
-    def _clear_indicator_on(window):
-        try:
-            bar = window.document_area().bar()
-            bar.set_drop_indicator(None)
-            bar.set_drop_active(False)
-        except (AttributeError, RuntimeError):   # pragma: no cover - defensive
-            pass
 
     # ------------------------------------------------------------------
     # Ending
@@ -530,32 +586,34 @@ class TabTearOff:
         document.
         """
         self._release_input()
-        target = self._target
         view = self._view
         source = self._source_window
+        attached = self._attached_to
+        target = self._target
         try:
-            self._clear_indicator()
             self._hide_ghost()
-            if target is not None:
-                window, index = target
-                if window is source:
-                    # Back where it started, or somewhere else in the same
-                    # strip. Nothing to move between windows; let the bar put
-                    # it at the index the cursor was over.
-                    landing = min(max(0, index), self._bar.count() - 1)
-                    if landing != self._source_index:
-                        self._bar.moveTab(self._source_index, landing)
-                else:
+            if self._whole_window:
+                if target is not None and target[0] is not source:
+                    # The lone-tab merge, deferred to here for the reason in
+                    # `_track`: the source empties and closes behind it.
+                    window, index = target
                     source.move_view_to_window(view, window, index)
                     window.activate_view(view)
-            elif self._whole_window:
-                # Already exactly where they let go of it: the window has been
-                # following the cursor for the whole gesture. Nothing to do.
-                pass
+                # Otherwise the window has been following the cursor all along
+                # and is already exactly where they let go of it.
+            elif target is not None:
+                # OVER A STRIP, WHICH MEANS IT IS ALREADY IN ONE. The approach
+                # attached it; the release only has to bring it forward. This
+                # covers going back up to the source bar as well, and that case
+                # is why the test for it exists: falling through to the branch
+                # below would have made a second window out of a tab that never
+                # actually left the first one.
+                (attached or source).activate_view(view)
             else:
                 # THE ONLY PLACE A WINDOW IS CREATED, and it happens with the
-                # button already up and the ghost already gone.
-                source.move_view_to_new_window(
+                # button already up, the ghost already gone, and the cursor
+                # over no strip at all.
+                (attached or source).move_view_to_new_window(
                     view, geometry=QRect(global_pos - self._offset,
                                          source.size()))
             self._settle_dpi(global_pos, view)
@@ -571,14 +629,32 @@ class TabTearOff:
         """
         self._release_input()
         try:
-            self._clear_indicator()
             self._hide_ghost()
+            holder = self._attached_to
+            if (holder is not None and self._source_window is not None
+                    and holder is not self._source_window):
+                # It has already joined another window's strip, so this cancel
+                # has a real move to reverse.
+                holder.move_view_to_window(
+                    self._view, self._source_window, self._source_index)
+                self._source_window.activate_view(self._view)
             if self._whole_window and self._source_window is not None:
                 # The one thing a cancel still has to undo, because it is the
                 # one thing that moved.
                 self._source_window.move(self._source_pos)
         finally:
             self._reset()
+
+    def _show_ghost(self, global_pos: QPoint):
+        """Bring the picture back for the part of the drag that is in mid-air."""
+        if self._ghost is not None or self._pixmap is None:
+            return
+        try:
+            self._ghost = _DragGhost(self._pixmap)
+            self._ghost.move(self.ghost_position(global_pos))
+            self._ghost.show()
+        except RuntimeError:                     # pragma: no cover - defensive
+            self._ghost = None
 
     def _hide_ghost(self):
         """Take the ghost off screen. Deleted on the next event loop pass
@@ -588,6 +664,7 @@ class TabTearOff:
         ghost = self._ghost
         if ghost is None:
             return
+        self._ghost = None
         try:
             ghost.hide()
             ghost.deleteLater()
