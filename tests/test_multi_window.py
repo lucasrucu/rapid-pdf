@@ -269,13 +269,23 @@ def test_the_window_left_behind_keeps_its_other_document(win, alpha, beta):
 def test_the_source_window_closes_when_its_last_document_leaves(
         win, registry, alpha):
     """The general mechanism, which the menu item deliberately never reaches
-    (it is disabled on a lone tab). Phase 4's tear-off will."""
+    (it is disabled on a lone tab). Phase 4's tear-off will.
+
+    THE CLOSE IS DEFERRED BY ONE PASS OF THE EVENT LOOP, which is what the
+    `processEvents` below pays for. The tear-off calls this from inside a
+    mouse-move dispatch, and closing the emptied window on that stack is a
+    window destroying itself underneath the window procedure still running it:
+    0xC000041D, the process gone with no traceback. See
+    `MainWindow.move_view_to_window` and tests/test_tear_off_crash.py.
+    """
     win.open_paths([alpha])
     target = registry.create_window(theme=win.theme_manager(), show=False)
     target.show()
     moved = win.move_view_to_window(win.document_area().view_at(0), target)
     assert moved
     assert target.document_area().count() == 1
+    assert win.document_area().count() == 0
+    QApplication.processEvents()
     assert registry.windows() == [target]
 
 

@@ -152,6 +152,42 @@ class PDFDocument:
         self.doc = fitz_doc
         self.path = None
 
+    def replace_from_bytes(self, payload: bytes) -> bool:
+        """Swap this document's CONTENT for `payload`, keeping its identity.
+
+        The landing point for work done on a private copy of this document on
+        a background thread: see core/ocr_worker.py, which OCRs its own
+        independent fitz.Document because PyMuPDF documents are not thread
+        safe, and hands the finished file back as bytes for the UI thread to
+        apply here.
+
+        Not `adopt`, and the difference is the whole reason this exists.
+        `adopt` takes over from a genuinely different document, so it drops the
+        path and forces the next save through Save As. This is the SAME
+        document with new page content, so the path stays and the next Ctrl+S
+        writes where it always would have.
+
+        `_render_scale` is deliberately NOT reset either. Page geometry is
+        unchanged by an OCR pass, and the scale is baked into the scene
+        coordinates of every annotation on the document and into the undo
+        stack behind them: see `render_scale` for why changing it under a live
+        document is not a thing that can be done in isolation.
+        """
+        if not payload:
+            return False
+        try:
+            replacement = fitz.open("pdf", payload)
+        except Exception as e:
+            self.last_open_error = f"Could not apply the result:\n{e}"
+            return False
+        path = self.path
+        if self.doc:
+            self.doc.close()
+        self.doc = replacement
+        self.path = path
+        self.invalidate_render_cache()
+        return True
+
     def open(self, path: str) -> bool:
         """Open a file, or return False with the reason in last_open_error.
 
@@ -253,10 +289,23 @@ class PDFDocument:
 
         Shared by render_page (fixed zoom) and render_thumbnail (zoom derived
         from a target width) so the fitz→QImage→QPixmap conversion lives once.
+
+        THE BUFFER IS BOUND TO A NAME ON PURPOSE, and it is not a style choice.
+        QImage does NOT copy the memory it is handed; it borrows it and expects
+        the caller to keep it alive for as long as the QImage is. This used to
+        read `QImage(bytes(pix.samples), ...)`, where the bytes object was an
+        unnamed temporary whose last reference died the moment the QImage
+        constructor returned. Every render after that point was reading freed
+        memory, and `QPixmap.fromImage` on the next line was the one deep copy
+        that had to happen while the buffer was still valid. It usually got
+        away with it, because a just-freed block is usually still intact, which
+        is exactly what makes this class of bug show up as a random crash
+        rather than a reproducible one.
         """
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat, alpha=False)
-        img = QImage(bytes(pix.samples), pix.width, pix.height, pix.stride,
+        samples = pix.samples          # keep the buffer alive past fromImage
+        img = QImage(samples, pix.width, pix.height, pix.stride,
                      QImage.Format.Format_RGB888)
         return QPixmap.fromImage(img)
 

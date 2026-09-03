@@ -54,11 +54,34 @@ is disabled at one tab for the same reason.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 from PySide6.QtCore import QPoint, QPointF, QRect, Qt
 from PySide6.QtGui import QCursor, QGuiApplication, QMouseEvent, QPainter
 from PySide6.QtWidgets import QApplication, QTabBar, QWidget
 
 from ui.window_registry import WindowRegistry
+
+try:
+    from shiboken6 import isValid as _cpp_alive
+except ImportError:                     # pragma: no cover - PySide6 always has it
+    def _cpp_alive(obj) -> bool:
+        return True
+
+
+def _usable(window) -> bool:
+    """Whether a window reference is still worth calling a method on.
+
+    A drag holds references to windows across many mouse events, and one of
+    those windows CLOSES DURING THE GESTURE: the window a tab was dropped into
+    empties and closes as soon as the tab is dragged back out of it. A Python
+    reference keeps the wrapper alive long after the C++ object behind it is
+    gone, and touching it then raises RuntimeError from inside a mouse handler,
+    which on Windows means the process is killed rather than an exception
+    reported. `shiboken6.isValid` is the only reliable way to ask.
+    """
+    return (window is not None and _cpp_alive(window)
+            and hasattr(window, "document_area"))
 
 # How far past the top or bottom edge of the bar the cursor has to go before a
 # reorder becomes a tear. Sideways travel never counts, however far it goes.
@@ -461,13 +484,21 @@ class TabTearOff:
         window last claimed it, and the ghost is only a picture of the thing
         being carried.
 
-        Safe for the same reason create-on-drop is safe: this moves a live view
-        between two windows that BOTH ALREADY EXIST, which is exactly what
-        `move_view_to_window` was built for. Nothing is constructed or destroyed
-        while the button is down, so the crash path stays closed.
+        NOTHING IS CONSTRUCTED HERE, BUT SOMETHING IS DESTROYED, and that was
+        the hole in the paragraph this one replaces. It claimed no window is
+        created or destroyed while the button is down. Moving a view between
+        two existing windows can EMPTY the one it came from, and an empty
+        window closes itself; adopting into a window whose only tab is an empty
+        placeholder retires that placeholder the same way. Both of those are
+        window destruction, on this stack, inside `mouseMoveEvent`, with the
+        mouse captured. That is the 0xC000041D. The two destructions are now
+        deferred at their source (`MainWindow.move_view_to_window` and
+        `DocumentArea._retire`), and the grabs are dropped here for the
+        duration of the move so that nothing runs a nested message loop while
+        this bar is holding the mouse.
         """
         holder = self._attached_to
-        if holder is None or self._view is None:
+        if not _usable(holder) or self._view is None:
             return
         try:
             if window is holder:
@@ -479,9 +510,19 @@ class TabTearOff:
                 if landing != at:
                     area.bar().moveTab(at, landing)
             else:
-                if not holder.move_view_to_window(self._view, window, index):
+                # RELEASED BEFORE THE MUTATION, NOT AFTER. Reparenting a view,
+                # raising a window and closing an emptied one can each pump
+                # native events, and doing that while this bar holds
+                # grabMouse()/grabKeyboard() delivers input to a widget that is
+                # in the middle of being taken apart. The grab is taken back
+                # immediately, before returning to the event loop, so the drag
+                # is uninterrupted.
+                with self._input_released():
+                    moved = holder.move_view_to_window(self._view, window, index)
+                    if moved:
+                        window.activate_view(self._view)
+                if not moved:
                     return
-                window.activate_view(self._view)
                 self._attached_to = window
         except (AttributeError, RuntimeError):   # pragma: no cover - defensive
             return
@@ -584,21 +625,49 @@ class TabTearOff:
         `releaseMouse()` first and unconditionally: everything after it can
         fail, and a leaked grab is a frozen application rather than a lost
         document.
+
+        EVERY WINDOW REFERENCE HERE IS RE-CHECKED, because a drag outlives the
+        windows it started with. `_attached_to` and `_source_window` were read
+        when the gesture began; by the time the button comes up, either can be
+        a Python wrapper around a deleted C++ window, since the window a tab
+        was dropped into empties and closes the moment the tab is dragged out
+        of it again. `attached or source` only asks whether the reference is
+        None, and a dead wrapper is not None. Calling through one raises
+        RuntimeError inside `mouseReleaseEvent`, which is a Qt virtual method,
+        which means the exception unwinds into the native window procedure and
+        the OS kills the process. `_usable` asks the question that matters.
+
+        The whole body is guarded for the same reason. An exception escaping
+        this method does not produce a traceback and a working app; it produces
+        0xC000041D and a vanished window. Losing the drop is bad; losing the
+        process is worse.
         """
         self._release_input()
         view = self._view
         source = self._source_window
         attached = self._attached_to
         target = self._target
+        # The window that is still standing and still holds the document.
+        holder = attached if _usable(attached) else source
+        if not _usable(holder):
+            holder = None
         try:
             self._hide_ghost()
+            if holder is None:
+                # Nothing left to land in. The view has already been reparented
+                # into whichever window last adopted it, so it is not lost; it
+                # simply has no window here to be activated in.
+                return
             if self._whole_window:
-                if target is not None and target[0] is not source:
+                if (target is not None and target[0] is not source
+                        and _usable(source) and _usable(target[0])):
                     # The lone-tab merge, deferred to here for the reason in
-                    # `_track`: the source empties and closes behind it.
+                    # `_track`: the source empties and closes behind it. The
+                    # grabs are already gone, which is what makes that close
+                    # survivable.
                     window, index = target
-                    source.move_view_to_window(view, window, index)
-                    window.activate_view(view)
+                    if source.move_view_to_window(view, window, index):
+                        window.activate_view(view)
                 # Otherwise the window has been following the cursor all along
                 # and is already exactly where they let go of it.
             elif target is not None:
@@ -608,15 +677,20 @@ class TabTearOff:
                 # is why the test for it exists: falling through to the branch
                 # below would have made a second window out of a tab that never
                 # actually left the first one.
-                (attached or source).activate_view(view)
+                holder.activate_view(view)
             else:
                 # THE ONLY PLACE A WINDOW IS CREATED, and it happens with the
                 # button already up, the ghost already gone, and the cursor
                 # over no strip at all.
-                (attached or source).move_view_to_new_window(
-                    view, geometry=QRect(global_pos - self._offset,
-                                         source.size()))
+                size = source.size() if _usable(source) else holder.size()
+                holder.move_view_to_new_window(
+                    view, geometry=QRect(global_pos - self._offset, size))
             self._settle_dpi(global_pos, view)
+        except (AttributeError, RuntimeError):
+            # A window that went away between the last mouse move and this
+            # release. See the docstring: swallowing it here costs the drop,
+            # letting it out of a Qt virtual method costs the process.
+            pass
         finally:
             self._reset()
 
@@ -626,22 +700,29 @@ class TabTearOff:
         This used to undo a window that had already been created and a view
         that had already been reparented. Now the document never left, so a
         cancel is the ghost disappearing and the grabs coming back.
+
+        Guarded exactly like `_finish`: this runs inside `keyPressEvent`, which
+        is another Qt virtual method with a native window procedure behind it,
+        and the window the document is being put back into can have closed
+        during the drag.
         """
         self._release_input()
         try:
             self._hide_ghost()
             holder = self._attached_to
-            if (holder is not None and self._source_window is not None
-                    and holder is not self._source_window):
+            source = self._source_window
+            if (_usable(holder) and _usable(source) and holder is not source):
                 # It has already joined another window's strip, so this cancel
                 # has a real move to reverse.
-                holder.move_view_to_window(
-                    self._view, self._source_window, self._source_index)
-                self._source_window.activate_view(self._view)
-            if self._whole_window and self._source_window is not None:
+                if holder.move_view_to_window(
+                        self._view, source, self._source_index):
+                    source.activate_view(self._view)
+            if self._whole_window and _usable(source):
                 # The one thing a cancel still has to undo, because it is the
                 # one thing that moved.
-                self._source_window.move(self._source_pos)
+                source.move(self._source_pos)
+        except (AttributeError, RuntimeError):   # pragma: no cover - defensive
+            pass
         finally:
             self._reset()
 
@@ -686,6 +767,23 @@ class TabTearOff:
         """
         self._bar.grabMouse()
         self._bar.grabKeyboard()
+
+    @contextmanager
+    def _input_released(self):
+        """Give the mouse and keyboard back for the length of a window change.
+
+        Re-grabbed on the way out, and only if the drag is still live and this
+        bar still exists: the block inside can close a window, and on the
+        single-tab paths that window can be the one this bar belongs to. A
+        `grabMouse()` on a half-destroyed widget is how an application ends up
+        unable to see the mouse at all.
+        """
+        self._release_input()
+        try:
+            yield
+        finally:
+            if self._dragging and _cpp_alive(self._bar):
+                self._grab_input()
 
     def _release_input(self):
         """Called on EVERY exit path. Qt tolerates a release without a grab."""

@@ -1126,13 +1126,34 @@ class DocumentArea(QWidget):
         self._disconnect_view(view)
         self._forget_visit(view)
         self._forget_checked(view)
-        view.teardown()
-        view.setParent(None)
-        view.deleteLater()
+        self._retire(view)
         self._refresh_titles()
         self._sync_header_visibility()
         self._resync_current()
         self.check_invariant()
+
+    def _retire(self, view):
+        """Close a removed view's document now, destroy the widget later.
+
+        THE `setParent(None)` THAT USED TO BE HERE IS GONE, and it is the same
+        0xC000041D as `MainWindow.move_view_to_window`. On Windows,
+        `setParent(None)` promotes a widget to a top-level with a real HWND,
+        and the `deleteLater` behind it destroys that native window again. This
+        method runs inside a mouse-move dispatch on the ordinary tear-off path:
+        dropping a tab into a window whose only tab is an empty placeholder
+        retires the placeholder through `remove_view` (see
+        `MainWindow.adopt`), with the mouse still captured and the window
+        procedure still on the stack. Creating and destroying a native window
+        there is what the OS kills the process for.
+
+        `remove_view` has already taken the widget out of the bar and the
+        stack, so nothing is displaying it and the parent it keeps until
+        deletion costs nothing. `teardown()` stays synchronous, because that is
+        plain Python releasing the fitz document and the callers that close a
+        tab and immediately reopen the file depend on the handle being gone.
+        """
+        view.teardown()
+        view.deleteLater()
 
     def set_current_index(self, index: int):
         if 0 <= index < self._bar.count():

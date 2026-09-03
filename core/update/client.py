@@ -70,6 +70,25 @@ STAGING_SUFFIX = ".update"
 #: The exe an install is built around. Only a frozen build has one to swap.
 EXE_NAME = "rapid-pdf.exe"
 
+#: The folder PyInstaller puts a onedir build's runtime in, beside the exe.
+#: An install without it is an exe with nothing to run against: it starts, it
+#: fails to find python3xx.dll, and it dies before it can say so.
+INTERNAL_DIR = "_internal"
+
+#: The floor on how many files an archive has to hold before it is believed to
+#: be a build at all.
+#:
+#: A real portable zip unpacks to about 252 files: the exe, _internal with the
+#: Python runtime and the PySide6 and Qt DLLs, the Qt plugin folders, and the
+#: bundled tessdata. The floor is set far below that, on purpose. This is a
+#: sanity check, not a manifest. It exists to reject an archive that unpacked
+#: to a handful of files, which is what a truncated build, a zip of the wrong
+#: thing, or a release published half-uploaded looks like, WITHOUT rejecting a
+#: legitimately slimmer future build that drops a language pack or stops
+#: bundling tessdata. Fifty is comfortably under any build that could start
+#: PySide6 at all and comfortably over anything that could not.
+MIN_PAYLOAD_FILES = 50
+
 #: Read size for the download and for hashing. The asset is 67 MB, and the
 #: default 64 KB turns that into a syscall benchmark rather than a disk one.
 CHUNK = 1 << 20
@@ -109,7 +128,16 @@ class UpdateInfo:
 
 @dataclass(frozen=True)
 class StagedUpdate:
-    """A verified copy of the new build, unpacked and ready to be swapped in."""
+    """A verified copy of the new build, unpacked and ready to be swapped in.
+
+    THE THREE NUMBERS ARE NOT STATISTICS. swap.build_script writes file_count
+    and exe_bytes into the batch file, and that file refuses to call an update
+    finished unless the install ends up holding at least file_count files and
+    an exe of exactly exe_bytes bytes. They are the only thing standing between
+    a robocopy that moved almost nothing and a log line claiming it worked:
+    that is not hypothetical, it is the 34 file install this check was written
+    for. Do not let them go stale, and do not let them go unread.
+    """
 
     info: UpdateInfo
     install_dir: Path
@@ -117,6 +145,7 @@ class StagedUpdate:
     payload_dir: Path
     file_count: int
     payload_bytes: int
+    exe_bytes: int
 
     def discard(self) -> None:
         """Throw the staging folder away. Safe to call twice."""
@@ -221,6 +250,9 @@ def stage(info: UpdateInfo, target: Path, feed=None, progress=None) -> StagedUpd
         if progress is not None:
             progress(asset.size, asset.size, "unpacking")
         count, size = _unpack(archive, payload, asset.size)
+        # Measured here, from the file on disk, and not taken from the zip's
+        # own header: what the swap has to match is what was actually written.
+        exe_bytes = (payload / EXE_NAME).stat().st_size
         archive.unlink(missing_ok=True)
     except UpdateError:
         shutil.rmtree(staging, ignore_errors=True)
@@ -240,6 +272,7 @@ def stage(info: UpdateInfo, target: Path, feed=None, progress=None) -> StagedUpd
     return StagedUpdate(
         info=info, install_dir=target, staging_dir=staging,
         payload_dir=payload, file_count=count, payload_bytes=size,
+        exe_bytes=exe_bytes,
     )
 
 
@@ -304,6 +337,16 @@ def _unpack(archive: Path, payload: Path, archive_size: int) -> tuple[int, int]:
     bytes are the published ones; it says nothing about whether the published
     ones contain `..\\..\\Windows\\System32\\something`. Those are different
     claims and only one of them is about trust.
+
+    AND WHAT CAME OUT IS CHECKED FOR SHAPE, which is a third claim again. The
+    digest says the bytes are the published ones and the name check says they
+    landed where they should; neither says the archive is a Rapid PDF build.
+    For a long time the only shape check here was that a file called
+    rapid-pdf.exe existed, so a zip holding exactly that one file staged
+    happily and the swap then laid it over a working install. The three checks
+    at the bottom are the cheapest place in the whole update to stop: nothing
+    outside the staging folder has been touched yet, so giving up costs a
+    folder.
     """
     try:
         with zipfile.ZipFile(archive) as zf:
@@ -347,6 +390,21 @@ def _unpack(archive: Path, payload: Path, archive_size: int) -> tuple[int, int]:
                     f"The update stopped: the downloaded archive has no "
                     f"{EXE_NAME} in it, so it is not a Rapid PDF build. "
                     "Nothing has been changed."
+                )
+            if not (payload / INTERNAL_DIR).is_dir():
+                raise UpdateError(
+                    f"The update stopped: the downloaded archive has "
+                    f"{EXE_NAME} but no {INTERNAL_DIR} folder beside it, and "
+                    f"an exe with no {INTERNAL_DIR} cannot start. It is not a "
+                    "complete Rapid PDF build. Nothing has been changed."
+                )
+            if len(entries) < MIN_PAYLOAD_FILES:
+                raise UpdateError(
+                    f"The update stopped: the downloaded archive holds "
+                    f"{len(entries)} files, and a Rapid PDF build is around "
+                    f"250. Something that small cannot be a whole build, and "
+                    f"laying it over this install would leave an app that "
+                    "does not start. Nothing has been changed."
                 )
             return len(entries), total
     except zipfile.BadZipFile as exc:

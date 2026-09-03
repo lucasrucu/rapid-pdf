@@ -958,9 +958,10 @@ class DocumentView(QWidget):
     def _on_ocr_finished(self, ocred_count: int, cancelled: bool, errors: list):
         self._ocr_thread = None
         self._ocr_worker = None
-        # OCR rewrote page content streams directly on the live document, so
-        # every cached render is stale and the panel/current page must be
-        # redrawn from the new (now-searchable) page content.
+        # The OCR pass ran on a private copy and the finished file has just
+        # replaced this document's content (see core/ocr_worker.py), so every
+        # cached render is stale and the panel/current page must be redrawn
+        # from the new (now-searchable) page content.
         self._doc.invalidate_render_cache()
         self._canvas.reload_current_page()
         self._refresh_panel_thumbnails()

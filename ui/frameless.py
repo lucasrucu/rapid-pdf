@@ -407,6 +407,38 @@ class FramelessHelper(QObject):
     # The native path
     # ------------------------------------------------------------------
 
+    def _hwnd(self) -> int:
+        """This window's HWND, or 0 if it does not currently have one.
+
+        NEVER `winId()`, AND THIS IS THE 0xC000041D. `QWidget.winId()` is
+        documented to CREATE the native window if the widget does not have one,
+        and creating an HWND dispatches WM_NCCREATE, WM_NCCALCSIZE and friends
+        to the window procedure SYNCHRONOUSLY, from inside the call. Every one
+        of those comes straight back into `native_event`, which used to call
+        `winId()` again on the still-handle-less window, which created another
+        one, and so on until the stack ran out. Windows reports a stack
+        overflow inside a window procedure as STATUS_FATAL_USER_CALLBACK_
+        EXCEPTION, 0xC000041D, with no traceback and no exit code worth
+        reading.
+
+        The window that has no handle is a window that has just been CLOSED,
+        which is not a rare state: closing a window destroys its native half
+        while messages for it are still being delivered, and the tear-off
+        empties and closes a window in the middle of a drag as a matter of
+        routine (drop a tab into a window holding only an empty placeholder,
+        then drag it out again). That is the reproduction.
+
+        `internalWinId()` asks the same question without the side effect: it
+        returns 0 for a widget with no native handle and creates nothing. A
+        message cannot be for a window that has no handle, so 0 is always
+        "not ours".
+        """
+        try:
+            return int(self._window.internalWinId() or 0)
+        except RuntimeError:                     # pragma: no cover - defensive
+            # The C++ window is gone entirely.
+            return 0
+
     def native_event(self, event_type, message):
         """MainWindow.nativeEvent forwards here. None means "not ours".
 
@@ -421,7 +453,8 @@ class FramelessHelper(QObject):
         msg = _as_msg(message)
         if msg is None:
             return None
-        if msg.hWnd != int(self._window.winId()):
+        hwnd = self._hwnd()
+        if not hwnd or msg.hWnd != hwnd:
             return None
         handler = {
             WM_NCCALCSIZE: self._on_nccalcsize,
@@ -473,7 +506,9 @@ class FramelessHelper(QObject):
         the wrong rectangle for it, sometimes by hundreds of pixels.
         """
         user32 = ctypes.windll.user32
-        hwnd = int(self._window.winId())
+        hwnd = self._hwnd()
+        if not hwnd:
+            return
         monitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
         if not monitor:
             return
@@ -535,9 +570,12 @@ class FramelessHelper(QObject):
         """This window's physical rectangle, or None. Also its client rect,
         because WM_NCCALCSIZE gave the whole window to the client area."""
         try:
+            hwnd = self._hwnd()
+            if not hwnd:
+                return None
             rect = _Rect()
             if not ctypes.windll.user32.GetWindowRect(
-                    int(self._window.winId()), ctypes.byref(rect)):
+                    hwnd, ctypes.byref(rect)):
                 return None
             return rect
         except Exception:                        # pragma: no cover - defensive
@@ -678,7 +716,9 @@ class FramelessHelper(QObject):
             return False
         try:
             user32 = ctypes.windll.user32
-            hwnd = int(self._window.winId())
+            hwnd = self._hwnd()
+            if not hwnd:
+                return False
             menu = user32.GetSystemMenu(hwnd, False)
             if not menu:
                 return False

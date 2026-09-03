@@ -458,6 +458,23 @@ class MainWindow(QMainWindow):
         anywhere in it: on Windows that promotes the widget to a top-level with
         a real HWND, and reparenting it back destroys the HWND and the widget's
         native resources with it.
+
+        STEP 5 IS DEFERRED, AND THAT IS THE 0xC000041D FIX. This method is
+        called mid-drag, from `TabTearOff._attach_to_strip`, which runs inside
+        `DocumentTabBar.mouseMoveEvent`, which Windows is running as a callback
+        out of the window procedure with the mouse captured. `self.close()`
+        there is a window destroying itself underneath the message dispatch it
+        is still inside, and Windows answers by killing the process with
+        STATUS_FATAL_USER_CALLBACK_EXCEPTION. Reproduced deterministically:
+        drag a tab into a window whose only tab is an empty placeholder (the
+        placeholder is retired on adopt, so that window is now holding exactly
+        the dragged tab), then drag it on to a third window.
+
+        `singleShot(0, ...)` puts the close on the next pass of the event loop
+        instead, by which time the mouse-move callback has returned and the
+        stack is the event loop's own. Nothing else in the sequence moves: the
+        window is still empty, it still closes, and it closes before the user
+        can see it empty.
         """
         if view is None or target is None or target is self:
             return False
@@ -468,7 +485,7 @@ class MainWindow(QMainWindow):
         target.adopt(view, at)
         self._area.detach(view, index)
         if self._area.count() == 0:
-            self.close()
+            QTimer.singleShot(0, self.close)
         target.raise_and_focus()
         return True
 

@@ -127,14 +127,31 @@ def build_zip(entries: dict[str, bytes]) -> bytes:
     return buf.getvalue()
 
 
-def release_zip(version: str = "1.4.0") -> bytes:
-    """The shape the real portable zip has: one top folder, exe plus _internal."""
-    return build_zip({
-        f"rapid-pdf/{client.EXE_NAME}": b"the new exe" * 100,
-        "rapid-pdf/_internal/python312.dll": b"a dll" * 100,
-        "rapid-pdf/_internal/base_library.zip": b"stdlib" * 100,
-        "rapid-pdf/assets/tessdata/eng.traineddata": b"ocr data" * 100,
-    })
+#: The exe body every fixture bundle carries, so a test can assert on the size
+#: the staged copy reports without recomputing it.
+NEW_EXE_BODY = b"the new exe" * 100
+
+
+def release_zip(version: str = "1.4.0", *, files: int = 60,
+                top: str = "rapid-pdf/") -> bytes:
+    """The shape the real portable zip has: one top folder, exe plus _internal.
+
+    IT HAS TO BE A PLAUSIBLE BUNDLE NOW, not the token four files it used to
+    be. A real portable zip is about 252 files, staging refuses anything that
+    could not be a build, and a fixture that would be refused in the field is
+    a fixture that pins the wrong behaviour. The four named entries are the
+    ones the tests actually look for; the rest is filler standing in for the
+    Qt plugins that make up most of a real build's file count.
+    """
+    entries = {
+        f"{top}{client.EXE_NAME}": NEW_EXE_BODY,
+        f"{top}_internal/python312.dll": b"a dll" * 100,
+        f"{top}_internal/base_library.zip": b"stdlib" * 100,
+        f"{top}assets/tessdata/eng.traineddata": b"ocr data" * 100,
+    }
+    for n in range(files - len(entries)):
+        entries[f"{top}_internal/PySide6/plugins/qt{n:03d}.dll"] = b"qt" * 50
+    return build_zip(entries)
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +392,13 @@ class Staging(unittest.TestCase):
         # The zip's `rapid-pdf/` wrapper is stripped: what lands is the
         # CONTENTS of an install, ready to be laid over one.
         self.assertFalse((payload / "rapid-pdf").exists())
-        self.assertEqual(staged.file_count, 4)
+        self.assertEqual(staged.file_count, 60)
+        # Measured off the unpacked file, and load bearing: swap.build_script
+        # writes it into the batch file as the size the swapped-in exe has to
+        # have before the update may call itself finished.
+        self.assertEqual(staged.exe_bytes, len(NEW_EXE_BODY))
+        self.assertEqual(
+            staged.exe_bytes, (payload / client.EXE_NAME).stat().st_size)
         self.assertEqual(staged.staging_dir, self.tmp / "Rapid PDF.update")
         # The archive itself is cleaned up once unpacked.
         self.assertFalse((staged.staging_dir / info.asset.name).exists())
@@ -440,6 +463,55 @@ class Staging(unittest.TestCase):
             client.stage(info, self.install, feed=feed)
         self.assertIn(client.EXE_NAME, str(caught.exception))
 
+    def test_an_archive_too_small_to_be_a_build_is_refused(self):
+        # THE BUG, caught at the earliest place it can be caught. The swap
+        # decided success on things a two file payload passes (robocopy
+        # exiting under 8, and an exe existing as a name), so a two file
+        # payload must never reach the swap in the first place. This is what
+        # the 34 file install would have looked like on the way in, if the
+        # zip had been the thing at fault.
+        thin = build_zip({
+            f"rapid-pdf/{client.EXE_NAME}": NEW_EXE_BODY,
+            "rapid-pdf/_internal/python312.dll": b"a dll" * 100,
+        })
+        feed = self._feed_for(thin)
+        info = client.check("1.3.0", feed=feed)
+        with self.assertRaises(client.UpdateError) as caught:
+            client.stage(info, self.install, feed=feed)
+        self.assertIn("2 files", str(caught.exception))
+        self.assertIn("Nothing has been changed", str(caught.exception))
+        self.assertFalse(client.staging_dir_for(self.install).exists())
+        self.assertEqual((self.install / client.EXE_NAME).read_bytes(),
+                         b"the old exe")
+
+    def test_an_archive_with_the_exe_but_no_internal_folder_is_refused(self):
+        # A PySide6 onedir build is an exe plus _internal. An exe on its own
+        # is a file with the right name that cannot start.
+        entries = {f"rapid-pdf/{client.EXE_NAME}": NEW_EXE_BODY}
+        for n in range(80):
+            entries[f"rapid-pdf/docs/page{n:03d}.txt"] = b"x" * 40
+        feed = self._feed_for(build_zip(entries))
+        info = client.check("1.3.0", feed=feed)
+        with self.assertRaises(client.UpdateError) as caught:
+            client.stage(info, self.install, feed=feed)
+        self.assertIn(client.INTERNAL_DIR, str(caught.exception))
+        self.assertFalse(client.staging_dir_for(self.install).exists())
+
+    def test_the_floor_is_a_floor_and_not_a_manifest(self):
+        # Set well under a real build's ~252 files on purpose, so a slimmer
+        # future build is not refused. Exactly the floor stages; one under it
+        # does not.
+        feed = self._feed_for(release_zip(files=client.MIN_PAYLOAD_FILES))
+        info = client.check("1.3.0", feed=feed)
+        staged = client.stage(info, self.install, feed=feed)
+        self.assertEqual(staged.file_count, client.MIN_PAYLOAD_FILES)
+        staged.discard()
+
+        feed = self._feed_for(release_zip(files=client.MIN_PAYLOAD_FILES - 1))
+        info = client.check("1.3.0", feed=feed)
+        with self.assertRaises(client.UpdateError):
+            client.stage(info, self.install, feed=feed)
+
     def test_something_that_is_not_a_zip_is_refused(self):
         feed = self._feed_for(b"this is not a zip file, it is a sentence.")
         info = client.check("1.3.0", feed=feed)
@@ -474,11 +546,7 @@ class Staging(unittest.TestCase):
         self.assertFalse((staged.payload_dir / "leftover.txt").exists())
 
     def test_a_flat_archive_keeps_its_paths(self):
-        flat = build_zip({
-            client.EXE_NAME: b"the new exe" * 50,
-            "_internal/python312.dll": b"a dll" * 50,
-        })
-        feed = self._feed_for(flat)
+        feed = self._feed_for(release_zip(top=""))
         info = client.check("1.3.0", feed=feed)
         staged = client.stage(info, self.install, feed=feed)
         self.assertTrue((staged.payload_dir / client.EXE_NAME).is_file())
@@ -490,14 +558,23 @@ class Staging(unittest.TestCase):
 # The swap helper, as text
 # ---------------------------------------------------------------------------
 
-def fake_staged(install: Path, version: str = "1.4.0") -> client.StagedUpdate:
+def fake_staged(install: Path, version: str = "1.4.0", *,
+                file_count: int = 252, payload_bytes: int = 264_000_000,
+                exe_bytes: int = 4_600_000) -> client.StagedUpdate:
+    """A staged copy with numbers in it, because the script checks them.
+
+    The defaults are a real 1.4.x portable build's shape. file_count and
+    exe_bytes are not decoration: they are written into the batch file and
+    compared against the disk before the update is allowed to say it worked.
+    """
     staging = client.staging_dir_for(install)
     info = client.UpdateInfo(
         release=parse_latest(json.dumps(release_payload(version))),
         running="1.3.0")
     return client.StagedUpdate(
         info=info, install_dir=install, staging_dir=staging,
-        payload_dir=staging / "payload", file_count=4, payload_bytes=1234)
+        payload_dir=staging / "payload", file_count=file_count,
+        payload_bytes=payload_bytes, exe_bytes=exe_bytes)
 
 
 class SwapScript(unittest.TestCase):
@@ -549,6 +626,92 @@ class SwapScript(unittest.TestCase):
                 with self.assertRaises(swap.SwapNotStarted):
                     swap.build_script(fake_staged(Path(bad)), pid=1)
 
+    # -- what the script checks before it claims to have worked -------------
+
+    def test_the_staged_numbers_are_written_into_the_script(self):
+        # They were dead fields on StagedUpdate for a while: computed at
+        # staging time and read by nothing. This is what makes them matter.
+        script = swap.build_script(
+            fake_staged(self.install, file_count=252, exe_bytes=4_600_000),
+            pid=1)
+        self.assertIn('set "EXPECT=252"', script)
+        self.assertIn('set "EXESIZE=4600000"', script)
+
+    def test_it_counts_the_files_it_wrote_and_measures_the_exe(self):
+        self.assertIn(
+            'for /f %%N in (\'dir /a-d /s /b "%INSTALL%" ^| '
+            '"%SYS%\\find.exe" /c /v ""\') do set "COUNT=%%N"', self.script)
+        self.assertIn('for %%A in ("%INSTALL%\\%EXE%") do set "NEWSIZE=%%~zA"',
+                      self.script)
+        self.assertIn("if %COUNT% LSS %EXPECT% goto shortcount", self.script)
+        self.assertIn("if not %NEWSIZE% EQU %EXESIZE% goto badexe",
+                      self.script)
+        self.assertIn(":shortcount", self.script)
+        self.assertIn(":badexe", self.script)
+
+    def test_both_new_checks_end_in_a_rollback(self):
+        for label in (":shortcount", ":badexe", ":copyfailed"):
+            with self.subTest(label=label):
+                tail = self.script.split(label, 1)[1]
+                self.assertIn("goto rollback",
+                              tail.split("\r\n\r\n", 1)[0],
+                              f"{label} does not roll back")
+
+    def test_update_finished_comes_after_the_checks_and_nowhere_else(self):
+        # The defect in one assertion: the old script wrote this line whatever
+        # had actually landed on disk.
+        self.assertEqual(self.script.count("update finished"), 1)
+        self.assertLess(self.script.index("if %COUNT% LSS %EXPECT%"),
+                        self.script.index("update finished"))
+        self.assertLess(self.script.index("if not %NEWSIZE% EQU %EXESIZE%"),
+                        self.script.index("update finished"))
+
+    def test_the_payload_survives_until_the_checks_have_passed(self):
+        # rd used to run before the success line was written, so a bad update
+        # destroyed the only copy of the new build on the machine.
+        self.assertEqual(self.script.count('rd /s /q "%STAGING%"'), 1)
+        self.assertLess(self.script.index("if %COUNT% LSS %EXPECT%"),
+                        self.script.index('rd /s /q "%STAGING%"'))
+
+    def test_the_log_records_the_numbers_and_not_just_the_verdict(self):
+        self.assertIn("%COUNT% files in the install, expected at least "
+                      "%EXPECT%", self.script)
+        self.assertIn("%EXE% is %NEWSIZE% bytes, expected %EXESIZE%",
+                      self.script)
+        # /NJH and /NJS suppressed robocopy's own header and summary, so
+        # update.log structurally could not say how many files moved. Read off
+        # the command itself, since the comment above it names both flags.
+        [command] = [line for line in self.script.split("\r\n")
+                     if line.startswith('"%SYS%\\robocopy.exe"')]
+        self.assertNotIn("/NJH", command)
+        self.assertNotIn("/NJS", command)
+        self.assertIn("/NFL /NDL", command)
+
+    def test_there_is_no_check_that_cannot_fire(self):
+        # `start` returns 0 as soon as it hands the exe to Windows, so the
+        # errorlevel test that used to follow it detected nothing.
+        started = self.script.index('start "" /D "%INSTALL%"')
+        after = self.script[started:started + 400]
+        self.assertNotIn("if errorlevel 1 goto rollback", after)
+
+    def test_the_rollback_puts_the_new_exe_back_before_restoring_the_old(self):
+        put_back = self.script.index(
+            'move /Y "%INSTALL%\\%EXE%" "%PAYLOAD%\\%EXE%"')
+        restore = self.script.index(
+            'if exist "%INSTALL%\\%EXE%.bak" move /Y "%INSTALL%\\%EXE%.bak"')
+        self.assertLess(put_back, restore,
+                        "the new exe is overwritten before it is kept")
+
+    def test_a_staged_copy_with_nothing_to_check_against_is_refused(self):
+        # Zeroes would make the count check pass on any install and the size
+        # check fail on every one. Refusing while nothing has been touched is
+        # the better of those two.
+        for kwargs in ({"file_count": 0}, {"exe_bytes": 0}):
+            with self.subTest(**kwargs):
+                with self.assertRaises(swap.SwapNotStarted):
+                    swap.build_script(fake_staged(self.install, **kwargs),
+                                      pid=1)
+
 
 # ---------------------------------------------------------------------------
 # The swap helper, actually running
@@ -570,6 +733,11 @@ class SwapRun(unittest.TestCase):
     #: must not be able to reach a real Rapid PDF somebody has open.
     EXE = "rapid-pdf-swaptest.exe"
 
+    #: How many files the payload really holds. Not two: the whole point of
+    #: the checks being tested is that a payload of two files must not be able
+    #: to end an update with "update finished" in the log.
+    PAYLOAD_FILES = 60
+
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="rapidpdf-swap-test-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
@@ -582,15 +750,40 @@ class SwapRun(unittest.TestCase):
         (self.install / "_internal").mkdir()
         (self.install / "_internal" / "old.txt").write_bytes(b"the old build")
 
-        self.staged = fake_staged(self.install)
-        payload = self.staged.payload_dir
+        payload = client.staging_dir_for(self.install) / "payload"
         (payload / "_internal").mkdir(parents=True)
         # The same working exe plus a marker byte, so "did the swap happen"
         # is a byte comparison and not a guess.
         new_exe = stand_in.read_bytes() + b"\x00NEW"
         (payload / self.EXE).write_bytes(new_exe)
         (payload / "_internal" / "new.txt").write_bytes(b"the new build")
+        for n in range(self.PAYLOAD_FILES - 2):
+            (payload / "_internal" / f"qt{n:03d}.dll").write_bytes(b"x" * 20)
         self.new_exe = new_exe
+        self.old_exe = (self.install / self.EXE).read_bytes()
+        # The truthful numbers for the payload that is actually on disk.
+        self.staged = self._staged()
+
+    def _staged(self, **kwargs) -> client.StagedUpdate:
+        """The staged copy, honest by default and wrong on request."""
+        kwargs.setdefault("file_count", self.PAYLOAD_FILES)
+        kwargs.setdefault("exe_bytes", len(self.new_exe))
+        return fake_staged(self.install, **kwargs)
+
+    def _run(self, staged, *, seconds: str = "1.5", wait_turns: int = 60):
+        """Run the helper against an app that exits on its own. Returns the log."""
+        app = subprocess.Popen(
+            [sys.executable, "-c", f"import time; time.sleep({seconds})"],
+            creationflags=NO_WINDOW)
+        self.addCleanup(app.kill)
+        script = swap.write_script(staged, exe_name=self.EXE, pid=app.pid,
+                                   wait_turns=wait_turns)
+        helper = swap.launch(script, self.install)
+        self.addCleanup(helper.kill)
+        app.wait(timeout=30)
+        self.assertEqual(helper.wait(timeout=90), 0)
+        self.script_file = script
+        return (self.install / swap.LOG_NAME).read_text(errors="replace")
 
     def _sweep(self):
         """Kill anything still carrying the test's image name. Normally a no-op."""
@@ -599,20 +792,7 @@ class SwapRun(unittest.TestCase):
                        check=False)
 
     def test_the_helper_waits_swaps_and_restarts(self):
-        # Stand-in for the running app: a process that exits on its own, so
-        # the helper's wait loop has something real to wait for.
-        app = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(1.5)"],
-            creationflags=NO_WINDOW)
-        self.addCleanup(app.kill)
-
-        script = swap.write_script(self.staged, exe_name=self.EXE,
-                                   pid=app.pid, wait_turns=60)
-        helper = swap.launch(script, self.install)
-        self.addCleanup(helper.kill)
-
-        app.wait(timeout=30)
-        self.assertEqual(helper.wait(timeout=90), 0)
+        log = self._run(self.staged)
 
         installed = self.install / self.EXE
         self.assertEqual(installed.read_bytes(), self.new_exe,
@@ -623,10 +803,50 @@ class SwapRun(unittest.TestCase):
                         "the supporting files were not moved in")
         self.assertFalse(self.staged.staging_dir.exists(),
                          "the staging folder was not cleaned up")
-        self.assertFalse(script.exists(), "the helper did not delete itself")
+        self.assertFalse(self.script_file.exists(),
+                         "the helper did not delete itself")
 
-        log = (self.install / swap.LOG_NAME).read_text(errors="replace")
         self.assertIn("update finished", log)
+        # The log has to name what it checked, not just that it was happy.
+        self.assertIn("expected at least 60", log)
+        self.assertIn(f"expected {len(self.new_exe)}", log)
+        # robocopy's own header and summary are the record of how many files
+        # moved. Matched on the product name, which is the one part of that
+        # banner a non-English Windows does not translate.
+        self.assertIn("ROBOCOPY", log)
+
+    def test_a_copy_that_lands_short_rolls_back_and_says_so(self):
+        # The reported bug, reproduced: the install ends up with far fewer
+        # files than the update was supposed to bring. Everything the old
+        # script checked still passes here (robocopy exits 1, the exe exists
+        # under the right name), and it used to write "update finished".
+        log = self._run(self._staged(file_count=self.PAYLOAD_FILES * 20))
+
+        self.assertNotIn("update finished", log)
+        self.assertIn("FAILED", log)
+        self.assertIn("so the copy did not finish", log)
+        self.assertEqual((self.install / self.EXE).read_bytes(), self.old_exe,
+                         "the previous exe was not put back")
+        self.assertFalse((self.install / f"{self.EXE}.bak").exists(),
+                         "the .bak was left behind instead of being restored")
+        self.assertTrue(self.staged.staging_dir.exists(),
+                        "the staging folder was destroyed after a failure")
+        self.assertTrue((self.staged.payload_dir / self.EXE).is_file(),
+                        "the new exe was thrown away, so there is nothing "
+                        "left to retry the update from")
+
+    def test_an_exe_that_is_not_the_downloaded_one_rolls_back(self):
+        # The other half of the old bug: `if not exist` passed on a name, so
+        # a zero byte or truncated exe counted as a successful swap. Here the
+        # count is right and only the size is wrong.
+        log = self._run(self._staged(exe_bytes=len(self.new_exe) + 1))
+
+        self.assertNotIn("update finished", log)
+        self.assertIn("is not the new build", log)
+        self.assertIn(f"{len(self.new_exe)} bytes", log)
+        self.assertEqual((self.install / self.EXE).read_bytes(), self.old_exe,
+                         "the previous exe was not put back")
+        self.assertTrue((self.staged.payload_dir / self.EXE).is_file())
 
     def test_it_refuses_to_swap_while_the_app_is_still_running(self):
         # The failure that matters most: a wait loop that reads "no output"

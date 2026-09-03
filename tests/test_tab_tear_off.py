@@ -638,7 +638,13 @@ def test_a_lone_tab_dropped_on_another_bar_empties_its_window(
         qt_app, store, registry, tmp_path):
     """The one case where the single-tab drag still moves a document: the
     source is emptied and closes, which is right because it is going away and
-    not being handed back."""
+    not being handed back.
+
+    The close is DEFERRED by one pass of the event loop, hence the
+    `processEvents` before the registry is counted. A window that closes on the
+    stack of the mouse event that emptied it is 0xC000041D: see
+    `MainWindow.move_view_to_window` and tests/test_tear_off_crash.py.
+    """
     source = _window(registry, tmp_path, ["a.pdf"], at=(100, 100))
     other = _window(registry, tmp_path, ["x.pdf", "y.pdf"], at=(2000, 100))
     bar = source.document_area().bar()
@@ -655,6 +661,8 @@ def test_a_lone_tab_dropped_on_another_bar_empties_its_window(
 
     assert other.document_area().count() == 3
     assert other.document_area().view_at(0) is moving
+    assert source.document_area().count() == 0
+    qt_app.processEvents()
     assert registry.count() == 1
     other.document_area().check_invariant()
 

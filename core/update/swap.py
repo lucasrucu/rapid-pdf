@@ -20,7 +20,7 @@ WHY A .cmd AND NOT THE TWO OBVIOUS ALTERNATIVES:
 A batch file is plain text, generated fresh for one update, and it deletes
 itself afterwards. Everything it does is a standard command someone can read.
 
-THE FOUR RULES IT IMPLEMENTS, each a failure it has to survive:
+THE FIVE RULES IT IMPLEMENTS, each a failure it has to survive:
 
   * IT WAITS for the app's PID to be gone, and gives up with a message rather
     than racing it. Moving files under a live process is how you get a
@@ -32,9 +32,19 @@ THE FOUR RULES IT IMPLEMENTS, each a failure it has to survive:
   * THE PREVIOUS EXE IS KEPT as rapid-pdf.exe.bak. If anything after that
     point fails, including the relaunch, the .bak goes back and the old
     version starts. A failed update must never leave a dead install.
-  * IT WRITES A LOG beside the exe, every run, success or failure. When an
-    update goes wrong the app is not running, so there is nowhere else for it
-    to say anything.
+  * IT COUNTS WHAT IT WROTE before it calls the update done, and rolls back
+    when the count does not add up. This rule was bought expensively. The
+    version before it decided success on two things: robocopy exiting under 8,
+    which it does when it copied NOTHING, and the new exe existing as a NAME,
+    which says nothing about its size. An install ended up with 34 files, no
+    exe, and an _internal holding four entries where hundreds belong, and the
+    log said "update finished" underneath it. A check that cannot fail is not
+    a check, it is a sentence about how things usually go.
+  * IT WRITES A LOG beside the exe, every run, success or failure, and the log
+    carries the numbers it checked, not just the verdict. When an update goes
+    wrong the app is not running, so there is nowhere else for it to say
+    anything, and "it failed" without the counts sends the next person
+    guessing. Robocopy's own job summary is left in there for the same reason.
 
 EVERY EXTERNAL COMMAND IS FULLY QUALIFIED to %SystemRoot%\\System32, and that
 is not tidiness. On a machine with Git for Windows on PATH, a bare `find`
@@ -43,11 +53,14 @@ reports "not running" for a process that is very much running. The cost of
 that would be the exe being replaced underneath a live app. Same risk for
 `sort`, `robocopy` and `ping`.
 
-WHAT IT HONESTLY CANNOT DO. It can tell that the new exe started; it cannot
-tell that it stayed up. A build that launches and dies on its own second line
-is beyond a batch file, and pretending otherwise would mean a rollback on a
-timer, which would fight a slow first launch. The .bak is the recovery that
-does work: rename it back by hand and the previous version runs again.
+WHAT IT HONESTLY CANNOT DO. It cannot tell that the new exe stayed up, and it
+cannot even tell that it started: `start` returns 0 the moment it hands the exe
+to Windows, so there is no errorlevel worth reading after it and the script no
+longer pretends there is. A build that launches and dies on its own second line
+is beyond a batch file, and covering it would mean a rollback on a timer, which
+would fight a slow first launch. What it CAN check is what is on disk before
+the launch, and it does, to the file. The .bak is the recovery for the rest:
+rename it back by hand and the previous version runs again.
 """
 
 from __future__ import annotations
@@ -103,10 +116,37 @@ def build_script(staged: StagedUpdate, *, exe_name: str = EXE_NAME,
     Kept as one function rather than assembled from fragments: the order of
     these steps IS the safety argument, and it should read top to bottom for
     somebody working out what a failed update did.
+
+    THE SUCCESS CRITERIA, in full, because they used to be weaker than they
+    looked. "update finished" is written when, and only when, all of these
+    held:
+
+      1. the app's process was gone before anything moved,
+      2. robocopy exited under 8,
+      3. the exe was renamed into place and exists,
+      4. the install then held at least `staged.file_count` files, counted off
+         the disk after the swap,
+      5. and that exe was exactly `staged.exe_bytes` bytes.
+
+    4 and 5 are the ones that carry the weight. 2 passes when robocopy copied
+    nothing at all, and 3 passes on a zero byte file with the right name.
     """
     install = str(Path(staged.install_dir))
     payload = str(Path(staged.payload_dir))
     staging = str(Path(staged.staging_dir))
+    # The two numbers the script verifies against. Refused rather than
+    # defaulted: a zero here would make the count check pass on any install and
+    # the size check fail on every one, and both of those are worse than being
+    # told the update cannot be applied while nothing has been touched.
+    expect_files = int(staged.file_count)
+    expect_exe = int(staged.exe_bytes)
+    if expect_files < 1 or expect_exe < 1:
+        raise SwapNotStarted(
+            f"The update cannot be applied: the staged copy reports "
+            f"{expect_files} files and a {expect_exe} byte {exe_name}, so "
+            "there is nothing to check the result against.\n"
+            "Nothing has been changed. Download the update again."
+        )
     # These go into `set "VAR=..."` lines. A quote would close the assignment
     # and a percent sign would be read as a variable, and either produces a
     # script that does something other than what it says, while the app is
@@ -134,6 +174,15 @@ def build_script(staged: StagedUpdate, *, exe_name: str = EXE_NAME,
         f'set "PID={int(pid)}"',
         f'set "LIMIT={int(wait_turns)}"',
         'set "WAITED=0"',
+        "rem What the finished install has to look like. EXPECT is a floor and",
+        "rem not an equality: an install legitimately carries files this",
+        "rem payload did not bring (update.log, the .bak, anything an older",
+        "rem version left), but after a copy that worked, every one of the",
+        "rem payload's files is in there, so the total cannot be lower.",
+        f'set "EXPECT={expect_files}"',
+        f'set "EXESIZE={expect_exe}"',
+        'set "COUNT=0"',
+        'set "NEWSIZE=0"',
         "rem Fully qualified, every one of them: a bare `find` on a machine",
         "rem with Git for Windows on PATH is GNU find, which fails and reports",
         "rem a running app as closed. That would swap the exe under a live",
@@ -154,13 +203,24 @@ def build_script(staged: StagedUpdate, *, exe_name: str = EXE_NAME,
         "",
         ":closed",
         'call :log "Rapid PDF has closed, applying the update"',
+        'call :log "this update is %EXPECT% files with a %EXESIZE% byte '
+        '%EXE%, and the install will be counted afterwards to prove it"',
         "",
         "rem Everything except the exe first. /MOVE empties the payload as it",
         "rem goes; the exe is excluded because it is swapped by rename below.",
+        "rem /NJH and /NJS are deliberately NOT here. They suppress robocopy's",
+        "rem job header and summary, and the summary is the only record of how",
+        "rem many files actually moved: without it a failed update cannot be",
+        "rem read afterwards, which is how one shipped 34 files and said it had",
+        "rem finished. /NFL /NDL stay, so the log gets the totals and not 252",
+        "rem lines of filenames.",
         '"%SYS%\\robocopy.exe" "%PAYLOAD%" "%INSTALL%" /E /MOVE '
-        '/XF "%PAYLOAD%\\%EXE%" /NFL /NDL /NJH /NJS /NP /R:2 /W:2 '
+        '/XF "%PAYLOAD%\\%EXE%" /NFL /NDL /NP /R:2 /W:2 '
         '>>"%LOG%" 2>&1',
         "rem robocopy exit codes below 8 are success, 8 and up are failures.",
+        "rem This is the WEAKEST of the checks and nothing is trusted to it: 0",
+        "rem means it copied nothing, and 1, 2 and 3 mean it copied some of it.",
+        "rem All of those pass here and are caught by the count below.",
         "if errorlevel 8 goto copyfailed",
         "",
         "rem The exe, by rename, both ways. The old one becomes the .bak that",
@@ -175,9 +235,34 @@ def build_script(staged: StagedUpdate, *, exe_name: str = EXE_NAME,
         "|| goto rollback",
         'if not exist "%INSTALL%\\%EXE%" goto rollback',
         "",
-        'call :log "files are in place, starting Rapid PDF"',
+        "rem THE CHECK THAT DECIDES. Everything above reports on what it tried",
+        "rem to do; these two lines read what is actually on the disk. The",
+        "rem count is of files only (/a-d), the whole tree (/s), bare (/b),",
+        "rem and find.exe counts the lines. find is fully qualified for the",
+        "rem same reason as every other command here: GNU find would read the",
+        "rem argument as a directory and answer something useless.",
+        "for /f %%N in ('dir /a-d /s /b \"%INSTALL%\" ^| "
+        "\"%SYS%\\find.exe\" /c /v \"\"') do set \"COUNT=%%N\"",
+        "rem %%~zA is the size of the exe now sitting in the install. An exe",
+        "rem that is missing leaves this empty, which `if not defined` turns",
+        "rem back into 0 rather than into a syntax error two lines down.",
+        'for %%A in ("%INSTALL%\\%EXE%") do set "NEWSIZE=%%~zA"',
+        'if not defined COUNT set "COUNT=0"',
+        'if not defined NEWSIZE set "NEWSIZE=0"',
+        'call :log "checked: %COUNT% files in the install, expected at least '
+        '%EXPECT%. %EXE% is %NEWSIZE% bytes, expected %EXESIZE%."',
+        "if %COUNT% LSS %EXPECT% goto shortcount",
+        "if not %NEWSIZE% EQU %EXESIZE% goto badexe",
+        "",
+        'call :log "verified, starting Rapid PDF"',
         'start "" /D "%INSTALL%" "%INSTALL%\\%EXE%"',
-        "if errorlevel 1 goto rollback",
+        "rem No errorlevel check after start, on purpose. It returns 0 as soon",
+        "rem as it hands the exe to Windows, so a check there passes whatever",
+        "rem happens next, and a check that cannot fire reads like a promise",
+        "rem this file is not in a position to make.",
+        "rem The staging folder goes only now, after the checks passed. While",
+        "rem anything above can still send this to :rollback, the payload is",
+        "rem the only copy of the new build on the machine.",
         'rd /s /q "%STAGING%" >nul 2>&1',
         'call :log "update finished. The previous exe is beside the new one '
         'as %EXE%.bak"',
@@ -191,24 +276,49 @@ def build_script(staged: StagedUpdate, *, exe_name: str = EXE_NAME,
         "",
         ":locked",
         'call :log "FAILED: %EXE% could not be renamed, so something still '
-        'has it open. NOTHING has been changed."',
+        'has it open. %EXE% itself was NOT changed, but the robocopy above '
+        'had already run, so the supporting files may have moved in. Run the '
+        'update again from %STAGING% once nothing is holding the exe."',
         "goto restart",
         "",
+        ":shortcount",
+        'call :log "FAILED: the install holds %COUNT% files and this update '
+        'needed at least %EXPECT%, so the copy did not finish. See the '
+        'robocopy summary above for what it managed. Rolling back."',
+        "goto rollback",
+        "",
+        ":badexe",
+        'call :log "FAILED: %EXE% in the install is %NEWSIZE% bytes and the '
+        'downloaded one is %EXESIZE%, so what is under that name is not the '
+        'new build. Rolling back."',
+        "goto rollback",
+        "",
         ":copyfailed",
-        'call :log "FAILED: robocopy could not put the supporting files in '
+        'call :log "FAILED: robocopy gave up putting the supporting files in '
         'place. The install may now be PART updated: check the robocopy '
-        'output above. %EXE% was NOT touched."',
-        "goto restart",
+        'summary above. Rolling back."',
+        "goto rollback",
         "",
         ":rollback",
         'call :log "FAILED partway through the swap. Putting the previous '
         '%EXE% back."',
+        "rem The new exe goes back to the payload FIRST, while it still",
+        "rem exists. Overwriting it with the .bak would destroy the only copy",
+        "rem of the new build on the machine and leave nothing to retry from.",
+        'if not exist "%PAYLOAD%" md "%PAYLOAD%" >nul 2>&1',
+        'if exist "%INSTALL%\\%EXE%.bak" if exist "%INSTALL%\\%EXE%" '
+        'move /Y "%INSTALL%\\%EXE%" "%PAYLOAD%\\%EXE%" >nul 2>&1',
         'if exist "%INSTALL%\\%EXE%.bak" move /Y "%INSTALL%\\%EXE%.bak" '
         '"%INSTALL%\\%EXE%" >nul 2>&1',
+        'if not exist "%INSTALL%\\%EXE%" call :log "SERIOUS: there is no '
+        '%EXE% in the install and no %EXE%.bak to put back. Reinstall Rapid '
+        'PDF from the release page."',
         'call :log "the previous %EXE% is back and has been started. The new '
-        'version was NOT applied. If the robocopy line above moved any '
-        'supporting files in before this, they are still there, so run the '
-        'update again to finish the job properly."',
+        'version was NOT applied. The staged copy has been LEFT in %STAGING% '
+        'on purpose, so run this update again rather than downloading it '
+        'twice. If the robocopy line above moved any supporting files in '
+        'before this, they are still there, and running the update again '
+        'finishes the job properly."',
         "goto restart",
         "",
         ":restart",
