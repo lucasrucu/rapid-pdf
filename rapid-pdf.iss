@@ -18,7 +18,7 @@
 ; created has to name what that build actually created.
 #define AppName "RapidPDF"
 #define OldAppName "Rapid PDF"
-#define AppVersion "1.7.0"
+#define AppVersion "1.8.0"
 #define AppPublisher "Lucas Ruiz"
 #define AppExeName "rapid-pdf.exe"
 ; Stable GUID for upgrades/uninstall. Keep this fixed across versions.
