@@ -45,7 +45,9 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import QPoint, QPointF, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal,
+)
 from PySide6.QtGui import QAction, QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractButton, QHBoxLayout, QMenu, QSizePolicy, QStackedWidget, QStyle,
@@ -101,6 +103,27 @@ TRAILING_SLACK = 10
 # The unsaved-changes dot, drawn in place of the close X.
 DIRTY_DOT_RADIUS = 3.5
 
+# The close control: the size of the whole button, which is also its hover pill,
+# and the width of the X drawn inside it. The X was previously derived from
+# `adjusted(5, 5, -5, -5)` on a 16px box, which is a 6px span; naming it keeps
+# the glyph and the box independent, so the pill can grow without the mark
+# growing with it.
+CLOSE_BUTTON_SIZE = 16
+CLOSE_GLYPH_SPAN = 6.0
+
+# How far the close button's right edge sits inside the tab's right edge.
+#
+# THIS EXISTS BECAUSE QSS CANNOT SET IT. `QStyleSheetStyle` computes
+# SE_TabBarTabRightButton itself, reads neither the `::tab` padding nor its
+# margin, and never delegates to the widget's style, so a QProxyStyle override
+# is not consulted either. Both were measured rather than assumed: raising
+# `padding-right` from 6px to 20px moved the button by zero pixels, and a proxy
+# style counted zero calls. Qt pins the button one pixel inside the tab rect,
+# which against 10px of left padding is what "not centred at all" looks like.
+# The only remaining lever is to move the widget, which is
+# `DocumentTabBar._place_close_buttons`.
+CLOSE_BUTTON_RIGHT_INSET = 10
+
 # The line drawn where a torn-off tab would land. In the accent, and full
 # height: it has to read as "between these two tabs" from the corner of the eye,
 # while the thing actually being looked at is the window under the cursor.
@@ -121,6 +144,10 @@ DROP_WASH_ALPHA = 46
 
 # The accent outline around the target strip, under the wash.
 DROP_OUTLINE_WIDTH = 2
+
+# Matched to the tab's own corner radius in ui/theme.py. A square frame drawn
+# around a row of rounded tabs reads as a second shape arguing with the first.
+DROP_OUTLINE_RADIUS = 8
 
 # Below this width the strip is not painted with drop feedback at all. A wash
 # and an outline are a way of saying "this whole strip"; on a bar a few pixels
@@ -259,13 +286,25 @@ class _TabCloseButton(QAbstractButton):
     the two things want the same few pixels and the one you need is decided by
     what you are about to do: reading the bar, you want to know which documents
     are unsaved; reaching for this button, you want the close control.
+
+    EVERYTHING HERE IS DRAWN IN FLOATING POINT, AND THAT IS THE FIX FOR HALF OF
+    "the x is not centered at all". `QRect(0, 0, 16, 16).center()` is QPoint(7,
+    7), not 8: QRect::center rounds down because a QRect's right edge is its
+    last pixel rather than its bound. The X was built from that point and from
+    `adjusted(5, 5, -5, -5)`, which put its midpoint at 7.5 while the true
+    centre of the box is 8.0. Half a pixel, on an antialiased 1.3px pen, is a
+    visibly soft, lopsided glyph rather than a crisp one. QRectF has no such
+    rounding, so the centre is exact and both strokes land on the same point.
+
+    The other half of the problem is not in this class and cannot be fixed from
+    here: see `DocumentTabBar._place_close_buttons`.
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setCursor(Qt.CursorShape.ArrowCursor)
-        self.setFixedSize(16, 16)
+        self.setFixedSize(CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE)
         self._dirty = False
         self._glyph = QColor("#666666")
         self._hover_bg = QColor(0, 0, 0, 28)
@@ -300,29 +339,38 @@ class _TabCloseButton(QAbstractButton):
         super().leaveEvent(event)
 
     def sizeHint(self) -> QSize:
-        return QSize(16, 16)
+        return QSize(CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE)
+
+    def glyph_centre(self) -> QPointF:
+        """The exact middle of the button, in float. Named for the tests, which
+        cannot see pixels but can ask where the mark was put."""
+        return QRectF(self.rect()).center()
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        rect = self.rect()
+        rect = QRectF(self.rect())
+        centre = rect.center()
         if self.shows_dot():
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(self._glyph)
-            centre = rect.center()
             painter.drawEllipse(centre, DIRTY_DOT_RADIUS, DIRTY_DOT_RADIUS)
             return
         if self.underMouse():
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(self._hover_bg)
-            painter.drawRoundedRect(rect, 3, 3)
+            # Half a pixel in on every side so the rounded edge sits inside the
+            # button rather than straddling its boundary.
+            painter.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), 3, 3)
         pen = QPen(self._glyph)
         pen.setWidthF(1.3)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(pen)
-        inset = QRect(rect).adjusted(5, 5, -5, -5)
-        painter.drawLine(inset.topLeft(), inset.bottomRight())
-        painter.drawLine(inset.topRight(), inset.bottomLeft())
+        half = CLOSE_GLYPH_SPAN / 2
+        painter.drawLine(QPointF(centre.x() - half, centre.y() - half),
+                         QPointF(centre.x() + half, centre.y() + half))
+        painter.drawLine(QPointF(centre.x() + half, centre.y() - half),
+                         QPointF(centre.x() - half, centre.y() + half))
 
 
 #: How long a page drag has to rest over a tab before that tab comes forward.
@@ -490,6 +538,26 @@ class DocumentTabBar(QTabBar):
     def drop_active(self) -> bool:
         return self._drop_active
 
+    def _can_paint_drop_feedback(self) -> bool:
+        """Whether this bar is a real strip rather than a few stray pixels.
+
+        THIS IS THE BACKSTOP, NOT THE FIX. The reported artifact was "a small
+        gold box floating in the caption": a wash and a 2px outline are a way
+        of saying "this whole strip", and around a bar a few pixels wide they
+        say something else entirely. The width threshold was the first answer
+        and it is kept, with an empty bar refused outright, because a bar with
+        nothing in it has no gap for a tab to land between and so can never
+        legitimately be lit.
+
+        The condition that actually produced the box is upstream of here and is
+        now handled there: a window holding one empty document hides its whole
+        header (`_sync_header_visibility`), and the tear-off used to name that
+        window as a target and light its bar anyway. `_show_drop_feedback` now
+        declines to light a strip that is not on screen, so the state is never
+        set rather than being set and then not drawn.
+        """
+        return self.count() > 0 and self.width() >= DROP_FEEDBACK_MIN_WIDTH
+
     def set_checked_indices(self, indices):
         """Which tabs are ticked, for painting. DocumentArea owns the truth."""
         indices = tuple(sorted(set(indices)))
@@ -574,6 +642,51 @@ class DocumentTabBar(QTabBar):
         reference = window.width() if window is not None else self.width()
         return max(TAB_MIN_WIDTH, reference - TAB_STRIP_RESERVE)
 
+    def _place_close_buttons(self):
+        """Move every close button to where the stylesheet implies it should be.
+
+        THE STYLESHEET CANNOT DO THIS, which is the whole reason the method
+        exists. `QStyleSheetStyle` works out SE_TabBarTabRightButton on its own,
+        consults neither the `::tab` padding nor its margin, and does not fall
+        through to the widget's style, so overriding `subElementRect` in a
+        QProxyStyle is not consulted either. Both facts were measured, not
+        inferred: taking `padding-right` from 6px to 20px moved the button by
+        exactly zero pixels, and a proxy style installed on this bar counted
+        exactly zero calls. What Qt actually does is pin the button one pixel
+        inside the tab rect, which next to 10px of left padding is a tab with
+        breathing room down one side and none down the other.
+
+        Vertically Qt centres on the tab RECT, which is right only while the
+        stylesheet's top and bottom margins match. They now do, deliberately;
+        see the tab block in ui/theme.py. So this only has to correct x, and it
+        deliberately leaves y alone rather than duplicating arithmetic that is
+        already correct and would then have two owners.
+
+        CALLED FROM THREE PLACES AND IT NEEDS ALL THREE. `tabLayoutChange` is
+        the documented hook and covers adding, removing, moving and resizing.
+        It is not enough on its own: `QTabBar::setTabButton` re-lays out that
+        one tab directly without ever raising `tabLayoutChange`, so a button
+        installed on a new tab would sit at Qt's position until something else
+        happened to the bar. `resizeEvent` is the third because the share
+        budget, and therefore every tab rect, moves with the window.
+        """
+        side = self._button_side()
+        for i in range(self.count()):
+            button = self.tabButton(i, side)
+            if not isinstance(button, _TabCloseButton):
+                continue
+            rect = self.tabRect(i)
+            if rect.isEmpty():
+                continue
+            geometry = button.geometry()
+            x = rect.right() - geometry.width() - CLOSE_BUTTON_RIGHT_INSET
+            if x != geometry.x():
+                button.move(x, geometry.y())
+
+    def tabLayoutChange(self):
+        super().tabLayoutChange()
+        self._place_close_buttons()
+
     def sizeHint(self) -> QSize:
         """The tabs, plus a deliberate strip of nothing after the last one.
 
@@ -597,6 +710,7 @@ class DocumentTabBar(QTabBar):
         # place to re-ask for the hint.
         super().resizeEvent(event)
         self.updateGeometry()
+        self._place_close_buttons()
 
     # -- the dirty dot -------------------------------------------------
 
@@ -612,6 +726,10 @@ class DocumentTabBar(QTabBar):
             button.apply_palette(self._palette)
         button.clicked.connect(lambda: self._on_close_clicked(button))
         self.setTabButton(index, self._button_side(), button)
+        # setTabButton lays this one tab out again WITHOUT raising
+        # tabLayoutChange, so without this the button would keep Qt's placement
+        # until the next unrelated relayout. See _place_close_buttons.
+        self._place_close_buttons()
         return button
 
     def _on_close_clicked(self, button: _TabCloseButton):
@@ -646,6 +764,11 @@ class DocumentTabBar(QTabBar):
     def _accent(self) -> QColor:
         return QColor(self._palette.accent) if self._palette is not None \
             else QColor("#3b82f6")
+
+    def _accent_press(self) -> QColor:
+        """The accent's pressed value, used for marks drawn ON the accent."""
+        return QColor(self._palette.accent_press) if self._palette is not None \
+            else QColor("#1d4ed8")
 
     def paintEvent(self, event):
         """The tabs, then the tick marks, then the drop feedback over the lot.
@@ -682,25 +805,49 @@ class DocumentTabBar(QTabBar):
         # set_drop_active on its bar, so the case is reached routinely rather
         # than rarely. Since the bar now hugs its tabs it is narrower than it
         # used to be, which would have made this more common, not less.
-        if self._drop_active and self.width() >= DROP_FEEDBACK_MIN_WIDTH:
+        if self._drop_active and self._can_paint_drop_feedback():
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
             wash = QColor(accent)
             wash.setAlpha(DROP_WASH_ALPHA)
-            painter.fillRect(self.rect(), wash)
+            inset = DROP_OUTLINE_WIDTH / 2
+            frame = QRectF(self.rect()).adjusted(inset, inset, -inset, -inset)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(wash)
+            # Rounded to the tab's own radius: a square frame around a row of
+            # rounded tabs reads as a second, competing shape.
+            painter.drawRoundedRect(frame, DROP_OUTLINE_RADIUS,
+                                    DROP_OUTLINE_RADIUS)
             pen = QPen(accent)
             pen.setWidth(DROP_OUTLINE_WIDTH)
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            inset = DROP_OUTLINE_WIDTH // 2
-            painter.drawRect(self.rect().adjusted(
-                inset, inset, -inset - 1, -inset - 1))
+            painter.drawRoundedRect(frame, DROP_OUTLINE_RADIUS,
+                                    DROP_OUTLINE_RADIUS)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
 
         # Same gate, same reason: a 4px line on a bar barely wider than 4px is
         # the same artifact wearing a different shape.
-        if self._drop_x is not None and self.width() >= DROP_FEEDBACK_MIN_WIDTH:
-            left = max(0, min(int(self._drop_x) - DROP_LINE_WIDTH // 2,
-                              self.width() - DROP_LINE_WIDTH))
-            painter.fillRect(
-                QRect(left, 0, DROP_LINE_WIDTH, self.height()), accent)
+        #
+        # NOT IN THE ACCENT, AND THAT IS THE POINT. The line used to be the
+        # same colour as the wash and the outline it is drawn on top of, which
+        # is invisible by construction: at index 0 it lands exactly under the
+        # frame's left edge and the two merge into one thick gold border that
+        # says nothing about position. A pressed-accent line reads as a mark ON
+        # the highlighted strip in both themes, darker than the wash in light
+        # and brighter than it in dark. It is also held inside the frame rather
+        # than clamped to the bar, so the first and last positions are as
+        # legible as the ones in the middle.
+        if self._drop_x is not None and self._can_paint_drop_feedback():
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            edge = DROP_OUTLINE_WIDTH + 1
+            left = max(edge, min(int(self._drop_x) - DROP_LINE_WIDTH // 2,
+                                 self.width() - DROP_LINE_WIDTH - edge))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(self._accent_press())
+            painter.drawRoundedRect(
+                QRectF(left, edge, DROP_LINE_WIDTH,
+                       max(1, self.height() - 2 * edge)),
+                DROP_LINE_WIDTH / 2, DROP_LINE_WIDTH / 2)
 
     def mouseDoubleClickEvent(self, event):
         """Empty space opens a new tab. A double-click ON a tab does nothing.

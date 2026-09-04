@@ -94,6 +94,7 @@ strip keeps its own size.
 | `Ctrl+S` | Save |
 | `Ctrl+Shift+S` | Save As |
 | `Ctrl+W` | Close the current tab |
+| `Ctrl+Shift+T` | Reopen the last closed tab |
 | `Ctrl+Q` | Quit every window |
 | Drop a PDF on a window | Opens it as a new tab in THAT window |
 
@@ -120,6 +121,7 @@ them to one folder instead.
 |---|---|
 | `Ctrl+T` | New tab |
 | `Ctrl+W` | Close the current tab |
+| `Ctrl+Shift+T` | Reopen the last closed tab, in this window |
 | `Ctrl+PgDn` / `Ctrl+PgUp` | Next / previous tab by POSITION, wrapping |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab by RECENT USE |
 | Click the `+` button | New tab |
@@ -135,11 +137,23 @@ tapping Tab to walk further back through the ones you have visited, and let Ctrl
 go to land on one. The list is frozen while Ctrl is down, so the walk keeps
 going back instead of bouncing between the last two.
 
-Dragging a tab DOWN off the bar tears it into its own window, which appears
-under the cursor straight away and follows it. Drop it on another window's tab
-bar and it docks there, at the gap the insertion line is showing. Drop it
-anywhere else and it stays where you let go. Escape mid-drag puts it back where
-it came from. Dragging sideways, however far, is only ever a reorder.
+Dragging a tab DOWN off the bar tears it out, and a picture of it follows the
+cursor. Bring that near another window and the tab JOINS that window there and
+then, rather than waiting for you to let go: the strip lights up to say it is
+the one receiving, and a line shows the gap the tab has landed in. Let go over
+no window at all and it becomes its own window, which is the only moment a new
+window is made. Escape mid-drag puts it back where it came from. Dragging
+sideways, however far, is only ever a reorder.
+
+A window holding a single tab is the exception: dragging that tab moves the
+whole window, and it merges into another window only when you let go over it.
+
+`Ctrl+Shift+T` reopens the last tab you closed, in the window you press it in.
+It remembers the last ten, so pressing it again keeps walking back, and the
+history is shared across every window: a tab closed in a window you have since
+closed still comes back. It restores the file, the page you were on and the
+zoom. A file that has been deleted or moved since is skipped without a fuss and
+the one before it comes back instead.
 
 Closing the last tab closes the window. A tab with unsaved changes shows a dot
 where its close button would be; hover it and the dot becomes the X again.
