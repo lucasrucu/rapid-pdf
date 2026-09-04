@@ -44,8 +44,6 @@ from __future__ import annotations
 import os
 import sys
 
-from core.version import APP_VERSION  # noqa: F401  (kept for future gating)
-
 #: The ProgID. This string is frozen and must never be renamed again. The app
 #: was renamed on the shell surface from "Rapid PDF" to "RapidPDF" in 1.8.0,
 #: and the one thing that survived unharmed was this identifier, because it was
