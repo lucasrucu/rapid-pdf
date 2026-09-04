@@ -10,10 +10,20 @@ Releases before 1.6.0 were written up on the
 [Releases page](https://github.com/lucasrucu/rapid-pdf/releases) and are not
 backfilled here.
 
-## [Unreleased]
+## [1.8.0] - 2026-09-04
 
-Two things people see, and one they should stop seeing. The version literals
-are still 1.7.0: bumping them is the release commit's job and this is not one.
+The tab strip release, and three crashes. The strip was rebuilt to read like a
+browser's, closing a tab is something you can take back now, and the gesture of
+dragging a tab out into its own window no longer kills the process.
+
+### Added
+
+- **Reopen a closed tab, `Ctrl+Shift+T`.** The last ten closures, held across
+  every window rather than per window, so a tab closed in a window that has
+  since been closed itself still comes back. It restores the file, the page you
+  were on and the zoom you were at, through the same path session restore uses,
+  which is the only one that converts a remembered zoom back out of the raster
+  scale it was stored in. A file deleted since is skipped without a dialog.
 
 ### Changed
 
@@ -32,10 +42,21 @@ are still 1.7.0: bumping them is the release commit's job and this is not one.
 - **The tabs look like tabs.** The strip was labels with an accent underline:
   no border, no corner radius, nothing between one tab and the next, and an
   active fill three values away from the background, so the only thing marking
-  the current document was a two-pixel line. It now reads the way a browser's
-  does. The active tab is a raised card with a border and rounded top corners,
-  inactive tabs take a fill under the pointer and a hairline between them, and
-  the hairline is dropped beside the active tab so the card reads as one shape.
+  the current document was a two-pixel line. Every tab is now a closed rounded
+  rectangle, all four corners, floating on the strip with a gap underneath it.
+  The active one is the only one filled and bordered and the inactive ones are
+  bare, which leaves the strip quiet until you look for the document you are in.
+  The hairline that used to separate one tab from the next is gone: the space
+  does that job now.
+
+- **The close button sits in the middle of the tab.** It was one pixel from the
+  right edge and two and a half pixels high, in every tab, and no amount of
+  padding moved it. Qt's stylesheet style works the button's position out for
+  itself, reads neither the padding nor the margin, and never hands the question
+  on, so the widget is positioned directly now, from the three places that can
+  change a tab's geometry. The tab's own margins were made symmetric at the same
+  time, since the vertical half of the error came from Qt centring on the tab
+  rectangle while the stylesheet drew the tab inset from it.
 
 - **The new-tab button is next to the tabs.** It sat at the far right of the
   caption, against the window controls, with an empty lane between it and the
@@ -53,7 +74,57 @@ are still 1.7.0: bumping them is the release commit's job and this is not one.
   instead of setting one as text: it was U+2304, a thinly covered codepoint
   that renders as an empty box wherever a font does not carry it.
 
+- **You can see where a dragged tab is going to land again.** Earlier in this
+  release the wash, the outline and the insertion line were taken out, on the
+  reasoning that the tab now joins the strip on approach and being able to see
+  the real thing beats a highlight promising it. That turned out to hide the
+  feature: the tab does join, but with nothing marking the strip it is joining,
+  nobody could tell it had happened. All three are back, as what makes the join
+  legible rather than as a substitute for it. The insertion line is read after
+  the tab has joined, so it marks where the tab actually is, and it is drawn in
+  the pressed accent because a gold line on a gold wash cannot be seen.
+
 ### Fixed
+
+- **Dragging a tab out into its own window killed the app.** Exit code
+  `0xC000041D`, reliably, on dragging a tab into a window whose only tab was an
+  empty one and then on to a third window. The cause was a check on the message
+  path asking Qt for a window's native handle with a call that creates the
+  handle when there is not one. Closing a window destroys its handle, the next
+  message for that window made a new one, making one dispatches two more
+  messages straight back into the same code, and it went round until the stack
+  ran out. Windows reports a stack overflow inside a window procedure as that
+  exit code. The same question is asked now with a call that only ever reads.
+  Alongside it, the work that closes or reparents a window is deferred off the
+  message stack rather than run inside it, because that was what put a
+  just-closed window in the queue to begin with, and the tear-off releases its
+  hold on the mouse and keyboard before it changes a window rather than after.
+  - Worth knowing: the 31 existing tear-off tests all passed against the broken
+    code. They run offscreen, which has no window procedure and no native
+    handles, so the boundary that was failing does not exist in the harness.
+    This was reproduced and confirmed on a real desktop instead, and what the
+    new tests pin is the source rule rather than the crash.
+
+- **OCR could corrupt the document it was reading.** The background worker drove
+  the live document directly, inserting and deleting pages, while the window
+  drew from the same document. PyMuPDF documents are not safe to use from two
+  threads. The worker opens its own copy now and hands the finished file back
+  for the window to apply, which keeps the original path so the next save still
+  writes where it always would.
+
+- **A rendering path read freed memory.** Rendering a page at a given zoom built
+  the image over a temporary buffer, and the image does not copy what it is
+  handed, so the buffer was released for exactly the line that needed it.
+
+- **The updater said it had finished after writing half an update.** It decided
+  success on the copy step's exit code, which is zero when it copied nothing,
+  and on the new exe existing as a name rather than as something of a plausible
+  size. It counts the files actually on disk after the swap now and checks the
+  size of the exe it swapped in, puts the old version back when either falls
+  short, keeps the downloaded payload until those checks pass, and writes the
+  numbers into `update.log` so a bad update names its own cause. This protects
+  updates applied *from* 1.8.0 onward: the script that applies an update is
+  written by the version you are updating away from.
 
 - **The gold box while dragging a tab.** Tearing a tab off washes the target
   strip in the accent and outlines it, which is how the drop target says "this
