@@ -35,6 +35,11 @@ THE SHAPE OF ONE GESTURE.
             what Chromium does. Coming back costs only DOCK_MARGIN, and that
             asymmetry is the hysteresis that stops the state flapping.
   crossing  grab the mouse and show a picture of the tab. NOTHING MOVES.
+  approach  the tab JOINS the strip it is near, and that strip lights up: an
+            accent wash and outline saying which window, and a line saying
+            where in it. The attach is the behaviour and the paint is how you
+            can tell it happened. See `_show_drop_feedback` for why both are
+            needed and why one of them was briefly not there.
   release   `releaseMouse()` FIRST, always. Then, and only then: adopt into the
             window under the cursor, or create a new one.
   escape    nothing to undo, because nothing left.
@@ -225,6 +230,7 @@ class TabTearOff:
         self._offset = QPoint()       # where in the tab the cursor took hold
         self._target = None           # (window, insertion index) under the cursor
         self._attached_to = None      # the window whose strip is holding it now
+        self._lit = None              # the window whose strip is painted right now
         self._start_dpr = 1.0
 
     def is_dragging(self) -> bool:
@@ -435,10 +441,21 @@ class TabTearOff:
             # emptying and closing the very window under the pointer.
             if self._source_window is not None:
                 self._source_window.move(self.ghost_position(global_pos))
+            # The lone tab has nothing to attach, so the feedback is the ONLY
+            # thing telling you the window will merge on release rather than
+            # just sit where you dropped it. Its own strip is never lit: the
+            # target is somewhere to go, and the source is where you already
+            # are.
+            self._show_drop_feedback(
+                target if target is not None
+                and target[0] is not self._source_window else None)
             return
 
         if target is not None:
             self._attach_to_strip(*target)
+
+        # After the attach, never before: the line marks where the tab now is.
+        self._show_drop_feedback(target)
 
         # The ghost is shown only while the cursor is off the strip that holds
         # the tab. On the strip, the tab itself is the feedback and a second
@@ -605,15 +622,93 @@ class TabTearOff:
         return None
 
     def _set_target(self, target):
-        """Kept as the tests' window onto where a drop would land.
+        """Record where a drop would land. Pure state, and the tests read it.
 
-        IT NO LONGER PAINTS ANYTHING. The accent wash, the outline and the
-        insertion line all said "this is where the tab would go if you let go
-        now", and they were answering a question the tab itself now answers by
-        being there. Removing them also removes the gold box that was appearing
-        mid-drag, at the source rather than by suppressing the symptom.
+        Deliberately does no painting. The feedback has to be put up AFTER the
+        live attach has moved the tab, not before, so it is a separate call:
+        see `_show_drop_feedback`.
         """
         self._target = target
+
+    def _show_drop_feedback(self, target):
+        """Light up the strip the tab is going into, and where in it.
+
+        WHY THIS CAME BACK. It was removed on purpose, and the reason was
+        sound at the time: the tab now JOINS the target strip on approach
+        rather than being promised to it, so the tab being there is itself the
+        answer to "where will this land". The trouble is that nobody can see it
+        happen. A tab quietly appearing among five others, while the eye is on
+        the cursor and a ghost is following it, is a change with nothing to
+        draw attention to it, and the feature was reported as missing by the
+        person who had asked for it and already had it. Feedback that says
+        "this window, here" is not competing with the live attach; it is what
+        makes the live attach legible.
+
+        THE OTHER HALF OF THE ORIGINAL REASON IS KEPT. Removing the painting
+        also removed a gold box that appeared over a collapsed, empty bar. That
+        is now fixed where it actually lives, in
+        `DocumentTabBar._can_paint_drop_feedback`, which refuses to paint a bar
+        with no tabs in it instead of relying on a width to stand in for the
+        same question. So the artifact does not come back with the feedback.
+
+        THE INDEX IS READ AFTER THE ATTACH, NOT BEFORE, and that is why this is
+        not folded into `_set_target`. By the time this runs the tab is already
+        sitting in the target strip, so `insertion_x` returns the left edge of
+        the tab being carried and the line marks where it actually is. Reading
+        it before the attach would put the line one position stale on every
+        frame, which is worse than no line at all.
+        """
+        window = target[0] if target is not None else None
+        if self._lit is not None and self._lit is not window:
+            self._clear_drop_feedback_on(self._lit)
+            self._lit = None
+        if target is None or not _usable(window):
+            return
+        try:
+            bar = window.document_area().bar()
+            if not bar.isVisible():
+                # A window holding one empty document hides its header, so
+                # there is no strip on screen to light. Lighting it anyway is
+                # what used to leave an accent box in the caption. `_hit_test`
+                # asks the same question before choosing an index; this asks it
+                # again because the answer can change mid-drag, when a window
+                # empties behind the tab that just left it.
+                return
+            index = target[1]
+            if not self._whole_window:
+                # The tab has already joined this strip, so the index the hit
+                # test produced counts it. Where it sits now IS the answer.
+                at = window.document_area().index_of(self._view)
+                if at >= 0:
+                    index = at
+            bar.set_drop_active(True)
+            bar.set_drop_indicator(bar.insertion_x(index))
+            self._lit = window
+        except (AttributeError, RuntimeError):   # pragma: no cover - defensive
+            self._lit = None
+
+    def _clear_drop_feedback(self):
+        if self._lit is not None:
+            self._clear_drop_feedback_on(self._lit)
+            self._lit = None
+
+    @staticmethod
+    def _clear_drop_feedback_on(window):
+        """Take the paint off one window's strip.
+
+        Guarded like everything else that touches a window reference mid-drag:
+        the window being cleared may have emptied and closed since the frame
+        that lit it, and calling through a dead wrapper from inside a Qt
+        virtual method costs the process rather than raising. See `_usable`.
+        """
+        if not _usable(window):
+            return
+        try:
+            bar = window.document_area().bar()
+            bar.set_drop_indicator(None)
+            bar.set_drop_active(False)
+        except (AttributeError, RuntimeError):   # pragma: no cover - defensive
+            pass
 
     # ------------------------------------------------------------------
     # Ending
@@ -643,6 +738,11 @@ class TabTearOff:
         process is worse.
         """
         self._release_input()
+        # Before the try, not inside it, and it is safe there because it is
+        # guarded end to end itself. Anything that throws below leaves the drop
+        # unfinished, which is recoverable; leaving an accent wash painted on a
+        # strip is a mark on the window that nothing would ever take off again.
+        self._clear_drop_feedback()
         view = self._view
         source = self._source_window
         attached = self._attached_to
@@ -707,6 +807,8 @@ class TabTearOff:
         during the drag.
         """
         self._release_input()
+        # Outside the try for the reason given in `_finish`.
+        self._clear_drop_feedback()
         try:
             self._hide_ghost()
             holder = self._attached_to

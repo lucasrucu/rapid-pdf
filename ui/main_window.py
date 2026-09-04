@@ -132,10 +132,11 @@ from ui.frameless import FramelessHelper
 from ui.title_bar import TitleBar
 from ui.preferences_dialog import PreferencesDialog
 from ui.page_jump import PageJump
+from ui.reopen_stack import capture_view, reopen_stack
 from ui.session import recorder
 from ui.theme import ThemeManager, apply_mica, themed_icon, qtawesome_available, LIGHT
 from ui.undo import WindowUndoStack
-from ui.window_registry import WindowRegistry
+from ui.window_registry import WindowRegistry, same_file
 
 
 class MainWindow(QMainWindow):
@@ -946,6 +947,12 @@ class MainWindow(QMainWindow):
         self._add_action(fm, "Open PDFs…", self.open_pdf, QKeySequence.StandardKey.Open)
         self._add_action(fm, "Combine PDFs…", self.combine_pdfs)
         self._add_action(fm, "Close PDF", self.close_pdf, "Ctrl+W")
+        # Directly under Close, and on the key every browser uses for it. The
+        # literal string for the same reason Quit is spelled out below: a
+        # StandardKey is resolved by the platform and this one has no entry on
+        # Windows worth trusting.
+        self._add_action(fm, "Reopen Closed Tab", self.reopen_closed_tab,
+                         "Ctrl+Shift+T")
         fm.addSeparator()
         self._add_action(fm, "Save", self.save_pdf, QKeySequence.StandardKey.Save)
         self._add_action(fm, "Save As…", self.save_pdf_as, "Ctrl+Shift+S")
@@ -1239,16 +1246,133 @@ class MainWindow(QMainWindow):
         `close_document` answers for it without a prompt. Asking
         `has_document()` here would have made Ctrl+W dead on every tab of a
         window that had just come back, since none of them has read its file.
+
+        THIS IS ALSO WHERE A CLOSED TAB IS REMEMBERED, for Ctrl+Shift+T. Every
+        route that closes a tab arrives here: the tab's X, its middle click,
+        Ctrl+W, and the context menu's Close, Close Others and Close to the
+        Right. `DocumentArea.remove_view` is one level too low to record at,
+        because it also catches a placeholder being retired and a cancelled
+        combine taking its own empty tab away again, neither of which is a
+        document the user closed. See ui/reopen_stack.py.
         """
         view = self._area.view_at(index)
         if view is None:
             return False
         if not view.is_empty():
-            return view.request_close()
+            # Read BEFORE the close and kept only once the close has happened.
+            # `request_close` reaches `PDFDocument.close`, which drops the path
+            # and puts the page back to zero, so a capture taken afterwards
+            # would describe nothing. And it answers False when the save prompt
+            # is cancelled, which is not a close and must leave no entry.
+            entry = capture_view(view)
+            if not view.request_close():
+                return False
+            reopen_stack().push(entry)
+            return True
         if self._area.count() <= 1:
             return False
         self._area.remove_view(index)
         return True
+
+    @staticmethod
+    def _still_on_disk(path: str) -> bool:
+        """Whether a remembered path is still openable, cheaply and quietly.
+
+        The whole existence check for a reopen. A file that has been deleted,
+        renamed or unmounted since it was closed is skipped without a word: the
+        user pressed a key expecting a tab, and a modal complaint about a file
+        they may have deleted on purpose is not an answer to that.
+        """
+        try:
+            return bool(path) and os.path.isfile(path)
+        except (OSError, ValueError):
+            return False
+
+    def _index_of_open_file(self, path: str) -> int:
+        """The tab in THIS window already holding this file, or -1.
+
+        `same_file` rather than `os.path.samefile`, which hits the filesystem
+        and raises for anything that has gone. See ui/window_registry.py.
+        """
+        for index, view in enumerate(self._area.views()):
+            if same_file(view.document_path(), path):
+                return index
+        return -1
+
+    def _drop_spare_tab(self, view, mine: bool):
+        """Take away a tab this reopen made and then found no use for."""
+        if view is None or not mine:
+            return
+        index = self._area.index_of(view)
+        if index >= 0 and self._area.count() > 1:
+            self._area.remove_view(index)
+
+    def reopen_closed_tab(self) -> bool:
+        """Ctrl+Shift+T. Bring the most recently closed tab back, here.
+
+        HERE meaning this window, whichever window the key was pressed in. The
+        history itself is application wide (see ui/reopen_stack.py: a per window
+        stack dies with the window, at the exact moment several tabs closed at
+        once), but the shortcut is window scoped, so where a tab comes back is
+        the one part of it that is local. That is what browsers do too.
+
+        THE ENTRY IS POPPED WHETHER OR NOT IT CAN BE USED. A file that has gone
+        since it was closed is discarded silently and the one below it is tried,
+        down to an empty stack, so holding the key does not stall on a path that
+        will never open again. Nothing here raises and nothing here prompts.
+
+        The restore path is reused rather than `open_path`, and that is not just
+        tidiness: `stage_path` plus `ensure_loaded` is the only route that
+        converts a remembered zoom out of the raster scale it was measured in
+        (see DocumentView.ensure_loaded), so a document reopened after the
+        render scale changed comes back the size it was rather than double it.
+
+        A file already open in this window activates its tab instead of opening
+        a second copy, which is the rule `open_paths` follows for every other
+        way a path arrives.
+
+        Returns True when a tab came back, False when the stack had nothing
+        left that could be opened.
+        """
+        stack = reopen_stack()
+        view = None
+        mine = False
+        while True:
+            entry = stack.pop()
+            if entry is None:
+                break
+            path = entry.get("path")
+            if not self._still_on_disk(path):
+                continue
+            already = self._index_of_open_file(path)
+            if already >= 0:
+                self._area.set_current_index(already)
+                self._drop_spare_tab(view, mine)
+                return True
+            if view is None:
+                before = self._area.count()
+                view = self.tab_for_restore()
+                mine = self._area.count() > before
+            if not view.stage_path(path, page=entry.get("page") or 0,
+                                   zoom=entry.get("zoom") or 0.0,
+                                   fit_mode=entry.get("fit_mode"),
+                                   raster_scale=entry.get("raster_scale") or 0.0):
+                continue
+            index = self._area.index_of(view)
+            if index >= 0:
+                self._area.set_current_index(index)
+            # By hand as well, for the case Qt emits nothing for: the tab being
+            # reopened is already the current one, so setCurrentIndex is a no-op
+            # and nothing would open the file. Same reason ui/session.py calls
+            # it after filling a window.
+            view.ensure_loaded()
+            if view.has_document():
+                return True
+            # It is on disk and it would not open. `open_path` has already said
+            # so in its own words, the view is an ordinary empty tab again, and
+            # the entry below is the next thing to try.
+        self._drop_spare_tab(view, mine)
+        return False
 
     def _on_view_close_requested(self, view=None):
         """A view's document has gone and the tab is what is left.
@@ -1668,7 +1792,15 @@ class MainWindow(QMainWindow):
                 self._force_quit = False
                 event.ignore()
                 return
+            # REMEMBERED FOR Ctrl+Shift+T, and this is the one close path that
+            # does not run through `close_tab`. The tab survives, but the
+            # document the user was reading does not, and "bring back what I
+            # just closed" is a question about the document rather than about
+            # the widget holding it. Read after the prompt and before
+            # `clear_document`, which is what drops the path.
+            entry = capture_view(view)
             view.clear_document()
+            reopen_stack().push(entry)
             recorder().save()   # the window stays, and it holds one tab less
             event.ignore()      # the window stays, empty
             return

@@ -465,10 +465,34 @@ QMenuBar#windowMenuBar {{ padding: 1px 4px; }}
    no radius, no separators and an active fill three values off the background,
    the only thing distinguishing a tab was a 2px line under it.
 
-   The active tab is a raised card with a border and rounded top corners.
-   Inactive tabs are flat with a hover fill and a hairline between them, and the
-   hairline is suppressed next to the selected tab so the card reads as one
-   object. The real widths come from DocumentTabBar.tabSizeHint.
+   EVERY TAB IS A CLOSED ROUNDED RECTANGLE, all four corners, and the bottom
+   edge is closed rather than opening into the strip. The tabs FLOAT on the
+   strip instead of growing out of it, so there is a margin under them as well
+   as over them and the strip shows through the gap.
+
+   The active tab is the only one that is a filled shape: a background one value
+   step closer to the content, with a thin border all the way round. Inactive
+   tabs are bare, no fill and no border, just icon, title and close button, and
+   they take a faint fill under the pointer. That pairing is the whole
+   active/inactive signal, which is why the fill and the border arrive together
+   rather than either one carrying it alone.
+
+   THE TRANSPARENT BORDER ON THE BASE RULE IS NOT DECORATION. An inactive tab
+   with `border: none` and an active tab with `border: 1px` are different sizes,
+   so the label would shift by a pixel every time you switched tabs. The border
+   is always present and only its colour changes.
+
+   NO HAIRLINE BETWEEN TABS. Space separates them now: the closed shape plus a
+   horizontal margin does the job a separator used to do, and a vertical rule
+   butting into a rounded corner reads as a smudge.
+
+   THE VERTICAL MARGIN IS SYMMETRIC AND THAT IS LOAD-BEARING, not taste. Qt
+   centres the close button on the tab RECT while this stylesheet draws the tab
+   inset by its margin, so any difference between the top and bottom margin
+   shows up as a close button sitting off centre. It was 5px over and 0 under,
+   which put the X two and a half pixels high in every tab. See
+   `_TabCloseButton` in ui/document_area.py for the horizontal half of that
+   problem, which no amount of padding here can reach.
 
    No bottom border on the strip. #windowChrome draws the one line that closes
    off the title bar and the menu row together; a second line halfway up the
@@ -483,27 +507,18 @@ QTabBar#documentTabBar::tab {{
     background: transparent;
     color: {p.text_faint};
     border: 1px solid transparent;
-    border-bottom: none;
-    border-top-left-radius: 8px;
-    border-top-right-radius: 8px;
+    border-radius: 8px;
     min-width: 0px;
-    padding: 5px 6px 5px 12px;
-    margin: 5px 0px 0px 0px;
-}}
-/* The hairline between two inactive tabs. Dropped next to the selected one,
-   because a line butting into the card's border reads as a smudge. */
-QTabBar#documentTabBar::tab:!selected:!next-selected {{
-    border-right: 1px solid {p.border};
+    padding: 4px 8px 4px 10px;
+    margin: 4px 2px 4px 2px;
 }}
 QTabBar#documentTabBar::tab:hover:!selected {{
     background-color: {p.surface_hover};
     color: {p.text};
-    border-right-color: transparent;
 }}
 QTabBar#documentTabBar::tab:selected {{
     background-color: {tab_active_bg};
     border: 1px solid {p.border_strong};
-    border-bottom: none;
     color: {p.text};
     font-weight: 600;
 }}
