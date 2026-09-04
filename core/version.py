@@ -32,7 +32,7 @@ from __future__ import annotations
 
 #: The one place the version is decided. Bump it, then bump `rapid-pdf.iss`
 #: and `packaging/version_info.txt` to match (tests/test_version.py checks).
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.8.1"
 
 
 def running_version() -> str:

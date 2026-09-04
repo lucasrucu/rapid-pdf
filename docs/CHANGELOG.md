@@ -10,6 +10,51 @@ Releases before 1.6.0 were written up on the
 [Releases page](https://github.com/lucasrucu/rapid-pdf/releases) and are not
 backfilled here.
 
+## [1.8.1] - 2026-09-04
+
+The shell registration repairs itself now. Two reports, one cause: the
+association keys were written by the installer and by nothing else, so anything
+that changed them behind its back stayed changed.
+
+### Fixed
+
+- **RapidPDF is back in the right-click "Open with" menu.** It disappeared when
+  an uninstall ran by accident on 2 September against a stale uninstall log.
+  Inno's own cleanup flags removed `Software\Classes\RapidPDF.Document` and the
+  `RapidPDF.Document` value under `Software\Classes\.pdf\OpenWithProgids`, and
+  those two between them are the entire reason the app appears in that menu. A
+  ProgID can be perfectly formed and still be invisible; it is that one value
+  in the shared `.pdf` key that lists you. Nothing put them back afterwards,
+  because the in-app updater replaces files and never writes a registry value.
+- **The entry is labelled "RapidPDF" again, not the old tagline.** Explorer
+  takes the name from a per-user cache under `Shell\MuiCache` that is keyed by
+  exe PATH. The 1.8.0 rename shortened the name in the exe but did not move the
+  exe, so the cache went on serving the old spaced name with its tagline on a
+  machine whose exe already said `RapidPDF`. The ProgID now states
+  `FriendlyAppName` outright, which outranks the cache, and a stale cached name
+  is cleared on launch.
+- **PDF files keep looking like PDFs.** Choosing RapidPDF as the default
+  handler paints the white page with the red band, not the gold app tile. This
+  was reported twice and fixed twice before without ever reaching the machine
+  that reported it: the fix shipped in 1.6.0, but 1.6.0 and 1.7.0 were both
+  installed through the in-app updater, which writes no registry, so
+  `DefaultIcon` went on pointing at the exe across two releases that contained
+  the fix. Measured rather than assumed: with the key absent Explorer paints
+  the app tile, so deleting it is not a neutral act and is not an option.
+
+### Added
+
+- **The app asserts its own shell registration on every launch**
+  (`core/shell_registration.py`). It writes only what differs, runs in the
+  primary instance only, and never touches `UserChoice`: which app opens a PDF
+  stays a decision for the person using the machine, and Windows hash protects
+  that value precisely so installers cannot take it.
+- **A second route into the "Open with" list**, under
+  `Software\Classes\Applications\rapid-pdf.exe` with `SupportedTypes`. The
+  entry no longer depends on a single value in a shared key surviving, and
+  Explorer can now resolve the bare exe name it keeps in its own
+  `FileExts\.pdf\OpenWithList`.
+
 ## [1.8.0] - 2026-09-04
 
 The tab strip release, and three crashes. The strip was rebuilt to read like a

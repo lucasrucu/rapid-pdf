@@ -9,6 +9,7 @@ from ui.theme import apply_theme
 from ui.window_registry import WindowRegistry
 from core.resources import app_icon_path
 from core.settings import settings
+from core.shell_registration import ensure_registered
 from core.single_instance import (
     InstanceServer,
     claim_primary,
@@ -112,6 +113,20 @@ def main():
     # written INTO the store, and the flush is what puts the store on disk.
     app.aboutToQuit.connect(save_session)
     app.aboutToQuit.connect(settings().flush)
+
+    # Assert the Windows shell registration, in the PRIMARY instance only.
+    #
+    # The installer writes these keys once and nothing else ever did, which is
+    # how the Open With entry disappeared and stayed gone: the in-app updater
+    # replaces files without touching the registry, so it could neither undo
+    # an accidental uninstall's cleanup nor deliver a fixed document icon.
+    # Doing it here means every launch repairs it. It writes only what
+    # differs, so the normal cost is a handful of registry reads.
+    #
+    # After the single-instance election on purpose. A multi-select "Combine
+    # with RapidPDF" fires one process per selected file, and the losers exit
+    # above; without that guard fifteen processes would race on the same keys.
+    ensure_registered()
 
     icon_path = app_icon_path()
     if icon_path:

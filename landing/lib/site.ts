@@ -17,7 +17,7 @@
 export const REPO = "lucasrucu/rapid-pdf";
 
 /** The released version the site advertises. The one place to change. */
-export const VERSION = "1.8.0";
+export const VERSION = "1.8.1";
 
 export const LINKS = {
   github: `https://github.com/${REPO}`,

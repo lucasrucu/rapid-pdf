@@ -18,7 +18,7 @@
 ; created has to name what that build actually created.
 #define AppName "RapidPDF"
 #define OldAppName "Rapid PDF"
-#define AppVersion "1.8.0"
+#define AppVersion "1.8.1"
 #define AppPublisher "Lucas Ruiz"
 #define AppExeName "rapid-pdf.exe"
 ; Stable GUID for upgrades/uninstall. Keep this fixed across versions.
@@ -148,6 +148,14 @@ Root: HKCU; Subkey: "Software\Classes\RapidPDF.Document\DefaultIcon"; ValueType:
 ;
 ; ProgID with a clean "open" verb: right-click a .pdf > Open with RapidPDF.
 Root: HKCU; Subkey: "Software\Classes\RapidPDF.Document"; ValueType: string; ValueData: "PDF Document"; Flags: uninsdeletekey
+; FriendlyAppName IS THE NAME IN THE OPEN WITH LIST, and it has to be stated.
+; Absent, the shell reads the exe's FileDescription, and before that a per-user
+; CACHE of it under Local Settings\...\Shell\MuiCache, which is keyed by exe
+; PATH. The 1.8.0 rename shortened the resource to "RapidPDF" but left the path
+; alone, so the cache went on serving the old tagline and the Open With entry
+; was still labelled "Rapid PDF - fast PDF annotation and page organization"
+; on a machine whose exe already said "RapidPDF". This value outranks the cache.
+Root: HKCU; Subkey: "Software\Classes\RapidPDF.Document"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#AppName}"
 Root: HKCU; Subkey: "Software\Classes\RapidPDF.Document\shell\open"; ValueType: string; ValueData: "Open with {#AppName}"
 ; Explicit, even though Document is what the shell infers for a command-line
 ; verb: "open" makes a top-level window per item, so the 15-item cap is right.
@@ -183,6 +191,27 @@ Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\RapidPDF
 ; Offer the ProgID as a .pdf handler: shows in "Open with" and carries the
 ; verbs above. Never touches the user's chosen default.
 Root: HKCU; Subkey: "Software\Classes\.pdf\OpenWithProgids"; ValueType: string; ValueName: "RapidPDF.Document"; ValueData: ""; Flags: uninsdeletevalue
+;
+; Applications\rapid-pdf.exe: the SECOND route into the Open With list, and the
+; reason it is here is that the first route is one value deep.
+;
+; Up to 1.8.0 the entry hung entirely on the single OpenWithProgids value
+; above. Delete that one value, or the ProgID it names, and RapidPDF vanishes
+; from the right-click menu with everything else still perfectly installed.
+; That is exactly what happened on 2 Sept 2026, when an uninstall ran by
+; accident against a stale log and its own uninsdelete flags took the ProgID
+; and this value with it. Nothing put them back, because the in-app updater
+; writes files and never registry.
+;
+; SupportedTypes is the part that does the work: it is what lets the shell
+; offer this exe for a .pdf, and it also makes RapidPDF resolvable from
+; Explorer's own FileExts\.pdf\OpenWithList MRU, which stores a bare exe name
+; and looks the app up here. With this key absent that MRU entry is a dead
+; string, which is why "rapid-pdf.exe" sat in his OpenWithList pointing at
+; nothing.
+Root: HKCU; Subkey: "Software\Classes\Applications\{#AppExeName}"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#AppName}"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\Applications\{#AppExeName}\SupportedTypes"; ValueType: string; ValueName: ".pdf"; ValueData: ""
+Root: HKCU; Subkey: "Software\Classes\Applications\{#AppExeName}\shell\open\command"; ValueType: string; ValueData: """{app}\{#AppExeName}"" ""%1"""
 ; Default Programs registration: appears in Settings > Default apps so the
 ; user CAN pick RapidPDF for .pdf. Selectable, never forced, never prompted.
 ; The parent key is removed too when uninstall leaves it empty (verified: with
@@ -220,9 +249,15 @@ Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; F
 //
 // This matters most to anyone upgrading from 1.5.0 or earlier, who has
 // RapidPDF.Document\DefaultIcon pointing at the exe and every PDF painted
-// gold, and to anyone on 1.6.0 or 1.7.0, who has it pointing at our document
-// icon. This install deletes that key outright; without this call nothing on
-// screen changes until something else happens to invalidate the cache.
+// gold. This install repoints that key at {app}\pdf-document.ico; without this
+// call nothing on screen changes until something else invalidates the cache.
+//
+// It also matters to anyone who reached 1.6.0 or 1.7.0 through the IN-APP
+// UPDATER rather than setup. The updater replaces files and writes no
+// registry, so the document icon shipped in 1.6.0 sat unused in their install
+// folder while DefaultIcon still pointed at the exe. From 1.8.1 the app
+// asserts its own registration on every launch, in core/shell_registration.py,
+// so an updated install repairs itself instead of waiting for a reinstall.
 //
 // SHCNE_ASSOCCHANGED is the documented way to do it and is what Explorer
 // itself fires when you change a default app. It is also the honest limit of
