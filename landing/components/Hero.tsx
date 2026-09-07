@@ -6,7 +6,7 @@ import { Download, Monitor, Moon, Sun } from "lucide-react";
 import { AppWindow } from "@/components/AppWindow";
 import { Eyebrow } from "@/components/Eyebrow";
 import { GitHubIcon } from "@/components/BrandIcons";
-import { LINKS, SITE } from "@/lib/site";
+import { LINKS, MAKER, SITE } from "@/lib/site";
 
 type Mode = "light" | "dark";
 
@@ -58,6 +58,17 @@ export function Hero() {
           <p className="mt-3 inline-flex items-center gap-1.5 text-xs text-muted-foreground">
             <Monitor className="h-3.5 w-3.5" aria-hidden="true" />
             Windows 10 / 11 · free · open source
+          </p>
+          {/* Byline. Near the fold on a phone, so the tool has a name on it
+              before anyone scrolls. Jumps to the maker band at the bottom. */}
+          <p className="mt-4 text-sm text-muted-foreground">
+            Built by{" "}
+            <a
+              href="#maker"
+              className="font-medium text-foreground decoration-primary decoration-2 underline-offset-4 hover:underline"
+            >
+              {MAKER.name}
+            </a>
           </p>
         </div>
 

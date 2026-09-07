@@ -30,6 +30,21 @@ export const LINKS = {
     `rapid-pdf-${VERSION}-portable.zip`,
 };
 
+// WHO BUILT IT, AND HOW TO REACH HIM. Added 2026-09-07: the site shipped with
+// no name on it at all, so a visitor who liked the tool had nowhere to go.
+//
+// Every channel below is already published on qori.land. Do not add one that
+// is not, and do not put a phone number or a postal address here.
+export const MAKER = {
+  name: "Lucas Ruiz",
+  initials: "LR",
+  // His own line from the hub, kept word for word so the properties agree.
+  blurb: "I build AI agents and automations that kill manual work.",
+  site: "https://qori.land",
+  email: "lucasruiz1336@gmail.com",
+  linkedin: "https://www.linkedin.com/in/lucasrucu/",
+};
+
 export const SITE = {
   name: "Rapid PDF",
   tagline: "Fast PDF page management and markup. OCR on demand. No wait.",

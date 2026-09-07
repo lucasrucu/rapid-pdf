@@ -1,6 +1,8 @@
+import { Mail } from "lucide-react";
+
 import { GitHubIcon } from "@/components/BrandIcons";
 import { QoriMark } from "@/components/QoriMark";
-import { LINKS } from "@/lib/site";
+import { LINKS, MAKER } from "@/lib/site";
 
 export function Footer() {
   return (
@@ -11,10 +13,30 @@ export function Footer() {
           <p className="text-sm text-muted-foreground">
             A Qori tool. Built in Python with PySide6 and PyMuPDF.
           </p>
+          {/* The very small link at the end. Quiet on purpose: the loud one is
+              the maker band above. */}
+          <p className="text-sm text-muted-foreground">
+            Built by{" "}
+            <a
+              href={MAKER.site}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-foreground transition-colors hover:text-muted-foreground"
+            >
+              {MAKER.name}
+            </a>
+          </p>
         </div>
         <div className="flex items-center gap-5 text-sm text-muted-foreground">
           <a href="https://qori.land" className="transition-colors hover:text-foreground">
             qori.land
+          </a>
+          <a
+            href={`mailto:${MAKER.email}`}
+            aria-label={`Email ${MAKER.name}`}
+            className="transition-colors hover:text-foreground"
+          >
+            <Mail className="h-5 w-5" aria-hidden="true" />
           </a>
           <a
             href={LINKS.github}
