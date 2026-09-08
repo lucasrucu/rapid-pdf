@@ -10,6 +10,43 @@ Releases before 1.6.0 were written up on the
 [Releases page](https://github.com/lucasrucu/rapid-pdf/releases) and are not
 backfilled here.
 
+## [1.9.0] - 2026-09-09
+
+Sophos blocked the 1.8.1 installer on a work laptop the second the download
+finished, before anyone had run it. There was nothing wrong with the build.
+Sophos's machine-learning engine convicts on a shape, and the shape is an
+unsigned executable almost nobody has downloaded yet. A fresh release of a
+personal tool is exactly that. This release takes away the parts of that shape
+the build controls.
+
+Nothing here changes what the app does. If 1.8.1 works for you, 1.9.0 does the
+same thing.
+
+### Changed
+
+- **The build states that it does not use UPX, instead of leaving it to a
+  default.** UPX compresses the exe and unpacks it in memory when it starts,
+  which is the same trick malware uses to get past a static scan, so a packed
+  section reads as malicious on its own. This build was already unpacked, but
+  PyInstaller turns UPX on by itself whenever it finds it on the machine, so a
+  build PC that happened to have UPX installed would have started packing
+  without anyone deciding to. It is now written out in `rapid-pdf.spec` and
+  cannot drift.
+- **The build steps now cover compiling the PyInstaller bootloader from
+  source.** Every app frozen with PyInstaller ships the same bootloader out of
+  the wheel, and so does Python malware, so scanners have had years to build
+  detections around those exact bytes. Compiling it locally means the exe
+  carries a binary nobody has a signature for. It is an install-time step, not
+  a build-time one, so it lives in `docs/build.md` under "Reducing antivirus
+  false positives" with the commands and the compiler it needs.
+
+### Notes
+
+The rest of the problem is prevalence and the missing signature, and neither is
+fixed by a build option. Prevalence sorts itself out as downloads add up. Code
+signing is being decided separately. If a scanner still stops the installer,
+that is the reason, and the file is not doing anything it should not.
+
 ## [1.8.1] - 2026-09-04
 
 The shell registration repairs itself now. Two reports, one cause: the

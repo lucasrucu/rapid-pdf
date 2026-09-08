@@ -1,3 +1,13 @@
 # Dev-only. The frozen build installs requirements.txt and nothing from here.
 -r requirements.txt
 pytest>=7.0
+
+# PYINSTALLER IS DELIBERATELY NOT PINNED HERE, because how it is installed
+# matters more than which version. Installed from the wheel it brings a
+# prebuilt bootloader that every PyInstaller app on earth shares, including the
+# malware, and scanners convict on those bytes. Sophos blocked the 1.8.1
+# installer on download for a mix of reasons and that is one of them. Install
+# it with PYINSTALLER_COMPILE_BOOTLOADER=1 and --no-binary so the bootloader is
+# compiled locally: the exact commands, and the compiler it needs, are in
+# docs/build.md under "Reducing antivirus false positives". A line in this file
+# would only get it installed the wrong way faster.
