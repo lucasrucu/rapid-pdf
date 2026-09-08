@@ -14,6 +14,34 @@ Notes baked in from docs/build.md research:
   so the toolbar icons render in the frozen build.
 - Build from the project's clean PySide6-only venv (no global PySide6/PyQt), or
   PyInstaller may grab the wrong Qt binding.
+
+THE TWO ANTI-FALSE-POSITIVE SETTINGS IN THIS FILE, AND WHY THEY ARE WRITTEN OUT
+RATHER THAN LEFT TO A DEFAULT. On 4 September 2026 Sophos blocked the 1.8.1
+installer on download, on a work laptop, before anybody had run it. Nothing was
+wrong with the build. Sophos's machine-learning engine convicts on a shape, and
+the shape it is tuned for is an unsigned executable that almost nobody has
+downloaded yet. A PyInstaller app matches that shape on its own, and two build
+options make the match tighter, so both are turned off here on purpose:
+
+- `upx=False` on EXE and on COLLECT. UPX is a runtime packer, and self-modifying
+  compressed code that unpacks itself in memory is what actual malware does to
+  hide, so a packed section is close to a straight conviction in a heuristic
+  engine. It buys tens of megabytes off an install that is already going to be
+  around 200 MB, which is not a trade worth making. Left unset PyInstaller
+  defaults to using UPX when it finds it on PATH, so a machine that happens to
+  have UPX installed would silently start packing the build. Stating it here
+  means the build does the same thing on every machine.
+- onedir, again. onefile writes a self-extracting stub that unpacks 100+ MB to a
+  temp folder and executes it from there on every launch, which is both the
+  packer behaviour above and the dropper behaviour scanners watch for. onedir
+  has neither.
+
+Signing is the actual fix for the prevalence half of it and is a separate
+decision. These two are free and worth having either way. The third free
+mitigation, building the PyInstaller bootloader from source so the exe does not
+carry the stock bootloader bytes that every PyInstaller app on earth shares, is
+a property of how PyInstaller was INSTALLED rather than of this spec. It is
+documented in docs/build.md under "Reducing antivirus false positives".
 """
 
 from PyInstaller.utils.hooks import collect_data_files
@@ -53,7 +81,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=False,
+    upx=False,                          # never pack: see the module docstring
     console=False,                      # windowed app, no console window
     disable_windowed_traceback=False,
     icon="assets/rapid-pdf.ico",
@@ -65,7 +93,7 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=False,
+    upx=False,                          # and not on the DLLs either, same reason
     upx_exclude=[],
     name="rapid-pdf",
 )

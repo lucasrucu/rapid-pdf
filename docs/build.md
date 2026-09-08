@@ -19,6 +19,10 @@ Prerequisites (one-time):
 - A clean PySide6-only venv (this repo's `.venv`). No global PySide6/PyQt, because a
   second Qt binding makes PyInstaller grab the wrong one or abort.
 - `pip install -r requirements.txt` plus the build tools: `pip install pyinstaller pillow`.
+  Install PyInstaller the way "Reducing antivirus false positives" below says,
+  not with a plain `pip install pyinstaller`. The difference is whether the exe
+  carries the stock bootloader bytes that every scanner already has a signature
+  for, and it is decided at install time, not at build time.
 - **Inno Setup 6** installed (https://jrsoftware.org/isdl.php) for the installer
   step. On this machine it is a PER-USER install, so `ISCC.exe` is at
   `%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe`, NOT the Program Files path.
@@ -107,6 +111,82 @@ offered to anybody; nothing breaks, nobody is told.
 
 GitHub publishes a sha256 for every asset and the updater refuses to install
 one that has none, so nothing extra has to be uploaded alongside it.
+
+### Reducing antivirus false positives
+
+On 4 September 2026 Sophos blocked `rapid-pdf-setup-1.8.1.exe` on a work laptop
+the moment the download finished, and called it malicious. Nothing was wrong
+with the build. Sophos convicts on a shape rather than on a signature here, and
+the shape its machine-learning engine is tuned for is an unsigned executable
+that hardly anyone has downloaded yet. A fresh release of a personal tool is
+exactly that, and PyInstaller packaging makes the match tighter.
+
+Signing fixes the unsigned half and is a separate decision (see the next
+section). Prevalence fixes itself slowly, as downloads accumulate. The three
+things below are free, they are worth doing whether or not the app is ever
+signed, and two of them are already in the repo.
+
+**1. No UPX. Done, in `rapid-pdf.spec`.** `upx=False` on both `EXE` and
+`COLLECT`. UPX compresses the executable and unpacks it in memory at run time,
+which is the same trick malware uses to hide from a static scan, so a packed
+section is close to an automatic conviction. It is written out rather than left
+blank because PyInstaller's default is to use UPX whenever it finds it on PATH,
+so a machine that happens to have UPX installed would quietly start packing the
+build.
+
+**2. onedir, not onefile. Done, in `rapid-pdf.spec`.** A onefile build is a stub
+that unpacks 100+ MB into a temp folder and runs it from there on every launch.
+That is both the packing behaviour above and the dropper behaviour scanners
+watch for. This repo has always been onedir, for startup speed and because it is
+what the installer wants, and the antivirus benefit comes along with it.
+
+**3. Build the PyInstaller bootloader from source. A one-time install step.**
+
+Every PyInstaller app ships the same prebuilt bootloader, because it comes
+inside the wheel. Malware written in Python ships it too. Scanners have had
+years to build detections around those exact bytes, and a detection that fires
+on the stock bootloader fires on this app for no reason other than that it was
+frozen with the same tool. Compiling the bootloader locally gives the exe a
+binary nobody has a signature for.
+
+It needs a C compiler, and it has to be done when PyInstaller is INSTALLED. A
+build cannot turn it on afterwards, so a venv that got PyInstaller from a wheel
+has to reinstall it.
+
+From a **Developer Command Prompt for VS 2022** (or any shell that has run
+`vcvars64.bat`, so `cl.exe` is on PATH), in the repo root:
+
+```
+set PYINSTALLER_COMPILE_BOOTLOADER=1
+.venv\Scripts\pip install --no-binary pyinstaller --no-cache-dir --force-reinstall pyinstaller==6.21.0
+```
+
+`--no-binary pyinstaller` is what makes pip take the source distribution instead
+of the wheel, which is the only form that has a bootloader to compile.
+`--no-cache-dir` stops pip handing back a wheel it built earlier without the
+environment variable set, which looks like success and changes nothing.
+
+Check it took. The compiled bootloader is newer than the package and is a
+different size from the shipped one:
+
+```
+dir .venv\Lib\site-packages\PyInstaller\bootloader\Windows-64bit-intel
+```
+
+Then rebuild as normal. Nothing in `rapid-pdf.spec` changes.
+
+**Is the toolchain on this machine?** Yes, as of 9 September 2026, and this was
+checked rather than assumed. Visual Studio Build Tools 2022 (17.12.4) is
+installed at `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools`
+with the MSVC toolset `14.42.34433` and Windows SDK `10.0.22621.0`. A C file
+including `windows.h` was compiled and run through `vcvars64.bat` to confirm the
+compiler, the headers and the linker all work, not just that the folders exist.
+`cl.exe` is NOT on the default PATH, so a plain `where cl` fails and the
+Developer Command Prompt (or a `vcvars64.bat` call) is required.
+
+The reinstall itself has not been run. Doing it would rewrite the venv the app
+runs from, and that is a decision for whoever is building, not a side effect of
+writing this down.
 
 ### Adding code signing later (currently OFF)
 
