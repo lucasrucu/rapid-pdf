@@ -82,7 +82,7 @@ def shift_map_after_insert(page_map: dict, at: int, count: int) -> dict:
     a page arriving from another document always is: transfer_pages_from lands
     a non-contiguous selection as one run starting at `at`. Keys at or after
     the insertion point move down by `count`; keys above nothing move at all.
-    The inserted pages themselves are not given keys here — the caller fills
+    The inserted pages themselves are not given keys here. The caller fills
     those in with whatever markup came across with them.
     """
     if count <= 0:

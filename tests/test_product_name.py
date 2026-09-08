@@ -14,12 +14,17 @@ row, and in the taskbar tooltip. A whole tagline in that field made the
 only FileDescription was long, and nothing was checking the two agreed.
 
 THE DASH, SEPARATELY, AND WHY GREP MISSED IT TWICE. version_info.txt held a
-real em dash behind a UTF-8 BOM, and rapid-pdf.iss held "â€”", the
-mojibake you get when UTF-8 bytes are decoded as cp1252 and written back. A
-plain repo grep for U+2014 skips the first (the BOM throws the encoding guess)
-and does not match the second at all, which is how one string survived several
-releases in two files. So the check below reads each file explicitly and looks
-for the character AND its double-encoded form.
+real em dash behind a UTF-8 BOM, and rapid-pdf.iss held the cp1252 mojibake of
+one: the three characters you get when the em dash's UTF-8 bytes are decoded as
+cp1252 and written back. A plain repo grep for U+2014 skips the first (the BOM
+throws the encoding guess) and does not match the second at all, which is how
+one string survived several releases in two files. So the checks below read
+each file explicitly and look for the character AND its double-encoded form.
+
+THIS FILE STAYS PURE ASCII, and the banned characters below are written as
+\\u escapes for that reason. test_no_source_file_anywhere_carries_an_em_dash
+sweeps the whole repo with no exemption list, and a check that has to exempt
+itself is a check with a hole in it.
 
 WHY THE STRINGS ARE READ OUT OF THE BUILD INPUTS. version_info.txt is a literal
 consumed by PyInstaller and rapid-pdf.iss is a literal consumed by Inno Setup.
@@ -61,8 +66,35 @@ APP_NAME = "RapidPDF"
 SETTINGS_APP_NAME = "Rapid PDF"
 
 #: A real em dash, an en dash, and the cp1252 double-encoding of an em dash
-#: that two of these files were actually carrying.
-BANNED_DASHES = ("—", "–", "â€”")
+#: that two of these files were actually carrying. Escapes, not literals: see
+#: the module docstring.
+BANNED_DASHES = ("\u2014", "\u2013", "\u00e2\u20ac\u201d")
+
+#: Directories the repo-wide sweep never descends into. Build output, installed
+#: dependencies, caches, and the agent worktrees under _wt/ (each of which is a
+#: full second checkout, so sweeping it would double-report every finding).
+SWEEP_SKIP_DIRS = {
+    ".git", ".venv", "venv", "env", "node_modules", ".next", "__pycache__",
+    ".pytest_cache", ".mypy_cache", ".ruff_cache", "dist", "build",
+    "installer_output", "graphify-out", "_wt", ".vercel", "_shots",
+}
+
+#: What the sweep reads: text a person writes. Anything else in the tree is
+#: either binary or generated, and neither carries prose.
+SWEEP_SUFFIXES = {
+    ".py", ".md", ".txt", ".iss", ".spec", ".ts", ".tsx", ".js", ".mjs",
+    ".jsx", ".json", ".css", ".html", ".bat", ".ps1", ".ini", ".cfg",
+    ".toml", ".yml", ".yaml",
+}
+
+#: The em dash, the horizontal bar that looks identical at any size, and the
+#: cp1252 mojibake of the em dash. The EN dash is deliberately not here: it is
+#: correct in a numeric range, and the rule is about the punctuation habit.
+SWEEP_BANNED = {
+    "\u2014": "an em dash (U+2014)",
+    "\u2015": "a horizontal bar (U+2015)",
+    "\u00e2\u20ac\u201d": "the cp1252 mojibake of an em dash",
+}
 
 
 def _read(path: Path) -> str:
@@ -138,9 +170,10 @@ def test_the_window_title_is_the_name_then_the_file():
 def test_no_shipped_product_string_carries_a_dash():
     """Every literal these three build inputs put in front of a user.
 
-    Scoped to the build inputs on purpose. The docs under docs/ are prose for
-    whoever is reading the repo, not strings Windows or the app ever shows, so
-    holding them to this would be noise with no user-visible payoff.
+    Kept even though the sweep below covers the whole repo, because these
+    three files are the ones a scanner and the shell read back, and this
+    check also bans the EN dash in them. The sweep does not: an en dash is
+    fine in a numeric range in prose, and not in a product string.
     """
     for path in (VERSION_INFO, ISS, SPEC):
         text = _read(path)
@@ -151,6 +184,51 @@ def test_no_shipped_product_string_carries_a_dash():
                 "PyInstaller and Inno Setup, and one of them has already been "
                 "saved back as cp1252 mojibake once"
             )
+
+
+def _sweepable_files():
+    """Every text file in the repo a person actually writes."""
+    for path in ROOT.rglob("*"):
+        if path.suffix.lower() not in SWEEP_SUFFIXES:
+            continue
+        if any(part in SWEEP_SKIP_DIRS for part in path.relative_to(ROOT).parts):
+            continue
+        if path.is_file():
+            yield path
+
+
+def test_no_source_file_anywhere_carries_an_em_dash():
+    """The whole repo, with no exemption list. Read the module docstring first.
+
+    THE NARROW CHECK ABOVE WAS NOT ENOUGH, and 1.6.0 is the proof: it shipped
+    with the em dash sitting in FileDescription, so Explorer, Task Manager and
+    at least one endpoint scanner all printed it back. The dash was killed in
+    the build inputs, a check was written for the build inputs, and the same
+    character stayed in the toolbar tooltip, in two dozen comments and across
+    the docs, because nothing was looking anywhere else.
+
+    So this looks everywhere, and it has no allow list. A file that needs to
+    talk ABOUT the character writes it as a backslash-u escape, the way this
+    one does.
+    """
+    offenders = []
+    for path in _sweepable_files():
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for dash, what in SWEEP_BANNED.items():
+            if dash not in text:
+                continue
+            line = next(
+                i for i, ln in enumerate(text.splitlines(), 1) if dash in ln
+            )
+            rel = path.relative_to(ROOT).as_posix()
+            offenders.append(f"{rel}:{line} carries {what}")
+
+    assert not offenders, (
+        "no file in this repo may carry an em dash. Use a period, a comma, "
+        "parentheses or a colon, or split the sentence. A spaced hyphen is "
+        "the same habit wearing a hat, so that is not the fix either.\n  "
+        + "\n  ".join(offenders)
+    )
 
 
 def test_the_about_box_describes_without_naming_a_second_time():

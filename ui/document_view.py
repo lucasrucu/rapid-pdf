@@ -934,7 +934,7 @@ class DocumentView(QWidget):
 
     def enhance_for_search(self):
         """Run OCR once, on demand, over every page that doesn't already have
-        an extractable text layer — so scanned/image-only pages become
+        an extractable text layer, so scanned/image-only pages become
         searchable. Runs on a background thread with a progress dialog; the
         normal editing UI stays responsive and untouched while it runs.
         """
@@ -1290,7 +1290,7 @@ class DocumentView(QWidget):
         self._canvas.remove_page_annotations(self._current_page)
         # Page deletion renumbers/removes items the undo stack still references;
         # clear it so a later undo can't replay against stale page indices.
-        # (Mirrors _on_pages_deleted — the Organizer delete path.)
+        # (Mirrors _on_pages_deleted, the Organizer delete path.)
         self._canvas.clear_own_history()
         self._refresh_panel_thumbnails()
         new_page = min(self._current_page, self._doc.page_count() - 1)
@@ -1304,14 +1304,14 @@ class DocumentView(QWidget):
     # ------------------------------------------------------------------
 
     def _on_tab_changed(self, index: int):
-        if index == 1:  # Organizer tab — (re)load a fresh, current snapshot of the pages
+        if index == 1:  # Organizer tab: (re)load a fresh, current snapshot of the pages
             self._refresh_organizer()
 
     def _make_markup_baked_render(self) -> PDFDocument:
         """A throwaway PDFDocument whose pages carry the current unsaved overlays
         baked in, for rendering thumbnails without mutating the live document.
 
-        Shared by the Organizer and the left page panel — both need a clone with
+        Shared by the Organizer and the left page panel. Both need a clone with
         the same per-page markup baked in; only what they do with it differs.
         Caller owns the returned render and must close it (see _close_* helpers).
         """
@@ -1389,7 +1389,7 @@ class DocumentView(QWidget):
         The live document on its own can't be the panel's render source: drawn
         markup lives as Qt overlay items (not in the doc until save), and on open
         the doc still carries the previous save's BAKED markup right up until the
-        strip step — so a panel rendered straight from _doc shows squares the page
+        strip step, so a panel rendered straight from _doc shows squares the page
         no longer has (and misses squares the page now shows). Baking the current
         overlays into a throwaway clone keeps every thumbnail in sync."""
         self._close_panel_render()
@@ -1422,7 +1422,7 @@ class DocumentView(QWidget):
         self._canvas.reorder_pages(new_order)
         # Reorder re-bases every item's page_num; the undo stack's commands still
         # reference the old numbering, so undo would land items on the wrong page.
-        # Structural page ops are incompatible with the item-level undo stack — clear it.
+        # Structural page ops are incompatible with the item-level undo stack, so clear it.
         self._canvas.clear_own_history()
         self._refresh_panel_thumbnails()
         self._current_page = self._canvas._current_page
@@ -1435,7 +1435,7 @@ class DocumentView(QWidget):
             self._mark_dirty()
         for row in rows:  # already in descending order from organizer
             self._canvas.remove_page_annotations(row)
-        # Page deletion is structurally irreversible — the undo stack holds references
+        # Page deletion is structurally irreversible. The undo stack holds references
         # to items on pages that no longer exist. Clear it to prevent corrupted undos.
         self._canvas.clear_own_history()
         self._refresh_panel_thumbnails()
@@ -1466,7 +1466,7 @@ class DocumentView(QWidget):
         _flush_annotations() writes canvas items as PDF annotation objects so they
         survive a save. The canvas also renders them as Qt items; if the baked
         objects remain in the live doc, the next _load_page() produces a background
-        pixmap that already includes them — every annotation then appears twice, the
+        pixmap that already includes them, and every annotation then appears twice, the
         second copy as an unselectable ghost at a rotated position for rotated pages.
         """
         if not self._doc.doc:
@@ -1488,7 +1488,7 @@ class DocumentView(QWidget):
         self._canvas.load_annotation_model(model)
         self._canvas.reload_current_page()
         # (The caller, open_path, rebuilds the left-panel thumbnails from a clone
-        # with these restored overlays baked in — so pages that aren't the current
+        # with these restored overlays baked in, so pages that aren't the current
         # one don't keep showing now-stripped squares, or miss restored ones.)
 
     def _on_page_selected(self, page_num: int):
@@ -1522,7 +1522,7 @@ class DocumentView(QWidget):
         self._page_panel.update_page_thumbnail(self._current_page, thumb)
         # Patch the Organizer's thumbnail too, the same cheap way, so it doesn't
         # lag behind the Editor tab until the next full tab-change rebuild (which
-        # re-clones the whole document via _refresh_organizer — much heavier).
+        # re-clones the whole document via _refresh_organizer, much heavier).
         # Grabbed at the organizer's own (larger) thumb width rather than reusing
         # the panel's pixmap, so it isn't an upscaled/blurry copy.
         org_thumb = self._canvas.grab_current_thumbnail(self._organizer.thumb_width())

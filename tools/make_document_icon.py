@@ -1,5 +1,5 @@
 """
-Generate assets/pdf-document.ico — the icon Explorer paints on .pdf FILES when
+Generate assets/pdf-document.ico, the icon Explorer paints on .pdf FILES when
 Rapid PDF is the default handler.
 
 This is deliberately NOT the app icon. assets/rapid-pdf.ico is the gold Qori

@@ -7,7 +7,7 @@ and an app icon.
 Status: **IMPLEMENTED** (PyInstaller onedir + Inno Setup, unsigned). The
 "Build it" section below is the exact recipe; the research that led here is kept
 underneath for context. Decision taken: PyInstaller (onedir) -> Inno Setup,
-per-user install, USA target, **shipped unsigned for now** (signing deferred —
+per-user install, USA target, **shipped unsigned for now** (signing deferred,
 see "Adding code signing later").
 
 ---
@@ -16,7 +16,7 @@ see "Adding code signing later").
 
 Prerequisites (one-time):
 
-- A clean PySide6-only venv (this repo's `.venv`). No global PySide6/PyQt — a
+- A clean PySide6-only venv (this repo's `.venv`). No global PySide6/PyQt, because a
   second Qt binding makes PyInstaller grab the wrong one or abort.
 - `pip install -r requirements.txt` plus the build tools: `pip install pyinstaller pillow`.
 - **Inno Setup 6** installed (https://jrsoftware.org/isdl.php) for the installer
@@ -27,9 +27,9 @@ Prerequisites (one-time):
 
 Files that drive the build (all committed):
 
-- `assets/rapid-pdf.ico` — multi-size Qori app icon (regen: `python tools/make_icon.py`).
+- `assets/rapid-pdf.ico`: multi-size Qori app icon (regen: `python tools/make_icon.py`).
   This is the APP icon: the exe, taskbar, Start menu, title bar, uninstaller.
-- `assets/pdf-document.ico` — multi-size PDF **document** icon, 16 to 256px
+- `assets/pdf-document.ico`: multi-size PDF **document** icon, 16 to 256px
   (regen: `python tools/make_document_icon.py`). This is the FILE icon, the one
   the installer wires to `RapidPDF.Document\DefaultIcon` so Explorer paints it
   on .pdf files. Deliberately a plain white page with a red PDF label and not
@@ -38,10 +38,10 @@ Files that drive the build (all committed):
   separate. The installer copies this one to `{app}` with its own `[Files]`
   line, because DefaultIcon is stored as a literal path and must not depend on
   where PyInstaller happens to put bundled assets.
-- `packaging/version_info.txt` — exe version/publisher metadata.
-- `rapid-pdf.spec` — PyInstaller onedir spec (icon + version + bundles assets +
+- `packaging/version_info.txt`: exe version/publisher metadata.
+- `rapid-pdf.spec`: PyInstaller onedir spec (icon + version + bundles assets +
   qtawesome fonts).
-- `rapid-pdf.iss` — Inno Setup script (per-user install, shortcuts, uninstaller).
+- `rapid-pdf.iss`: Inno Setup script (per-user install, shortcuts, uninstaller).
 
 ### 1. Freeze with PyInstaller (onedir)
 
@@ -114,10 +114,10 @@ Unsigned today, so users get one SmartScreen "More info -> Run anyway" click.
 That's fine for personal use. To remove it when showcasing:
 
 1. Get a cert. Cheapest sane route is **Azure Trusted Signing** (~$10/mo) IF
-   eligibility works (individuals: US/CA only — Lucas in Indonesia likely needs a
+   eligibility works (individuals: US/CA only, so Lucas in Indonesia likely needs a
    qualifying org; else fall back to an OV cert from a CA). Details in the
    research section below.
-2. Sign the **app exe** first: `signtool sign /fd SHA256 /tr <timestamp-url> /td SHA256 dist\rapid-pdf\rapid-pdf.exe` (Azure Trusted Signing uses its own dlib via `signtool` — see its docs).
+2. Sign the **app exe** first: `signtool sign /fd SHA256 /tr <timestamp-url> /td SHA256 dist\rapid-pdf\rapid-pdf.exe` (Azure Trusted Signing uses its own dlib via `signtool`, see its docs).
 3. Sign the **setup exe**: in the Inno Setup IDE, Tools -> Configure Sign Tools,
    add one named `signtool`, then uncomment `SignTool=signtool` in `rapid-pdf.iss`
    (see the commented block at the bottom) and recompile. Sign BOTH the app exe

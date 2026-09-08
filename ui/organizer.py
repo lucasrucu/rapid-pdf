@@ -60,7 +60,7 @@ PREFETCH_PX = 240
 
 _PAGE_ID = Qt.ItemDataRole.UserRole       # each item's source page index (retagged on edits)
 # The page index in the RENDER doc (markup-baked clone) this item's thumbnail
-# comes from. Set once at refresh and NEVER retagged — a drag reorders only the
+# comes from. Set once at refresh and NEVER retagged, because a drag reorders only the
 # live doc, not the clone, so the lazy renderer must keep pulling each thumbnail
 # from its original clone page or a scrolled-in placeholder would show the wrong
 # page after a reorder.
@@ -91,7 +91,7 @@ class _ThumbDelegate(QStyledItemDelegate):
     # Purely cosmetic horizontal nudge applied to the cells flanking the
     # current drop line during a drag, so the insertion point reads as "pages
     # sliding apart to make room" instead of just a thin indicator line. Does
-    # not touch layout/geometry — only where this delegate paints each cell.
+    # not touch layout/geometry, only where this delegate paints each cell.
     _NUDGE_PX = 10
 
     def __init__(self, parent=None):
@@ -157,7 +157,7 @@ class _DragList(QListWidget):
     goes stale mid-drop (rows shift as earlier ones are removed), which can
     hand a native takeItem/removeRow an out-of-range index and crash the
     process outright (a C++-side assert/segfault, not a catchable Python
-    exception — this is a long-standing Qt issue, not specific to this app).
+    exception, and this is a long-standing Qt issue, not specific to this app).
     So the drop is handled entirely by hand instead of delegating to
     super().dropEvent(): take every selected item out (descending row order,
     so each takeItem() never invalidates a later index), figure out where the
@@ -537,7 +537,7 @@ class PageOrganizer(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._doc = None       # real document — all structural edits happen here
+        self._doc = None       # real document, all structural edits happen here
         self._render = None    # optional PDFDocument whose pages have markup baked in
         self._placeholder_color = QColor(LIGHT.surface_raised)  # themed via apply_palette()
         # Current rung of ZOOM_STEPS, restored from the last run, plus the
@@ -598,7 +598,7 @@ class PageOrganizer(QWidget):
         self._list.setDefaultDropAction(Qt.DropAction.MoveAction)
         self._list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self._list.setDropIndicatorShown(True)
-        # NOTE: don't combine setSpacing() with an explicit setGridSize() here —
+        # NOTE: don't combine setSpacing() with an explicit setGridSize() here:
         # Qt's grid-mode layout adds spacing into the row/column pitch AND into
         # the per-item rect it hands the delegate, and the two don't line up:
         # the whole grid visibly shifts down/right by ~spacing, which clips the
@@ -925,7 +925,7 @@ class PageOrganizer(QWidget):
         """Patch one page's thumbnail in place (e.g. after a live canvas edit),
         instead of rebuilding the whole grid from a fresh markup-baked clone.
 
-        Mirrors PagePanel.update_page_thumbnail — same cheap "grab what the
+        Mirrors PagePanel.update_page_thumbnail, same cheap "grab what the
         canvas already rendered" pixmap, no PyMuPDF re-render and no throwaway
         fitz clone. This is what keeps the Organizer's thumbnails from lagging
         behind the Editor tab, which was patching its own panel this way already.
