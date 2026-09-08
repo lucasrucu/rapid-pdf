@@ -88,7 +88,7 @@ class PDFDocument:
         # LRU cache of rendered page pixmaps keyed by (page_num, zoom_key).
         # A cache hit makes a repeated render_page of the same page+zoom free
         # (the lift re-render, reload-after-strip, organizer/page round-trips).
-        # MUST be invalidated whenever a page's content changes — a stale pixmap
+        # MUST be invalidated whenever a page's content changes. A stale pixmap
         # showing a lifted-out image still present, or old baked markup, is a
         # correctness regression worse than slowness. See invalidate_* below and
         # the call sites in canvas/main_window.
@@ -112,7 +112,7 @@ class PDFDocument:
     def render_page_cached(self, page_num: int, zoom: float = 1.5) -> QPixmap:
         """render_page with an LRU pixmap cache keyed by (page_num, zoom).
 
-        Returns the SAME QPixmap instance for repeated calls — callers must treat
+        Returns the SAME QPixmap instance for repeated calls, so callers must treat
         it as read-only (copy() before cropping; setPixmap shares it, which is
         fine). Any mutation of the page's content must call invalidate_render_page
         (single page) or invalidate_render_cache (whole doc) first.
@@ -204,7 +204,7 @@ class PDFDocument:
         try:
             if self.doc:
                 self.doc.close()
-            self.invalidate_render_cache()   # new document — no stale pixmaps
+            self.invalidate_render_cache()   # new document, no stale pixmaps
             self._render_scale = None        # and a fresh scale decision
             self.doc = fitz.open(path)
             if getattr(self.doc, "needs_pass", False):
@@ -429,7 +429,7 @@ class PDFDocument:
                 else f"Could not save:\n{target}\n\n{e}")
             # If the temp file was written but never renamed into place (the swap
             # succeeds by renaming it away, and the .bak path renames it too), it's
-            # orphaned next to the target — clean it up so failed saves don't litter.
+            # orphaned next to the target. Clean it up so failed saves don't litter.
             if tmp_path and os.path.exists(tmp_path):
                 try:
                     os.remove(tmp_path)
@@ -438,13 +438,13 @@ class PDFDocument:
             return False
 
     # ------------------------------------------------------------------
-    # OCR ("Enhance for Search") — on-demand, explicit only
+    # OCR ("Enhance for Search"): on-demand, explicit only
     # ------------------------------------------------------------------
 
     def page_has_text(self, page_num: int) -> bool:
         """True if this page already carries an extractable text layer.
 
-        Used to skip pages that don't need OCR — most pages in a normal
+        Used to skip pages that don't need OCR. Most pages in a normal
         editing session already have real text, so this keeps a full-document
         OCR pass fast and avoids garbling/duplicating existing text.
         """
@@ -461,12 +461,12 @@ class PDFDocument:
         into PyMuPDF (no tesseract.exe needed at runtime).
 
         Only meant to be called on pages that fail page_has_text() (i.e.
-        scanned/image-only pages) — this rasterizes the page, so running it
+        scanned/image-only pages). This rasterizes the page, so running it
         on a page that already has real vector text/graphics would destroy
         that content, not just add a text layer alongside it.
 
         Note: fitz.Page.get_textpage_ocr() alone does NOT persist a text
-        layer into the saved file — it only returns an in-memory TextPage
+        layer into the saved file. It only returns an in-memory TextPage
         for immediate extraction. Producing bytes via Pixmap.pdfocr_tobytes()
         and splicing that in as the new page is what actually survives
         doc.save() and a later reopen (verified by testing).
@@ -543,7 +543,7 @@ class PDFDocument:
         the image while leaving everything behind it untouched (no hole), the way a
         real PDF editor moves an object.
 
-        Only the tight `cm` (six numbers) immediately-before-`Do` form is removed —
+        Only the tight `cm` (six numbers) immediately-before-`Do` form is removed:
         that cm exists solely to place this image, so dropping it is self-contained.
         Returns True if a placement was removed; False if the safe pattern wasn't
         found (caller should fall back to redaction).
@@ -844,7 +844,7 @@ class PDFDocument:
         self.invalidate_render_cache()   # page set/indices changed
 
     # ------------------------------------------------------------------
-    # Editable annotation model (embedded JSON) — for save/reopen round-trip
+    # Editable annotation model (embedded JSON): for save/reopen round-trip
     # ------------------------------------------------------------------
 
     def _model_embed_names(self) -> list[str]:
@@ -893,7 +893,7 @@ class PDFDocument:
         """Return the embedded editable annotation model, or None if absent.
 
         If the file carries more than one copy (a stale duplicate from an older
-        save), pick the richest — the one describing the most annotations — so a
+        save), pick the richest (the one describing the most annotations) so a
         leftover earlier copy can never override the latest saved markup.
         """
         if not self.doc:

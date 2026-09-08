@@ -11,7 +11,7 @@
 > are named by ROLE in the `Palette` dataclass (two ship: `LIGHT` default, `DARK`),
 > so re-skinning is a one-Palette edit. `ThemeManager` handles apply/toggle/persist
 > and emits `theme_changed` so code-drawn surfaces (scene backgrounds, custom-drawn
-> icons, item delegates) can re-tint — wire those through an `apply_palette(palette)`
+> icons, item delegates) can re-tint, so wire those through an `apply_palette(palette)`
 > method like rapid-pdf's toolbar/organizer/page-panel do. `themed_icon(name, color)`
 > wraps qtawesome with a graceful empty-icon fallback; `apply_mica(win, dark)` is a
 > silent no-op off Win11.

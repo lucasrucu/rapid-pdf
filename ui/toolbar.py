@@ -272,7 +272,7 @@ class ToolBar(QWidget):
         layout.setContentsMargins(6, 10, 6, 10)
         layout.setSpacing(5)
 
-        # --- Tools (always) — icon-led, accent-on-active rail buttons ---
+        # --- Tools (always): icon-led, accent-on-active rail buttons ---
         layout.addWidget(self._section_label("TOOLS"))
         for tid, label, tip in [
             ("select",    "Select  V",    "Select, move and resize objects"),
@@ -353,7 +353,7 @@ class ToolBar(QWidget):
         )
         layout.addWidget(self._text_section)
 
-        # --- Opacity (always) — a preset dropdown, not a slider ---
+        # --- Opacity (always): a preset dropdown, not a slider ---
         layout.addWidget(self._divider())
         layout.addWidget(self._section_label("OPACITY"))
         self._opacity_btn = QToolButton()
@@ -374,13 +374,13 @@ class ToolBar(QWidget):
         # --- Keyboard hints ---
         layout.addWidget(self._divider())
         hints = QLabel(
-            "V/R/L/T — tools\n"
-            "Del — delete\n"
-            "Dbl-click — text\n"
-            "Ctrl+drag — copy\n"
-            "Shift+drag — straight\n"
-            "Ctrl+scroll — zoom\n"
-            "Shift+draw — constrain"
+            "V/R/L/T: tools\n"
+            "Del: delete\n"
+            "Dbl-click: text\n"
+            "Ctrl+drag: copy\n"
+            "Shift+drag: straight\n"
+            "Ctrl+scroll: zoom\n"
+            "Shift+draw: constrain"
         )
         hints.setWordWrap(True)
         hints.setObjectName("section")
@@ -494,7 +494,7 @@ class ToolBar(QWidget):
         if line_width is not None:
             self._line_btn.set_width(line_width)
             if line_width <= 0:
-                # A 0-width border IS "No Border" — show that, not a color chip.
+                # A 0-width border IS "No Border", so show that, not a color chip.
                 self._line_btn.set_none()
 
         fill = summary.get("fill") if summary else None

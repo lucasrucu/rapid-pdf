@@ -33,7 +33,7 @@ PAGE_RENDER_DEBOUNCE_MS = 80
 # repainted crisply.
 SETTLE_MS = 140
 # Minimum drag distance (scene units) before a press over an embedded image lifts
-# it — kept well above double-click jitter so a click/double-click never lifts.
+# it, kept well above double-click jitter so a click/double-click never lifts.
 LIFT_DRAG_THRESHOLD = 8
 # How close to a scrollbar end still counts as "nothing left to scroll" when
 # deciding whether to turn the page. A fractional view transform can leave the
@@ -512,7 +512,7 @@ class TextAnnotationItem(QGraphicsTextItem, AnnotationBase):
 
 
 # ---------------------------------------------------------------------------
-# Undo/redo — snapshots + commands
+# Undo/redo: snapshots + commands
 # ---------------------------------------------------------------------------
 
 def style_snapshot(item) -> dict:
@@ -756,7 +756,7 @@ class PDFCanvas(QGraphicsView):
         self._embedded_images = None          # None = not yet scanned for this page
         self._embedded_images_page = -1       # page the current scan belongs to
 
-        # Tool state — stroke (outline/line) and fill are now independent colors.
+        # Tool state: stroke (outline/line) and fill are now independent colors.
         self._tool = "select"
         self._stroke_color = QColor(255, 255, 0)
         self._fill_color = QColor(255, 255, 0)
@@ -792,7 +792,7 @@ class PDFCanvas(QGraphicsView):
         self._press_additive = False
         self._rubber_item: QGraphicsRectItem | None = None
         # An embedded image under the press becomes liftable only if the gesture
-        # turns into a drag — a plain click / double-click never lifts.
+        # turns into a drag. A plain click / double-click never lifts.
         self._lift_candidate = None
 
         # Resize state
@@ -1484,7 +1484,7 @@ class PDFCanvas(QGraphicsView):
         }
 
     # ------------------------------------------------------------------
-    # Editable annotation model — JSON round-trip (save → reopen → still editable)
+    # Editable annotation model: JSON round-trip (save → reopen → still editable)
     # ------------------------------------------------------------------
 
     def _item_to_json(self, item) -> dict | None:
@@ -1866,7 +1866,7 @@ class PDFCanvas(QGraphicsView):
         self._load_page(page)
 
     def _flush_pending_render(self):
-        """Force any debounced page render to happen now — before hit-testing,
+        """Force any debounced page render to happen now, before hit-testing,
         thumbnail grabs, or structural ops that read back the rendered page."""
         if self._pending_page is not None:
             self._render_pending_page()
@@ -1945,7 +1945,7 @@ class PDFCanvas(QGraphicsView):
             # Cache the rasterised page in ITEM coordinates so per-frame markup
             # repaints blit a cached tile instead of re-scaling a huge pixmap.
             # Item (not Device) coordinate cache keeps memory bounded to the native
-            # raster size — DeviceCoordinateCache would balloon to hundreds of MB
+            # raster size. DeviceCoordinateCache would balloon to hundreds of MB
             # when zoomed in on an A1 drawing.
             self._bg_item.setCacheMode(QGraphicsItem.CacheMode.ItemCoordinateCache)
             self._bg_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
@@ -2040,7 +2040,7 @@ class PDFCanvas(QGraphicsView):
         """List (xref, PDF-coord Rect) for every raster image currently drawn on the page.
 
         Uses get_images(), which stops reporting an image once it has been redacted
-        out (i.e. once lifted) — so lifted images never reappear here.
+        out (i.e. once lifted), so lifted images never reappear here.
         """
         out = []
         if not self._doc or not self._doc.doc or page_num >= self._doc.page_count():
@@ -2066,7 +2066,7 @@ class PDFCanvas(QGraphicsView):
         """Return (xref, fitz.Rect) of the smallest embedded image under scene_pos, or None.
 
         Smallest-area wins so a small image on top of a full-page background is the one
-        you grab (a scanned page that is one big image still lifts as a whole — by design).
+        you grab (a scanned page that is one big image still lifts as a whole, by design).
         """
         if self._zoom <= 0 or not self._doc or not self._doc.doc:
             return None
@@ -2074,7 +2074,7 @@ class PDFCanvas(QGraphicsView):
         # get_image_rects() returns rects in the page's UNROTATED user space, but
         # scene_pos is in rendered/displayed pixels. page.rotation_matrix is the
         # mapping from unrotated user space to the rendered (visible, post-rotation)
-        # image for EVERY page — rot=0 included. We previously used
+        # image for EVERY page, rot=0 included. We previously used
         # transformation_matrix (a pure y-flip) on rot=0 pages, which double-flipped
         # these rects vertically and put the hit region on the OPPOSITE side of the
         # image from where it draws. Verified against ground truth (pixels that change
@@ -2091,7 +2091,7 @@ class PDFCanvas(QGraphicsView):
             if dr.x0 <= scene_pos.x() <= dr.x1 and dr.y0 <= scene_pos.y() <= dr.y1:
                 area = dr.width * dr.height
                 # Skip a near-full-page raster (a whole drawing scanned as one
-                # image): it's the page background, not a liftable element — and
+                # image): it's the page background, not a liftable element, and
                 # lifting it was the cause of the "page turns into a flipped copy" bug.
                 if page_area > 0 and area >= 0.9 * page_area:
                     continue
@@ -2111,14 +2111,14 @@ class PDFCanvas(QGraphicsView):
         z = self._zoom
         page = doc[page_num]
 
-        # Grab the exact pixels currently shown for this image — straight from the
-        # rendered page — so the lifted object keeps the page's orientation. PDFs
+        # Grab the exact pixels currently shown for this image, straight from the
+        # rendered page, so the lifted object keeps the page's orientation. PDFs
         # often place an image with a vertically-flipped matrix; re-inserting the raw
         # extracted bytes un-flipped is what made a lifted raster look rotated 180°.
         # Cropping the render sidesteps the placement transform entirely.
         # fitz_rect is in the page's unrotated user space; convert to pixel coords
         # via page.rotation_matrix, which maps unrotated user space to the rendered
-        # (visible) image for every page — rot=0 and rotated alike. Using
+        # (visible) image for every page, rot=0 and rotated alike. Using
         # transformation_matrix (a y-flip) here mis-placed the crop vertically on
         # rot=0 pages, mirroring the lifted cutout to the opposite side. Must match
         # the same mapping _embedded_image_at uses for the hit-test.
@@ -2138,7 +2138,7 @@ class PDFCanvas(QGraphicsView):
             if pixmap.isNull():
                 return None
 
-        # Encode what we display (PNG) so a later save re-inserts exactly that —
+        # Encode what we display (PNG) so a later save re-inserts exactly that:
         # display and saved file stay identical, no flip on round-trip.
         buf = QBuffer()
         buf.open(QIODevice.OpenModeFlag.WriteOnly)
@@ -2154,14 +2154,14 @@ class PDFCanvas(QGraphicsView):
 
         try:
             # Preferred: drop the image's single content-stream placement operator.
-            # That removes the image while leaving the background behind it intact —
+            # That removes the image while leaving the background behind it intact:
             # no white hole where it sat (the way a real editor moves an object).
             if self._doc.remove_image_placement(page_num, xref):
                 placement_removed = True
             else:
                 # Fallback for images that aren't a tight `cm /Name Do` placement:
                 # redact PIXELS (blanks only the pixels under the rect, so it never
-                # wipes the whole-page background like IMAGE_REMOVE would — but it can
+                # wipes the whole-page background like IMAGE_REMOVE would, but it can
                 # leave a hole where the image was).
                 page.add_redact_annot(fitz_rect, fill=None)
                 page.apply_redactions(
@@ -2175,7 +2175,7 @@ class PDFCanvas(QGraphicsView):
 
         # Background now renders without the lifted image. The placement removal
         # above invalidated this page's cache, so render_page_cached MISSES here
-        # (correct — content changed) and re-renders once, then stores the new
+        # (correct, content changed) and re-renders once, then stores the new
         # pixmap. The mid-drag cost is the single unavoidable re-render; what the
         # cache buys is that the NEXT reload of this page (drop_baked_image_items
         # after save, a page-switch back) is free instead of another ~120ms raster.
@@ -2189,7 +2189,7 @@ class PDFCanvas(QGraphicsView):
         self._page_annotations.setdefault(page_num, []).append(item)
         # We know exactly which xref was just removed; drop it from the existing
         # scan instead of a full get_images + get_image_rects rescan of the page.
-        # (get_images would no longer report this xref anyway — so the rescan was
+        # (get_images would no longer report this xref anyway, so the rescan was
         # pure cost.) A page with many embedded rasters rescanned mid-gesture is
         # avoidable lag; this keeps the post-lift bookkeeping O(images-removed).
         if self._embedded_images is not None and self._embedded_images_page == page_num:
@@ -2548,7 +2548,7 @@ class PDFCanvas(QGraphicsView):
             elif self._annotation_at(scene_pos):
                 self.setCursor(Qt.CursorShape.SizeAllCursor)
             elif self._embedded_image_at(scene_pos) is not None:
-                # Hovering a liftable embedded image — including images placed by
+                # Hovering a liftable embedded image, including images placed by
                 # other apps (e.g. pasted in Acrobat's Edit PDF). A move cursor,
                 # the same one an annotation gets, because that is what a drag
                 # here does: it lifts the image and MOVES it. This used to show an
@@ -2623,7 +2623,7 @@ class PDFCanvas(QGraphicsView):
                 self._lift_candidate = None
 
             elif self._press_empty_pos is not None:
-                # A plain click (no drag). On an embedded image, grab it — lift
+                # A plain click (no drag). On an embedded image, grab it: lift
                 # into a movable object (already selected) so images placed by
                 # other apps are reachable with a click, not just an obscure drag.
                 # _embedded_image_at's near-full-page guard keeps a whole-page

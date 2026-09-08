@@ -169,7 +169,7 @@ class _PageList(QListWidget):
     # moved block once it has rebuilt the strip from the document.
     reorder_requested = Signal(list, list)
     delete_requested = Signal()
-    # (payload dict, insertion index, copy) — a drop from ANOTHER document's
+    # (payload dict, insertion index, copy): a drop from ANOTHER document's
     # strip or grid. The host owns the edit for the same reason it owns the
     # reorder: this widget never touches pages itself. Phase 5.
     transfer_requested = Signal(dict, int, bool)
@@ -462,7 +462,7 @@ class PagePanel(QWidget):
     # and rebuilds this panel from it; the panel never edits pages itself.
     pages_delete_requested = Signal(list)
     pages_reorder_requested = Signal(list, list)
-    #: (payload, insertion index, copy) — pages dragged in from ANOTHER open
+    #: (payload, insertion index, copy): pages dragged in from ANOTHER open
     #: document. Republished from the list; the host owns the edit.
     pages_transfer_requested = Signal(dict, int, bool)
 

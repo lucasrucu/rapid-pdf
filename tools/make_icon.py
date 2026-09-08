@@ -1,5 +1,5 @@
 """
-Generate assets/rapid-pdf.ico — a Qori-branded multi-size app icon.
+Generate assets/rapid-pdf.ico, a Qori-branded multi-size app icon.
 
 Design: a rounded amber/gold tile (Qori Sovereign accent #F1AE04) with a white
 document glyph and a folded corner, the "PDF" wordmark across the bottom. Drawn

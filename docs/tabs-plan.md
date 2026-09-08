@@ -934,7 +934,7 @@ It survives the save, so the file we write has a broken bookmark in it. Same
 applies to `delete_pages` (`:405`). The fix is to drop TOC entries whose
 target went to `-1` after any deletion.
 
-### 6. The SECOND switch into the Organizer throws, and loses the clone — FIXED in phase 3
+### 6. The SECOND switch into the Organizer throws, and loses the clone. FIXED in phase 3
 
 Found during phase 1, and measured on `main` at `ab0506a` before the split, so
 it is not something the split introduced. `_refresh_organizer` closes the old
@@ -998,7 +998,7 @@ the state every render saw when it started rather than waiting for an exception
 to arrive somewhere it can be caught. Those tests fail against the pre-fix
 ordering (verified by reverting it).
 
-### 7. A save that cannot overwrite silently writes a `.bak` — FIXED in phase 3
+### 7. A save that cannot overwrite silently writes a `.bak`. FIXED in phase 3
 
 Found in phase 3, because multi-window is what makes it ordinary. `save()`
 writes an in-place save to a temp file beside the target and swaps it over with
