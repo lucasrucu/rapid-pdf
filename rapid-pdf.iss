@@ -256,6 +256,13 @@ Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; F
 ; never shows, and no skipifsilent, so it runs in exactly the case it is for.
 ; RelaunchAfterUpdate keeps it off every other install, so the two entries can
 ; never both fire and start the app twice.
+;
+; VERIFIED, not assumed, on 9 Sept 2026 with Inno Setup 6 on this machine. The
+; docs describe postinstall and skipifsilent separately and never say outright
+; what a plain entry does under /SILENT, so a throwaway installer was compiled
+; and run with the same switches the updater passes. It fired this entry, it
+; did not fire the checkbox entry above, and it accepted /RAPIDPDFRELAUNCH=1
+; as a command line parameter of its own and read it back through {param:}.
 Filename: "{app}\{#AppExeName}"; Flags: nowait; Check: RelaunchAfterUpdate
 
 ; -----------------------------------------------------------------------------

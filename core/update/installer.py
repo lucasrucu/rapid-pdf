@@ -81,6 +81,15 @@ THE SWITCHES, AND WHY EACH ONE IS THERE:
                           else for anything to be said. Inno's own log is far
                           more detailed than the one this repo used to write.
 
+THIS COMMAND LINE WAS RUN AGAINST A REAL INSTALLER before it shipped, on
+9 Sept 2026 with Inno Setup 6, using a throwaway script that did nothing but
+record what happened. Two things about it are not stated outright anywhere in
+Inno's documentation and both are load bearing: that a plain [Run] entry fires
+under /SILENT, and that Setup accepts a command line switch of its own that it
+knows nothing about. Both held. Setup exited 0, the relaunch entry ran, the
+"Launch RapidPDF" checkbox entry did not (so nothing can start the app twice),
+and the log landed at the path it was given.
+
 PORTABLE INSTALLS GET NO SELF-UPDATE, ON PURPOSE. A portable copy is a folder
 somebody unzipped, and the installer cannot update it: Inno installs to
 %LocalAppData%\\Programs\\RapidPDF whatever folder the running copy is in, so
