@@ -55,9 +55,19 @@ export function Hero() {
               View on GitHub
             </a>
           </div>
+          {/* THIS LINE SAID "open source" AND MUST NOT SAY IT AGAIN WITHOUT A
+              LICENSE. The repo carries no LICENSE file and the README makes no
+              licensing statement, so default copyright applies and nobody may
+              legally reuse the code. That made the claim misleading, not merely
+              unsupported, so it came off on 2026-09-09. Whether to license the
+              project is still open: docs/licensing-decision.md has the options.
+              What replaced it is true today. The app talks to the network in
+              exactly one place, core/update/feed.py, and only to ask GitHub
+              about its own releases. No document ever leaves the machine, OCR
+              included. */}
           <p className="mt-3 inline-flex items-center gap-1.5 text-xs text-muted-foreground">
             <Monitor className="h-3.5 w-3.5" aria-hidden="true" />
-            Windows 10 / 11 · free · open source
+            Windows 10 / 11 · free · your files never leave your PC
           </p>
           {/* Byline. Near the fold on a phone, so the tool has a name on it
               before anyone scrolls. Jumps to the maker band at the bottom. */}
