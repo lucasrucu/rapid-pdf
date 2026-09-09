@@ -20,6 +20,12 @@ from ui.scrolling import (
 
 HANDLE_SIZE = 8
 
+# Font size floor and ceiling, matched to the toolbar's own combo (ui/toolbar.py
+# clamps typed sizes to the same pair). Dragging a text label's corner scales the
+# font, so it has to stop where the box would.
+MIN_FONT_SIZE = 4
+MAX_FONT_SIZE = 144
+
 # Search hits are the accent at two strengths: the hit you are on is a solid
 # wash with an accent outline, the rest are a hint. Both used to be raw RGB,
 # and the weaker one was a yellow that appeared in no palette at all.
@@ -459,9 +465,28 @@ class TextAnnotationItem(QGraphicsTextItem, AnnotationBase):
         self.set_color(c)
 
     def set_font_size(self, size: int):
+        # A label is exactly as big as its text, so the font size IS its
+        # geometry. Without prepareGeometryChange the scene keeps the old
+        # bounding rect indexed and the grown label paints outside its own
+        # entry, leaving a trail behind a corner drag.
+        self.prepareGeometryChange()
         self._font_size = size
         self._apply_style()
         self.update()
+
+    # The corners that get a handle, and the only ones the canvas will resize
+    # from. Named here so the paint below and PDFCanvas._get_text_handles can
+    # never drift apart, which is how the handles came to be decorative.
+    HANDLE_CORNERS = ("tl", "tr", "bl", "br")
+
+    def text_rect(self) -> QRectF:
+        """The label's own rect, without boundingRect's handle padding."""
+        return QGraphicsTextItem.boundingRect(self)
+
+    def scene_text_rect(self) -> QRectF:
+        r = self.text_rect()
+        return QRectF(self.mapToScene(r.topLeft()),
+                      self.mapToScene(r.bottomRight())).normalized()
 
     def boundingRect(self) -> QRectF:
         extra = HANDLE_SIZE * 3
@@ -473,7 +498,7 @@ class TextAnnotationItem(QGraphicsTextItem, AnnotationBase):
         super().paint(painter, option, widget)
         option.state = saved
         if self.isSelected():
-            br = QGraphicsTextItem.boundingRect(self)
+            br = self.text_rect()
             m11 = painter.worldTransform().m11()
             hs = HANDLE_SIZE / m11 if m11 > 0 else HANDLE_SIZE
             pen_w = 1.0 / m11 if m11 > 0 else 1.0
@@ -492,7 +517,7 @@ class TextAnnotationItem(QGraphicsTextItem, AnnotationBase):
 
     def to_annotation_dict(self, zoom: float) -> dict:
         pos = self.pos()
-        br = QGraphicsTextItem.boundingRect(self)
+        br = self.text_rect()
         fitz_rect = fitz.Rect(
             pos.x() / zoom, pos.y() / zoom,
             (pos.x() + br.width()) / zoom, (pos.y() + br.height()) / zoom,
@@ -545,12 +570,20 @@ def style_restore(item, snap: dict):
 def geometry_snapshot(item) -> dict:
     if isinstance(item, LineAnnotationItem):
         return {"line": QLineF(item.line()), "pos": QPointF(item.pos())}
+    if isinstance(item, TextAnnotationItem):
+        # A label has no rect to snapshot: it is sized by its font, so the font
+        # size is its geometry. Capturing pos too matters because scaling from
+        # any corner but the top-left moves the item to keep the far corner
+        # nailed where it was.
+        return {"font_size": item._font_size, "pos": QPointF(item.pos())}
     return {"rect": QRectF(item.rect()), "pos": QPointF(item.pos())}
 
 
 def geometry_restore(item, snap: dict):
     if "line" in snap:
         item.setLine(snap["line"])
+    elif "font_size" in snap:
+        item.set_font_size(snap["font_size"])
     else:
         item.setRect(snap["rect"])
     item.setPos(snap["pos"])
@@ -800,6 +833,7 @@ class PDFCanvas(QGraphicsView):
         self._resize_handle: str | None = None
         self._resize_orig_pos: QPointF | None = None
         self._resize_orig_rect: QRectF | None = None
+        self._resize_orig_font: int | None = None
         self._resize_before: dict | None = None
 
         # Undo/redo. This one is the FALLBACK, for a canvas standing on its own
@@ -1830,6 +1864,24 @@ class PDFCanvas(QGraphicsView):
 
         return {"p1": h(p1s), "p2": h(p2s)}
 
+    def _get_text_handles(self, item: TextAnnotationItem) -> dict[str, QRectF]:
+        """The four corner handles a selected text label paints, as hit targets.
+
+        These used to be painted and never tested for, so a label looked
+        resizable and was not. The corners here are read from the same
+        scene_text_rect the item paints from, so what you see is what you can
+        grab.
+        """
+        r = item.scene_text_rect()
+        hs = self._handle_size_scene()
+
+        def h(x, y): return QRectF(x - hs / 2, y - hs / 2, hs, hs)
+
+        return {
+            "tl": h(r.left(), r.top()), "tr": h(r.right(), r.top()),
+            "bl": h(r.left(), r.bottom()), "br": h(r.right(), r.bottom()),
+        }
+
     def _handle_at(self, scene_pos: QPointF):
         for item in self._scene.selectedItems():
             if isinstance(item, AnnotationItem):
@@ -1840,7 +1892,67 @@ class PDFCanvas(QGraphicsView):
                 for name, rect in self._get_line_handles(item).items():
                     if rect.contains(scene_pos):
                         return item, name
+            elif isinstance(item, TextAnnotationItem):
+                for name, rect in self._get_text_handles(item).items():
+                    if rect.contains(scene_pos):
+                        return item, name
         return None, None
+
+    # Drag one corner, and the one diagonally opposite is what stays put.
+    _TEXT_ANCHOR = {"tl": "br", "tr": "bl", "bl": "tr", "br": "tl"}
+
+    @staticmethod
+    def _corner_of(rect: QRectF, name: str) -> QPointF:
+        return {
+            "tl": rect.topLeft(), "tr": rect.topRight(),
+            "bl": rect.bottomLeft(), "br": rect.bottomRight(),
+        }[name]
+
+    def _resize_text(self, scene_pos: QPointF):
+        """Scale a text label's FONT by dragging one of its corners.
+
+        Why the font and not a box. A label has no box of its own: it is
+        exactly as wide and as tall as its text at its current size. Font size
+        is also the only thing here that survives the round trip, it goes into
+        the embedded annotation model and straight onto the PDF freetext
+        annotation as `fontsize`, so a bigger drag gives a bigger label in the
+        saved file too. A wrap width would not: nothing persists it, and
+        reflowing at a fixed size could only ever answer a horizontal drag,
+        which would leave the vertical half of every corner doing nothing.
+
+        This is the same edit the toolbar's font-size box already makes, so it
+        inherits its undo (ResizeCommand over a geometry_snapshot) and its
+        clamps, and adds no new way for the geometry to go wrong.
+        """
+        item = self._resize_item
+        handle = self._resize_handle
+        orig = self._resize_orig_rect
+        if orig is None or self._resize_orig_font is None:
+            return
+        anchor_name = self._TEXT_ANCHOR.get(handle)
+        if anchor_name is None:
+            return
+
+        anchor = self._corner_of(orig, anchor_name)
+        v0 = self._corner_of(orig, handle) - anchor
+        span = v0.x() * v0.x() + v0.y() * v0.y()
+        if span <= 0:
+            return
+        v1 = scene_pos - anchor
+        # Project the drag onto the label's original diagonal. Taking the raw
+        # distance instead would grow the type when you slid sideways off the
+        # diagonal, which reads as the label fighting the cursor.
+        scale = (v1.x() * v0.x() + v1.y() * v0.y()) / span
+
+        size = int(round(self._resize_orig_font * scale))
+        size = max(MIN_FONT_SIZE, min(MAX_FONT_SIZE, size))
+        if size != item._font_size:
+            item.set_font_size(size)
+
+        # The label always grows down and right from its own origin, so pin the
+        # anchor corner back where the drag started by moving the item.
+        item.setPos(anchor - self._corner_of(item.text_rect(), anchor_name))
+        item.update()
 
     def _handle_cursor(self, handle: str) -> Qt.CursorShape:
         if handle in ("tl", "br"):
@@ -2282,7 +2394,10 @@ class PDFCanvas(QGraphicsView):
                     self._resize_handle = res_handle
                     self._resize_orig_pos = scene_pos
                     self._resize_before = geometry_snapshot(res_item)
-                    if isinstance(res_item, AnnotationItem):
+                    if isinstance(res_item, TextAnnotationItem):
+                        self._resize_orig_rect = res_item.scene_text_rect()
+                        self._resize_orig_font = res_item._font_size
+                    elif isinstance(res_item, AnnotationItem):
                         l, t, r, b, _, _ = self._rect_corners_in_scene(res_item)
                         self._resize_orig_rect = QRectF(l, t, r - l, b - t)
                     event.accept()
@@ -2415,6 +2530,8 @@ class PDFCanvas(QGraphicsView):
                 else:
                     self._resize_item.setLine(QLineF(ln.p1(), local_pos))
                 self._resize_item.update()
+            elif isinstance(self._resize_item, TextAnnotationItem):
+                self._resize_text(scene_pos)
             else:
                 total = scene_pos - self._resize_orig_pos
                 orig = self._resize_orig_rect
@@ -2582,7 +2699,13 @@ class PDFCanvas(QGraphicsView):
                 self._resize_handle = None
                 self._resize_orig_pos = None
                 self._resize_orig_rect = None
+                self._resize_orig_font = None
                 self._resize_before = None
+                # Resizing a text label changes its font size, which the
+                # toolbar shows. The summary is otherwise only rebuilt when the
+                # selection changes, so without this the combo keeps reading
+                # the size you started the drag at.
+                self._on_selection_changed()
                 self.annotation_changed.emit()
 
             elif self._drag_items:
