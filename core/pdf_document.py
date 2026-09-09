@@ -4,6 +4,8 @@ import os
 import re
 import tempfile
 from collections import OrderedDict
+from typing import NamedTuple
+
 from PySide6.QtGui import QPixmap, QImage
 
 from core.render_scale import AUTO, choose_render_scale
@@ -34,6 +36,90 @@ MODEL_EMBED_NAME = "rapid_pdf_model.json"
 # still covering the realistic hot pattern: lift + reload + a couple of
 # page-switch round-trips all hit the same page+zoom.
 RENDER_CACHE_MAX = 6
+
+# How a save is going to be written. INCREMENTAL appends a new revision to the
+# end of the existing file and leaves every byte already in it alone, which is
+# the only kind of write a digital signature survives. REWRITE is the normal
+# full rebuild (garbage collect + deflate) and produces a different file, so
+# every signature in it is void.
+SAVE_MODE_INCREMENTAL = "incremental"
+SAVE_MODE_REWRITE = "rewrite"
+
+
+class SavePlan(NamedTuple):
+    """What the next save is going to do, decided before anything is written.
+
+    `reason` is a finished sentence fit to put in front of a user, and it is
+    set if and only if `breaks_signature` is true. The core never opens a
+    dialog; it hands this back and lets the window ask.
+    """
+
+    mode: str                     # SAVE_MODE_INCREMENTAL or SAVE_MODE_REWRITE
+    signed: bool                  # the document carries at least one real signature
+    breaks_signature: bool        # writing it will make readers reject that signature
+    reason: str | None            # what breaks and why, in words, or None
+
+    @property
+    def needs_confirmation(self) -> bool:
+        return self.breaks_signature
+
+
+def _signature_widgets(doc) -> list[str]:
+    """Names of the signature fields in `doc` that have actually been SIGNED.
+
+    An empty signature field is not a signature. Blank RFCC and RFWCC forms
+    ship with one sitting on the page waiting for someone to sign it, and
+    `get_sigflags()` reports 3 for those exactly as it does for a signed file
+    (measured on PyMuPDF 1.27.2.3: adding an empty signature widget to a fresh
+    document and saving it gives sigflags 3). Treating that as signed would
+    push every blank form onto the incremental path and warn the user about
+    breaking a signature that does not exist, so the field's /V entry is what
+    decides: it holds the signature dictionary, and it is absent until the file
+    is signed.
+    """
+    names = []
+    for page in doc:
+        for widget in page.widgets():
+            if widget.field_type != fitz.PDF_WIDGET_TYPE_SIGNATURE:
+                continue
+            try:
+                kind, _value = doc.xref_get_key(widget.xref, "V")
+            except Exception:
+                continue
+            if kind and kind != "null":
+                names.append(widget.field_name or "(unnamed)")
+    return names
+
+
+def _highlight_quad(visible_rect, derot) -> "fitz.Quad":
+    """The quad to hand add_highlight_annot for a freehand highlight box.
+
+    ONE QUAD FROM THE RECT, AND THAT IS DELIBERATE. A PDF highlight normally
+    carries one quad per line of selected text, because that is where it comes
+    from in a reader. Rapid PDF's highlight is not a text selection at all: the
+    user drags a box over a drawing, which may have no text under it whatsoever.
+    A single quad covering that box is the honest translation, and it is what
+    every reader then paints.
+
+    THE CORNERS ARE MAPPED INDIVIDUALLY, not taken from the derotated bounding
+    box, and on a rotated page the difference is visible. MuPDF gives a
+    highlight a marker-pen appearance whose overhang is scaled off the quad's
+    own HEIGHT (measured on 1.27.2.3: about h/16 top and bottom, about
+    h*0.2357 left and right). Feed it the derotated BOUNDING BOX of a 190x30
+    box on a 90-degree page and it reads the 190 as the height, so it pads
+    45pt sideways and the highlight balloons to four times its width. Feed it
+    the four corners with their roles kept (upper-left stays upper-left in the
+    quad even after the matrix moves it) and the overhang follows the box the
+    user actually drew.
+
+    On an unrotated page this is exactly `visible_rect.quad`.
+    """
+    r = fitz.Rect(visible_rect).normalize()
+    ul, ur = fitz.Point(r.x0, r.y0), fitz.Point(r.x1, r.y0)
+    ll, lr = fitz.Point(r.x0, r.y1), fitz.Point(r.x1, r.y1)
+    if derot is not None:
+        ul, ur, ll, lr = ul * derot, ur * derot, ll * derot, lr * derot
+    return fitz.Quad(ul, ur, ll, lr)
 
 
 def source_is_readable(source) -> bool:
@@ -76,6 +162,18 @@ class PDFDocument:
         # Why the last open() returned False, in words fit to show a user, or
         # None. Same contract as last_save_error: read it straight after a False.
         self.last_open_error: str | None = None
+        # True when the last save() returned False because it would have voided
+        # a digital signature and nobody had said to go ahead. It is NOT an
+        # error: the document is untouched and the same call with
+        # allow_signature_break=True will write it. The window reads this right
+        # after a False to decide between an error box and a question box.
+        self.last_save_blocked_by_signature: bool = False
+        # Whether pages have been added, removed or reordered since this file
+        # was opened or last saved. An incremental save can still write that,
+        # but no reader will accept a signature over a page tree that has moved
+        # underneath it, so it is the difference between a save that keeps a
+        # signature and one that only keeps the bytes. See save_plan().
+        self._structure_changed = False
         # Cross-document page moves this document has been part of SINCE ITS
         # LAST SAVE, so the close prompt can say what is actually at stake.
         # Two lists of plain strings (the other document's display name):
@@ -151,6 +249,7 @@ class PDFDocument:
         self._render_scale = None    # different document, different geometry
         self.doc = fitz_doc
         self.path = None
+        self._structure_changed = False   # brand new document, nothing to compare to
 
     def replace_from_bytes(self, payload: bytes) -> bool:
         """Swap this document's CONTENT for `payload`, keeping its identity.
@@ -206,6 +305,7 @@ class PDFDocument:
                 self.doc.close()
             self.invalidate_render_cache()   # new document, no stale pixmaps
             self._render_scale = None        # and a fresh scale decision
+            self._structure_changed = False  # as it sits on disk, so far
             self.doc = fitz.open(path)
             if getattr(self.doc, "needs_pass", False):
                 self.doc.close()
@@ -230,6 +330,7 @@ class PDFDocument:
         self.clear_transfer_ledger()
         self.invalidate_render_cache()
         self._render_scale = None
+        self._structure_changed = False
 
     def is_open(self) -> bool:
         """Whether there is a document here that can still be read.
@@ -322,7 +423,161 @@ class PDFDocument:
         zoom = max_width / page.bound().width
         return self._render_page_at_zoom(page, zoom)
 
-    def save(self, path: str | None = None) -> bool:
+    # ------------------------------------------------------------------
+    # Digital signatures, and what a save is allowed to do to them
+    # ------------------------------------------------------------------
+
+    def _note_structure_change(self):
+        """Record that the page tree moved, for the next save_plan()."""
+        self._structure_changed = True
+
+    def _incremental_filename(self, target: str) -> str | None:
+        """The exact string to hand `doc.save(..., incremental=True)`, or None.
+
+        PyMuPDF gates the incremental path on `self.name != filename or
+        self.stream`, and that is a RAW STRING COMPARISON against the name the
+        document was opened with, not a path comparison. Hand it anything else,
+        including the same file spelled with different separators, and it
+        raises ValueError("incremental needs original file"). So the document's
+        own `name` is what gets passed, and `target` is only checked to be that
+        same file.
+
+        `stream` is the other half and it is the one that bites after OCR.
+        `replace_from_bytes` swaps the content for a document opened from bytes
+        while KEEPING `self.path`, so `path`, `is_same` and even
+        `can_save_incrementally()` all still say yes while PyMuPDF would refuse.
+        A document with no file behind it cannot be appended to, whatever the
+        path field says.
+        """
+        doc = self.doc
+        name = getattr(doc, "name", "") or ""
+        if not name or getattr(doc, "stream", None):
+            return None
+        try:
+            if os.path.abspath(name) != os.path.abspath(target):
+                return None
+        except Exception:
+            return None
+        return name
+
+    def signature_names(self) -> list[str]:
+        """Names of the signed signature fields in this document, if any.
+
+        Empty for an unsigned file, and empty for a blank form that carries an
+        unsigned signature field. Cheap on the common case: `get_sigflags()`
+        answers -1 when the file has no signature fields at all, so nothing
+        walks the pages unless there is something to find.
+        """
+        if not self.is_open():
+            return []
+        try:
+            if self.doc.get_sigflags() < 0:
+                return []
+        except Exception:
+            pass          # no AcroForm to read; fall through and look properly
+        try:
+            return _signature_widgets(self.doc)
+        except Exception as e:
+            print(f"Signature scan error: {e}")
+            # Something in the form tree is unreadable. Assume the worst rather
+            # than the best: a file we cannot inspect is one we must not silently
+            # rewrite. sigflags 3 means the catalog claims signatures exist.
+            try:
+                return ["(unreadable signature field)"] if self.doc.get_sigflags() == 3 else []
+            except Exception:
+                return []
+
+    def is_signed(self) -> bool:
+        """Whether this document carries at least one digital signature.
+
+        THE REASON THIS EXISTS. Every save this app has ever done was a full
+        rewrite (`garbage=4, deflate=True`), which produces a different file
+        and voids every signature in it. Lucas opens signed RFCC, RFWCC and SAC
+        certificates daily; touching one annotation and pressing Ctrl+S used to
+        silently destroy the signature on the file he then sent on. Nothing
+        told him. See save_plan() for what is done about it.
+        """
+        return bool(self.signature_names())
+
+    def save_plan(self, path: str | None = None) -> SavePlan:
+        """Decide how the next save would be written, WITHOUT writing anything.
+
+        Call it to find out whether to ask the user something before saving.
+        `save()` runs it again itself, so a caller that does not care about
+        signatures can ignore it entirely and still not lose one by accident.
+
+        The rules, measured against PyMuPDF 1.27.2.3 rather than remembered:
+
+        - An unsigned document is a plain rewrite, as before. There is nothing
+          at stake and the compaction is worth having.
+        - A signed document saved over the file it was opened from goes out
+          incrementally: the existing bytes are left alone and a new revision
+          is appended, which is the only write a signature survives.
+          `incremental=True` forbids `garbage` ("Can't do incremental writes
+          with garbage collection") and requires `encryption=PDF_ENCRYPT_KEEP`
+          ("Can't do incremental writes when changing encryption"), so neither
+          is passed. It also refuses a different filename ("incremental needs
+          original file") and a file MuPDF had to repair on open ("Can't do
+          incremental writes on a repaired file"), which is what
+          `can_save_incrementally()` answers.
+        - A signed document going anywhere else (Save As, an untitled document
+          from Combine, a file that cannot take an incremental update) can only
+          be written as a rewrite, and that breaks the signature.
+        - A signed document whose PAGES have moved breaks the signature even
+          though the write itself is still incremental. The bytes survive; the
+          signature covers a page tree that is no longer the document.
+        """
+        target = path or self.path
+        if not self.is_open() or not target:
+            return SavePlan(SAVE_MODE_REWRITE, False, False, None)
+
+        names = self.signature_names()
+        if not names:
+            return SavePlan(SAVE_MODE_REWRITE, False, False, None)
+
+        who = ", ".join(names)
+        is_same = (self.path is not None
+                   and os.path.abspath(target) == os.path.abspath(self.path))
+
+        if not is_same:
+            if self.path is None:
+                where = ("This document was built in this window (Combine), so it "
+                         "has to be written out as a whole new file.")
+            else:
+                where = ("Saving to a different file has to write the whole file "
+                         "out fresh.")
+            return SavePlan(
+                SAVE_MODE_REWRITE, True, True,
+                f"This PDF is digitally signed ({who}).\n\n{where} The signature "
+                "cannot come with it, and the saved copy will open with the "
+                "signature shown as invalid.\n\nSave anyway?")
+
+        try:
+            can_append = bool(self.doc.can_save_incrementally())
+        except Exception:
+            can_append = False
+        if not can_append or self._incremental_filename(target) is None:
+            return SavePlan(
+                SAVE_MODE_REWRITE, True, True,
+                f"This PDF is digitally signed ({who}), but a new revision cannot "
+                "be appended to it: either its structure had to be repaired when "
+                "it was opened, or its contents have already been rebuilt in this "
+                "window (Enhance for Search does that). Saving rewrites the whole "
+                "file and the signature will be shown as invalid afterwards."
+                "\n\nSave anyway?")
+
+        if self._structure_changed:
+            return SavePlan(
+                SAVE_MODE_INCREMENTAL, True, True,
+                f"This PDF is digitally signed ({who}), and pages have been added, "
+                "removed or reordered. The edit will be appended rather than "
+                "rewritten, but a signature covers the pages it was applied to, so "
+                "readers will show it as invalid.\n\nSave anyway?")
+
+        return SavePlan(SAVE_MODE_INCREMENTAL, True, False, None)
+
+    def save(self, path: str | None = None,
+             allow_signature_break: bool = False) -> bool:
         """Write the document. False means nothing was written where it was asked.
 
         A False ALWAYS leaves `last_save_error` set to something worth showing
@@ -342,12 +597,27 @@ class PDFDocument:
         ends: the .bak is ADOPTED as the document's path, so everything
         downstream names the file that actually holds the work, and the reason
         goes in `last_save_error` for the caller to show.
+
+        SIGNED DOCUMENTS ARE NOT REWRITTEN BEHIND THE USER'S BACK. `save_plan()`
+        decides first. If the plan is incremental the write appends a revision
+        and the signature lives; if the plan breaks a signature the save is
+        REFUSED (False, `last_save_blocked_by_signature` True, the reason and
+        the question in `last_save_error`) until the caller comes back with
+        `allow_signature_break=True`. Passing that flag on an unsigned document
+        does nothing at all, so a caller that always passes it has simply
+        opted out of the protection.
         """
         self.last_save_error = None
+        self.last_save_blocked_by_signature = False
         if not self.doc or not (self.path or path):
             self.last_save_error = "There is no document to save."
             return False
         target = path or self.path
+        plan = self.save_plan(target)
+        if plan.breaks_signature and not allow_signature_break:
+            self.last_save_blocked_by_signature = True
+            self.last_save_error = plan.reason
+            return False
         # An untitled (merged) doc has no current path → it's never an in-place save.
         is_same = self.path is not None and os.path.abspath(target) == os.path.abspath(self.path)
         # A save bakes markup/redactions into page content and (in-place) reopens
@@ -356,7 +626,28 @@ class PDFDocument:
         self.invalidate_render_cache()
         tmp_path = None
         try:
-            if is_same:
+            if plan.mode == SAVE_MODE_INCREMENTAL:
+                # Appends a revision to the end of the file it was opened from.
+                # No temp file and no atomic swap, because there is nothing to
+                # swap: the original bytes stay exactly where they are and the
+                # edit goes on the end. That is the whole point, and it is why
+                # the signature survives.
+                #
+                # Neither `garbage` nor a new encryption setting is legal here
+                # (PyMuPDF raises FzErrorArgument for both), and `deflate` is
+                # left off as well: it would only compress the handful of new
+                # annotation objects, and the fewer options on this path the
+                # fewer ways it can start refusing on a later PyMuPDF.
+                #
+                # The document is NOT closed and reopened afterwards. The
+                # in-place rewrite below has to, because it swaps the file out
+                # from under an open handle; this one writes through the handle
+                # it already has and stays live on the same file, which a second
+                # incremental save straight after was measured to be fine with.
+                self.doc.save(self._incremental_filename(target) or target,
+                              incremental=True,
+                              encryption=fitz.PDF_ENCRYPT_KEEP)
+            elif is_same:
                 dir_path = os.path.dirname(os.path.abspath(target))
                 with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False, dir=dir_path) as tf:
                     tmp_path = tf.name
@@ -419,6 +710,9 @@ class PDFDocument:
             # Whatever this document owed the other side of a page move is now
             # on disk, so the close prompt has nothing left to warn about.
             self.clear_transfer_ledger()
+            # The page tree on disk now matches the one in memory, so the next
+            # save has no page moves of its own to warn about.
+            self._structure_changed = False
             return True
         except Exception as e:
             print(f"Save error: {e}")
@@ -606,6 +900,7 @@ class PDFDocument:
         if self.doc:
             self.doc.move_page(from_idx, to_idx)
             self.invalidate_render_cache()   # page indices shifted
+            self._note_structure_change()
 
     def reorder(self, new_order: list):
         """Reorder pages so that new page i is the page currently at new_order[i].
@@ -616,6 +911,7 @@ class PDFDocument:
         if self.doc and sorted(new_order) == list(range(len(self.doc))):
             self.doc.select(list(new_order))
             self.invalidate_render_cache()   # page indices changed
+            self._note_structure_change()
 
     def clone_with_annotations(self, dicts_by_page: dict):
         """Return a throwaway fitz.Document copy with the given markup baked in.
@@ -678,6 +974,7 @@ class PDFDocument:
             self.doc.delete_page(page_num)
             self.strip_dangling_toc()
             self.invalidate_render_cache()   # pages after this one renumbered
+            self._note_structure_change()
 
     def delete_pages(self, page_nums: list) -> list:
         """Delete a whole selection of pages in one go.
@@ -695,6 +992,7 @@ class PDFDocument:
             self.doc.delete_page(page_num)
         self.strip_dangling_toc()
         self.invalidate_render_cache()
+        self._note_structure_change()
         return rows
 
     def extract_pages(self, page_nums: list):
@@ -730,6 +1028,7 @@ class PDFDocument:
             self.doc.insert_pdf(stash, from_page=k, to_page=k,
                                 start_at=max(0, min(at, len(self.doc))))
         self.invalidate_render_cache()   # page set/indices changed
+        self._note_structure_change()
 
     # ------------------------------------------------------------------
     # Moving pages between two LIVE documents (phase 5 of docs/tabs-plan.md)
@@ -774,6 +1073,7 @@ class PDFDocument:
                                 start_at=at + k, links=True, annots=True,
                                 widgets=True)
         self.invalidate_render_cache()   # page set/indices changed
+        self._note_structure_change()
         return len(rows)
 
     def transfer_report(self, rows: list) -> dict:
@@ -842,6 +1142,7 @@ class PDFDocument:
         self.doc.insert_pdf(src, from_page=from_page, to_page=to_page, start_at=start_at)
         src.close()
         self.invalidate_render_cache()   # page set/indices changed
+        self._note_structure_change()
 
     # ------------------------------------------------------------------
     # Editable annotation model (embedded JSON): for save/reopen round-trip
@@ -916,6 +1217,15 @@ class PDFDocument:
 
         Used on open so reconstructed editable items don't double-render on top of
         the markup that was baked into the file on the previous save.
+
+        THE TAG IS THE ONLY THING IT MATCHES ON, and that is what keeps files
+        written by older versions working. Highlights used to be baked as filled
+        Square annotations and are now baked as real Highlight text markup;
+        both carry `title == RAPID_PDF_TAG`, so a document saved by 1.9.0 or
+        earlier is still stripped, still rebuilt from its embedded JSON model
+        (which never recorded the annotation subtype in the first place), and
+        still re-baked, now in the new form. Nothing here keys off the subtype
+        and nothing should start to.
         """
         if not self.doc or page_num >= len(self.doc):
             return
@@ -955,6 +1265,12 @@ class PDFDocument:
             color = ann.get("color")
             opacity = ann.get("opacity", 1.0)
 
+            # Keep the pre-derotation rect. A highlight quad is built from the
+            # four CORNERS of the visible rect, each mapped through derot
+            # separately, and that is not the same shape as the derotated
+            # bounding box. See _highlight_quad.
+            visible_rect = fitz.Rect(rect).normalize() if rect is not None else None
+
             # Convert from visible space to PDF user space for rotated pages.
             if rect is not None and derot is not None:
                 rect = fitz.Rect(rect) * derot
@@ -969,13 +1285,32 @@ class PDFDocument:
                     if rect is None or rect.is_empty or rect.is_infinite:
                         print(f"Annotation write skipped (highlight): degenerate rect {rect}")
                         continue
-                    annot = page.add_rect_annot(rect)
-                    fill = color if color else (1.0, 1.0, 0.0)
-                    annot.set_colors(fill=fill, stroke=fill)
+                    # A REAL TEXT-MARKUP HIGHLIGHT, not a filled box. This used
+                    # to be add_rect_annot with a solid fill, which rapid-pdf
+                    # drew acceptably and every other reader drew as an OPAQUE
+                    # RECTANGLE sitting on top of the text. Acrobat users got a
+                    # blanked-out line where a highlight was meant to be.
+                    # add_highlight_annot writes subtype /Highlight, which
+                    # readers composite with a multiply blend, so whatever is
+                    # underneath shows through the way a marker pen behaves.
+                    annot = page.add_highlight_annot(
+                        _highlight_quad(visible_rect, derot))
+                    # /C on a text-markup annotation is the marker colour and it
+                    # goes in the STROKE slot. Passing fill= here is silently
+                    # ignored, which is worth saying out loud because the rect
+                    # branch below does use fill.
+                    annot.set_colors(stroke=color if color else (1.0, 1.0, 0.0))
                     annot.set_opacity(opacity)
-                    annot.set_border(width=0)
                     info = annot.info
                     info["title"] = RAPID_PDF_TAG
+                    # THE TYPED NOTE HAS TO GO IN THE FILE. It used to be
+                    # written on the rect branch and dropped here, so a note
+                    # typed into a highlight survived a reopen in rapid-pdf
+                    # (the embedded JSON model still had it) and did not exist
+                    # for anybody else. That is the worst shape a bug can take:
+                    # it looked saved and was not.
+                    if ann.get("text"):
+                        info["content"] = ann["text"]
                     annot.set_info(info)
                     annot.update()
 
