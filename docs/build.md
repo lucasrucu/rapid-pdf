@@ -105,7 +105,7 @@ on startup and offers an update when the release's version is higher than
   far as the updater is concerned, and you should still upload it: it is the
   only thing a portable user can update from.
 
-**From 1.10.0 the updater runs the SETUP EXE, not the zip.** An installed copy
+**From 2.0.0 the updater runs the SETUP EXE, not the zip.** An installed copy
 downloads `rapid-pdf-setup-X.Y.Z.exe`, checks it against the sha256 GitHub
 publishes, and runs it with `/SILENT /SP- /CLOSEAPPLICATIONS
 /NORESTARTAPPLICATIONS /RAPIDPDFRELAUNCH=1 /DIR=<install>
@@ -133,7 +133,7 @@ GitHub publishes a sha256 for every asset and the updater refuses to run one
 that has none, so nothing extra has to be uploaded alongside it.
 
 **Do not change `AppId` in `rapid-pdf.iss`.** It was already fixed for upgrade
-tracking; from 1.10.0 it is also how the app knows it was installed at all.
+tracking; from 2.0.0 it is also how the app knows it was installed at all.
 `core/update/client.APP_ID` holds a copy and `tests/test_update.py` reads both
 files to check they agree.
 

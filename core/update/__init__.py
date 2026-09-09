@@ -9,7 +9,7 @@
 THERE IS NO swap.py ANY MORE. Up to 1.9.0 an update was a batch file this
 package wrote and ran, which replaced the exe underneath the app. It worked,
 and it read to a behavioural antivirus engine as a dropper, because that is
-what those steps are when you list them out. From 1.10.0 an installed copy is
+what those steps are when you list them out. From 2.0.0 an installed copy is
 updated by the installer that made it, and a portable copy is not updated at
 all: it is told to download the new zip. installer.py's docstring has the
 whole argument.

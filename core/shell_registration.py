@@ -10,7 +10,7 @@ walked straight through that assumption:
   wrote a registry value. Lucas updated to 1.6.0 on 31 Aug 2026 and to 1.7.0
   on 2 Sept through it, and the document-icon fix that shipped in 1.6.0 sat in
   his install folder without ever reaching his registry. He reported the same
-  bug twice against two builds that both contained the fix. From 1.10.0 the
+  bug twice against two builds that both contained the fix. From 2.0.0 the
   updater runs setup (`core/update/installer.py`), so the registry is written
   on every update, but this file stays: a portable copy still never runs setup
   at all, and it is the cheaper of the two guarantees anyway.

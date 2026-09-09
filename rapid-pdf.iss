@@ -18,7 +18,7 @@
 ; created has to name what that build actually created.
 #define AppName "RapidPDF"
 #define OldAppName "Rapid PDF"
-#define AppVersion "1.10.0"
+#define AppVersion "2.0.0"
 #define AppPublisher "Lucas Ruiz"
 #define AppExeName "rapid-pdf.exe"
 ; Stable GUID for upgrades/uninstall. Keep this fixed across versions.
@@ -59,7 +59,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 UsePreviousTasks=no
 
 ; -- What the in-app updater relies on. Both of these are Inno's defaults, and
-; -- both are written out because from 1.10.0 the app runs this installer
+; -- both are written out because from 2.0.0 the app runs this installer
 ; -- itself (core/update/installer.py) and a default that moved underneath it
 ; -- would break an update on a machine nobody is watching.
 ;

@@ -288,7 +288,7 @@ class ReleaseParsing(unittest.TestCase):
             parse_latest(json.dumps(payload))
 
     def test_a_release_without_the_portable_zip_is_still_installable(self):
-        # The loose half of the same rule, and it changed at 1.10.0. Nothing
+        # The loose half of the same rule, and it changed at 2.0.0. Nothing
         # here installs the zip any more, so a release missing it is perfectly
         # installable and all that is lost is being able to name the manual
         # download. Refusing it would switch updates off over a file nothing

@@ -219,7 +219,7 @@ def test_installer_refreshes_the_shell_icon_cache():
 # installer: it downloaded the portable zip, which is the PyInstaller onedir
 # folder, and laid it over the install. So on any machine that updated from
 # inside the app, DefaultIcon pointed at a file that was never delivered. From
-# 1.10.0 an installed copy updates by running setup (core/update/installer.py)
+# 2.0.0 an installed copy updates by running setup (core/update/installer.py)
 # so that particular hole is closed, but a portable copy still only ever gets
 # the zip, and the zip has to be complete.
 #

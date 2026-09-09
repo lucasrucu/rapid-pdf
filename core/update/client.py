@@ -182,7 +182,7 @@ def installed_location() -> Path | None:
     THE ALTERNATIVE, AND WHY IT DOES NOT WORK. The obvious approach is a marker
     file in the portable zip. It cannot be used here, because 1.9.0 and earlier
     update by laying the zip's CONTENTS over the install folder, so an INSTALLED
-    copy that reaches 1.10.0 through the old updater would have the marker in it
+    copy that reaches 2.0.0 through the old updater would have the marker in it
     and would look portable for the rest of its life. Detecting installed
     POSITIVELY, from a key the old updater never wrote, has no such hole.
 

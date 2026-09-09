@@ -47,12 +47,12 @@ from dataclasses import dataclass
 #: read is a version it declines to compare rather than one it guesses at.
 _SEMVER = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 
-#: The asset a self-update RUNS. From 1.10.0 an installed build hands the
+#: The asset a self-update RUNS. From 2.0.0 an installed build hands the
 #: update to the same Inno Setup installer that created the install, so this
 #: is the setup exe and not the portable zip. See the docstring at the top of
 #: core/update/installer.py for the whole argument.
 #:
-#: Matched on both ends because "rapid-pdf-setup-1.10.0.exe" is the only exe a
+#: Matched on both ends because "rapid-pdf-setup-2.0.0.exe" is the only exe a
 #: release publishes, and a bare ".exe" match would happily pick up anything
 #: somebody attached to a release afterwards.
 SETUP_PREFIX = "rapid-pdf-setup-"

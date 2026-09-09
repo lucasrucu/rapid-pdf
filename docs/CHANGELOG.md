@@ -10,7 +10,13 @@ Releases before 1.6.0 were written up on the
 [Releases page](https://github.com/lucasrucu/rapid-pdf/releases) and are not
 backfilled here.
 
-## [1.10.0] - 2026-09-09
+## [2.0.0] - 2026-09-09
+
+Major, not a minor, because two things users had are gone: portable builds no
+longer update themselves, and there is no longer a one-step rollback to the
+previous build. Both are listed below. Everything else in this release is an
+improvement, but the version is set by what was removed, not by what was
+added.
 
 The updater no longer replaces the app's own files. It runs the installer
 instead, the same one you would download and run yourself.
