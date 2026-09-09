@@ -98,19 +98,44 @@ tracks upgrades/uninstall).
 on startup and offers an update when the release's version is higher than
 `APP_VERSION`. For that to work, a release needs:
 
-- a tag of `vX.Y.Z` (the title "Rapid PDF X.Y.Z" is the fallback), and
+- a tag of `vX.Y.Z` (the title "Rapid PDF X.Y.Z" is the fallback),
+- the `rapid-pdf-setup-X.Y.Z.exe` asset attached, which is REQUIRED, and
 - the `rapid-pdf-X.Y.Z-portable.zip` asset attached, holding the whole
-  `dist\rapid-pdf\` folder with its `rapid-pdf/` top level intact.
+  `dist\rapid-pdf\` folder with its `rapid-pdf/` top level intact. Optional as
+  far as the updater is concerned, and you should still upload it: it is the
+  only thing a portable user can update from.
 
-The updater takes the PORTABLE ZIP, never the setup `.exe`: the zip is the
-install folder, so an update is a verified file swap in place, with no
-SmartScreen prompt on an unsigned download and no second install created
-beside a portable copy. See the docstring at the top of `core/update/client.py`
-for the full reasoning. A release published without the zip is simply not
-offered to anybody; nothing breaks, nobody is told.
+**From 1.10.0 the updater runs the SETUP EXE, not the zip.** An installed copy
+downloads `rapid-pdf-setup-X.Y.Z.exe`, checks it against the sha256 GitHub
+publishes, and runs it with `/SILENT /SP- /CLOSEAPPLICATIONS
+/NORESTARTAPPLICATIONS /RAPIDPDFRELAUNCH=1 /DIR=<install>
+/LOG=<install>\update.log`. Inno closes the
+app through the Restart Manager, replaces the files, rewrites the registry, and
+the `[Run]` entry gated on `RelaunchAfterUpdate` starts the new build.
 
-GitHub publishes a sha256 for every asset and the updater refuses to install
-one that has none, so nothing extra has to be uploaded alongside it.
+That replaced a batch file this repo generated at run time, which waited on the
+app's PID, slept with `ping`, moved the payload in with `robocopy` and renamed
+the new exe over the running one. It worked, and it reads to a behavioural
+antivirus engine as a dropper: Sophos convicted the test suite for it on
+9 September 2026. `core/update/installer.py` has the full argument.
+
+**A portable copy does not self-update.** The installer cannot update one (it
+would build a second install in `%LocalAppData%` and leave the folder the
+shortcut points at stale), so the notice sends a portable copy to the release
+page instead, and the user unzips the new folder over the old one.
+`core/update/client.install_kind()` tells the two apart by reading Inno's own
+uninstall registration, so the answer comes from a key only setup ever writes.
+
+A release published without the setup exe is simply not offered to anybody;
+nothing breaks, nobody is told.
+
+GitHub publishes a sha256 for every asset and the updater refuses to run one
+that has none, so nothing extra has to be uploaded alongside it.
+
+**Do not change `AppId` in `rapid-pdf.iss`.** It was already fixed for upgrade
+tracking; from 1.10.0 it is also how the app knows it was installed at all.
+`core/update/client.APP_ID` holds a copy and `tests/test_update.py` reads both
+files to check they agree.
 
 ### Reducing antivirus false positives
 

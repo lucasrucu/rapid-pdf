@@ -10,6 +10,70 @@ Releases before 1.6.0 were written up on the
 [Releases page](https://github.com/lucasrucu/rapid-pdf/releases) and are not
 backfilled here.
 
+## [1.10.0] - 2026-09-09
+
+The updater no longer replaces the app's own files. It runs the installer
+instead, the same one you would download and run yourself.
+
+1.9.0 took away the parts of the BUILD that antivirus convicts on. This one
+takes away the parts of the BEHAVIOUR. Sophos fired on the test suite on 9
+September and named it as masquerading, and it was right about what it saw:
+the test copied a Windows system binary under a different name so it had
+something real to swap. That was only the test. The updater underneath it was
+worse. It wrote a batch file at run time, ran it with the window hidden, polled
+the process list waiting for the app to die, used `ping` as a sleep timer,
+moved the new build in with `robocopy`, and renamed the new exe over the
+running one. Every one of those is on a behavioural detection list on its own.
+Together they are the shape of a dropper, and no code signing certificate would
+have changed that, because a signature says who wrote a program and a
+behavioural engine is asking what it does.
+
+### Changed
+
+- **An installed copy now updates by running the installer.** It downloads
+  `rapid-pdf-setup-X.Y.Z.exe`, checks it against the hash GitHub publishes, and
+  hands the whole job to Inno Setup on its silent switches. Inno closes the
+  app, replaces the files, writes the registry entries and starts the new
+  version. You see the installer's progress window and then the app comes back.
+  The batch file, the hidden window, the `ping`, the `robocopy` and the
+  self-rename are all gone.
+- **A portable copy is told to update itself, and no longer pretends to.** The
+  installer cannot update a portable folder. It would install a second copy in
+  your user folder and leave the one your shortcut points at on the old
+  version. So the notice opens the releases page and says to unzip the new
+  folder over the old one, which is what a portable build is. The app works out
+  which kind it is by reading the installer's own uninstall entry, so it cannot
+  guess wrong in the direction that matters.
+- **Updates now repair the registry as well as the files.** An update runs the
+  installer, and the installer writes the file associations, the Start-menu
+  entry and the uninstall registration. Two bugs in the 1.8 series were caused
+  by updated installs drifting away from fresh ones. That gap is closed.
+
+### Removed
+
+- **The rollback copy of the previous exe.** The old updater kept the version
+  it replaced as `rapid-pdf.exe.bak` and put it back if anything went wrong
+  after the swap. There is no equivalent now. Inno undoes its own work if an
+  install fails partway through, so a broken update still leaves you with a
+  working app, but if an update finishes and the new version turns out to be
+  bad, going back means installing the previous release from the releases page.
+  That is a real loss and it is worth stating rather than burying.
+- **The file count and exe size checks that ran after an update.** They existed
+  because `robocopy` reports success when it has copied nothing, which is how
+  one update once finished with 34 files in the install and "update finished"
+  in the log. Nothing runs `robocopy` any more. What survives is the checking
+  that happens BEFORE anything is run, which is the half that could stop an
+  update for free: the download is hashed against GitHub's published sha256,
+  and it is refused if it is not a Windows program or is too small to be a real
+  build.
+
+### Fixed
+
+- **The test suite no longer trips antivirus.** The test that needed a real
+  program to launch used a renamed copy of `rundll32.exe`. It now compiles a
+  five line stub of its own, and skips with a clear reason on a machine with no
+  compiler.
+
 ## [1.9.0] - 2026-09-09
 
 Sophos blocked the 1.8.1 installer on a work laptop the second the download

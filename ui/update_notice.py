@@ -18,12 +18,23 @@ THE THREE RULES IT KEEPS:
   3. LATER MEANS LATER. Dismissing hides it for this session. The next launch
      checks again, which is the right amount of nagging for a free upgrade.
 
-FROM SOURCE THERE IS NO EXE TO SWAP, so the button says "View release" and
-opens the page in a browser instead. Honest, and it means the check is still
-exercised in development rather than being dead code until the next build.
+THREE KINDS OF INSTALL, AND ONLY ONE OF THEM UPDATES ITSELF. What the button
+does is decided by client.install_kind(), never guessed at here:
+
+  INSTALLED  "Update now". Downloads the release's setup exe, verifies it, and
+             hands the update to it. See core/update/installer.py.
+  PORTABLE   "Download". Opens the release page, and the strip then says what
+             to do with the zip. A portable copy is a folder somebody unzipped,
+             and running the installer against one would not update it, it
+             would build a SECOND install elsewhere and leave the folder the
+             shortcut points at stale. Doing nothing and saying so is better
+             than doing the wrong thing quietly.
+  SOURCE     "View release". No exe at all, so there is nothing to update.
+             It means the check is still exercised in development rather than
+             being dead code until the next build.
 
 WHERE THE WORK HAPPENS: not here. Nothing in this file knows how to compare a
-version, fetch an asset or replace an exe. It calls core/update/, which is
+version, fetch an asset or run an installer. It calls core/update/, which is
 Qt-free and tested on its own. This is two threads and three buttons.
 
 The look follows ui/theme.py the same way every other widget does: an
@@ -40,8 +51,23 @@ from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QMessageBox, QProgressBar, QPushButton,
 )
 
-from core.update import client, swap
+from core.update import client, installer
 from core.update.release import human_size
+
+#: What the one button says, per kind of install. See the module docstring:
+#: only an installed copy updates itself, and the other two are sent to the
+#: release page rather than being offered something that cannot work.
+ACTION_TEXT = {
+    client.INSTALLED: "Update now",
+    client.PORTABLE: "Download",
+    client.SOURCE: "View release",
+}
+
+#: What a portable copy is told once the page is open. It is the whole
+#: instruction, because there is no second screen to put the rest on.
+PORTABLE_STEPS = (
+    "Opened the releases page. Close Rapid PDF, then unzip the new portable "
+    "folder over this one.")
 
 
 class _CheckWorker(QObject):
@@ -63,10 +89,10 @@ class _CheckWorker(QObject):
 
 
 class _StageWorker(QObject):
-    """Downloads, verifies and unpacks, reporting bytes as they land.
+    """Downloads and verifies the installer, reporting bytes as they land.
 
     Progress is emitted from this thread and connected across, so the bar is
-    repainted by the GUI thread as usual. The asset is 67 MB, which is why
+    repainted by the GUI thread as usual. The asset is tens of MB, which is why
     there is a bar at all rather than a spinner.
     """
 
@@ -83,8 +109,8 @@ class _StageWorker(QObject):
     def cancel(self) -> None:
         """Stop at the next chunk. Set from the GUI thread when the app closes.
 
-        A download of 67 MB cannot be interrupted by quitting a thread's event
-        loop, because it is in a read loop and not in an event loop. Raising
+        A download of tens of MB cannot be interrupted by quitting a thread's
+        event loop, because it is in a read loop and not in one. Raising
         out of the progress callback is what stops it, and it stops it through
         client.stage()'s own cleanup, so the half-written staging folder goes
         with it rather than being left beside the install.
@@ -119,9 +145,9 @@ class UpdateNotice(QFrame):
     moves unless an update is actually offered.
     """
 
-    #: A verified update is staged and the app has to close for the swap. The
-    #: main window decides when that is safe (unsaved changes) and calls
-    #: launch_swap() when it is.
+    #: A verified installer is on disk and the app has to close for it to run.
+    #: The main window decides when that is safe (unsaved changes) and calls
+    #: launch_update() when it is.
     staged_ready = Signal(object)
 
     def __init__(self, parent=None) -> None:
@@ -216,8 +242,8 @@ QLabel#UpdateNoticeText {{
             return
         self._info = info
         self._label.setText(info.headline())
-        self._action.setText("Update now" if client.install_dir() is not None
-                             else "View release")
+        self._action.setText(ACTION_TEXT.get(client.install_kind(),
+                                             "View release"))
         self._action.setEnabled(True)
         self._later.setEnabled(True)
         self._bar.hide()
@@ -235,12 +261,21 @@ QLabel#UpdateNoticeText {{
             return
 
         target = client.install_dir()
-        if target is None:
-            # Running from source: there is no exe to replace, so the honest
-            # thing is the release page rather than a swap that cannot work.
+        kind = client.install_kind(target)
+        if kind != client.INSTALLED:
+            # SOURCE has no exe to update at all. PORTABLE has one and must
+            # not be handed to the installer: see the module docstring. Both
+            # get the release page, which is the honest answer rather than an
+            # update that cannot work.
             url = self._info.release.html_url
             if url:
                 QDesktopServices.openUrl(QUrl(url))
+            if kind == client.PORTABLE:
+                # Left on screen rather than dismissed: the download is only
+                # half the job and the other half is the sentence below.
+                self._label.setText(PORTABLE_STEPS)
+                self._action.setEnabled(False)
+                return
             self._dismiss()
             return
 
@@ -258,11 +293,11 @@ QLabel#UpdateNoticeText {{
         self._run(worker)
 
     def _on_progress(self, done: int, total: int, phase: str) -> None:
-        if phase == "unpacking":
-            # No byte count to report through the unpack, and a bar frozen at
+        if phase == "checking":
+            # No byte count to report through the check, and a bar frozen at
             # 100% reads as a hang. A busy bar says it is still working.
             self._bar.setRange(0, 0)
-            self._label.setText("Checking and unpacking the download...")
+            self._label.setText("Checking the download...")
             return
         if total > 0:
             self._bar.setValue(int(done * 100 / total))
@@ -294,16 +329,16 @@ QLabel#UpdateNoticeText {{
         QMessageBox.warning(self.window(), "Update", message
                             or "The update stopped. Nothing has been changed.")
 
-    def launch_swap(self, staged) -> bool:
-        """Start the helper that does the swap. True when it is running.
+    def launch_update(self, staged) -> bool:
+        """Start the installer. True when it is running.
 
-        The caller must exit the app straight after a True: the helper is
-        sitting in a wait loop watching for this process to go, and nothing on
-        disk has changed until it does.
+        The caller must exit the app straight after a True. Setup would close
+        it through the Restart Manager anyway, but exiting cleanly is how
+        unsaved work gets its prompt, and the window has already asked.
         """
         try:
-            swap.apply(staged)
-        except swap.SwapNotStarted as exc:
+            installer.apply(staged)
+        except installer.InstallerNotStarted as exc:
             QMessageBox.warning(self.window(), "Update", str(exc))
             self._action.setEnabled(True)
             self._later.setEnabled(True)
@@ -323,8 +358,8 @@ QLabel#UpdateNoticeText {{
         """Later. Hidden for this session; the next launch asks again.
 
         Anything already downloaded is thrown away rather than left in a
-        folder beside the install for nobody to find. It is a 67 MB folder and
-        the next launch would re-check anyway.
+        folder beside the install for nobody to find. It is tens of MB and the
+        next launch would re-check anyway.
         """
         if self._staged is not None:
             self._staged.discard()
@@ -367,6 +402,15 @@ QLabel#UpdateNoticeText {{
         wait would otherwise land _on_check_done or _on_stage_done on a window
         that is halfway through closing, and neither of those has any business
         running then.
+
+        BOTH EXCEPTIONS ARE CAUGHT, and the second one was bought the hard way.
+        A no-argument disconnect() on a worker that has nothing connected does
+        not raise RuntimeError in PySide6, it raises TypeError ("not enough
+        arguments"), because with no connections to drop the call resolves to
+        an overload that wants some. This runs inside closeEvent, so what an
+        escaping exception costs is the app failing to close. Caught here on
+        9 Sept 2026 after it came out of a suite run under load, which is the
+        only condition anything had ever reproduced it in.
         """
         worker, thread = self._worker, self._thread
         if worker is None and thread is None:
@@ -376,6 +420,6 @@ QLabel#UpdateNoticeText {{
                 worker.cancel()
             try:
                 worker.disconnect()
-            except RuntimeError:
+            except (RuntimeError, TypeError):
                 pass          # nothing was connected, or it is already gone
         self._finish_thread(wait_ms=15000)

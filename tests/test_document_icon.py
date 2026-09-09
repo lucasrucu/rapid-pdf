@@ -215,11 +215,13 @@ def test_installer_refreshes_the_shell_icon_cache():
 #
 # The DefaultIcon change shipped in 1.6.0 and the icon file was added with it,
 # but the ONLY thing putting that file at {app}\pdf-document.ico was the
-# installer's [Files] line. An in-app update never runs the installer: it
-# downloads the portable zip, which is the PyInstaller onedir folder, and
-# robocopies it over the install (core/update/client.py, core/update/swap.py).
-# So on any machine that updated from inside the app, DefaultIcon pointed at a
-# file that was never delivered.
+# installer's [Files] line, and up to 1.9.0 an in-app update never ran the
+# installer: it downloaded the portable zip, which is the PyInstaller onedir
+# folder, and laid it over the install. So on any machine that updated from
+# inside the app, DefaultIcon pointed at a file that was never delivered. From
+# 1.10.0 an installed copy updates by running setup (core/update/installer.py)
+# so that particular hole is closed, but a portable copy still only ever gets
+# the zip, and the zip has to be complete.
 #
 # PyInstaller 6 buries every `datas` entry under _internal/, so the spec has to
 # copy the icon to the onedir root itself, after COLLECT. These tests pin that.

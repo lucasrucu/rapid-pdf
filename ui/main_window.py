@@ -1087,17 +1087,18 @@ class MainWindow(QMainWindow):
         return True
 
     def _on_update_staged(self, staged):
-        """A verified update is on disk and the app has to close for the swap.
+        """A verified installer is on disk and the app has to close to run it.
 
         The unsaved-changes prompt runs FIRST, and a cancelled prompt leaves
         everything as it was: the download stays staged and the strip keeps
-        offering it. The helper is only started once closing is certain,
-        because the moment it starts it is watching for this process to exit.
+        offering it. The installer is only started once closing is certain,
+        because it closes this app itself if it is still here when it gets to
+        the files.
         """
         if not self._maybe_save_every_tab():
             self._update_notice.apply_cancelled()
             return
-        if not self._update_notice.launch_swap(staged):
+        if not self._update_notice.launch_update(staged):
             return
         for view in self._area.views():
             view.mark_clean()    # the prompt above has already settled these
