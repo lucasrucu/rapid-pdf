@@ -2,7 +2,7 @@
 
 WHY THIS EXISTS. The test suite runs under QT_QPA_PLATFORM=offscreen, forced in
 tests/conftest.py, and offscreen has no window procedure, no compositor and no
-z-order. It will happily tell you that `drop_active()` is True while nothing
+z-order. It will happily tell you that `drop_indicator()` is set while nothing
 whatsoever is on screen, so a green suite is not evidence that drag feedback is
 visible. Two defects in one day got through exactly that gap.
 
@@ -158,8 +158,14 @@ def main():
     state = {"mode": ThemeMode.LIGHT, "ok": {}, "phase": 0}
 
     def feedback_of(window):
-        bar = window.document_area().bar()
-        return bar.drop_active(), bar.drop_indicator()
+        """Where the insertion line is on that window's strip, or None.
+
+        It used to return a wash flag alongside this. The wash and the outline
+        it came with are gone: they read as a highlight box around the tab on a
+        strip that hugs its tabs, and Edge draws neither. The line is now the
+        whole of the feedback, so it is the whole of what this asks about.
+        """
+        return window.document_area().bar().drop_indicator()
 
     def run_pass(mode, done):
         """One full drag in one theme, photographed at the moment of truth."""
@@ -225,14 +231,14 @@ def main():
                     for dx in range(5):
                         move_to(spot.x() - (4 - dx) * 8, spot.y())
                 elif kind == "probe":
-                    active, line = feedback_of(win_b)
+                    line = feedback_of(win_b)
                     tear = win_a.document_area().bar()._tear_off
                     say(f"    [{arg}] dragging={tear.is_dragging()} "
                         f"A={win_a.document_area().count()} "
                         f"B={win_b.document_area().count()} "
-                        f"B.drop_active={active} B.drop_indicator={line} "
+                        f"B.drop_indicator={line} "
                         f"cursor={QCursor.pos()}")
-                    state["ok"][arg] = bool(active and line is not None)
+                    state["ok"][arg] = line is not None
             except RuntimeError as exc:
                 say(f"!!! RuntimeError at step {kind}: {exc}")
                 timer.stop()
