@@ -1395,8 +1395,19 @@ class PDFDocument:
     def search_text(self, needle: str) -> list[tuple[int, "fitz.Rect"]]:
         """Find every occurrence of `needle` (case-insensitive, as PyMuPDF
         does) across the document. Returns [(page_num, rect), ...] in page
-        order; rects are in the page's displayed coordinate space, the same
-        space render_page rasterises (so scene coords = rect * zoom)."""
+        order.
+
+        THE RECTS ARE IN THE PAGE'S UNROTATED USER SPACE, IN POINTS. That is
+        what `page.search_for` answers, and it is NOT the space the canvas
+        draws in: render_page rasterises the page WITH its /Rotate applied, so
+        on any page with a non-zero rotation the two spaces differ. A caller
+        that wants scene (rendered pixel) coordinates has to go through
+        `page.rotation_matrix * fitz.Matrix(zoom, zoom)`, the same transform
+        `get_text("words")` needs, and not `rect * zoom`. Multiplying by zoom
+        alone put search highlights nowhere near their text on rotated pages,
+        and this docstring used to claim it was correct, which is how that
+        shipped.
+        """
         hits: list[tuple[int, fitz.Rect]] = []
         if not self.doc or not needle:
             return hits
