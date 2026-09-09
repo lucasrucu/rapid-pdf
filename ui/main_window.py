@@ -20,6 +20,11 @@ Three of those controls act on a document and still belong here:
     each own a window-context QShortcut for "v", which Qt reports as ambiguous
     and then routes to neither. They stay here and reach the front view only,
     through the `view` property.
+  - PRINTING (Ctrl+P). The work is ui/print_support.py's; what is here is the
+    menu entry, the parent for two dialogs and a progress bar, and the three
+    `_print_*` attributes remembering what the last print in this window asked
+    for. A print reads the front document and changes nothing in it, so there
+    was nothing for the view to own.
 
 The search bar went the other way and lives in the view: its hits are page
 numbers in one particular document.
@@ -132,6 +137,9 @@ from ui.frameless import FramelessHelper
 from ui.title_bar import TitleBar
 from ui.preferences_dialog import PreferencesDialog
 from ui.page_jump import PageJump
+from ui.print_support import (
+    RANGE_ALL, print_active_document, report_print_result,
+)
 from ui.reopen_stack import capture_view, reopen_stack
 from ui.session import recorder
 from ui.theme import ThemeManager, apply_mica, themed_icon, qtawesome_available, LIGHT
@@ -181,6 +189,13 @@ class MainWindow(QMainWindow):
         self._mica_applied = False  # the backdrop needs an HWND, so it waits for show()
         self._screen_watched = False  # so does the QWindow behind screenChanged
         self._mru_filter_on = False   # a Ctrl+Tab walk is waiting on Ctrl coming up
+        # What the last Print in THIS window asked for, so the next Ctrl+P
+        # opens on the same choices. Deliberately per window and not persisted:
+        # printing four pages of one pack is no reason for tomorrow's print of
+        # a different document to start there. See ui/print_support.py.
+        self._print_options = None
+        self._print_range = RANGE_ALL
+        self._print_custom = ""
         # Joined BEFORE anything that asks the registry a question. In
         # particular _should_check_for_updates counts the windows already in it,
         # so a window that has not joined would think it was the first.
@@ -957,6 +972,12 @@ class MainWindow(QMainWindow):
         self._add_action(fm, "Save", self.save_pdf, QKeySequence.StandardKey.Save)
         self._add_action(fm, "Save As…", self.save_pdf_as, "Ctrl+Shift+S")
         fm.addSeparator()
+        # Ctrl+P spelled out, for the same reason Ctrl+Q is below rather than
+        # QKeySequence.StandardKey.Quit: a standard key is resolved by the
+        # platform, and this app has already shipped a menu entry whose
+        # displayed shortcut was a hardware media key nobody could press.
+        self._add_action(fm, "Print…", self.print_pdf, "Ctrl+P")
+        fm.addSeparator()
         self._add_action(fm, "Enhance for Search (OCR)…", self.enhance_for_search)
         fm.addSeparator()
         # Ctrl+Q spelled out, not QKeySequence.StandardKey.Quit. On Windows that
@@ -1476,6 +1497,25 @@ class MainWindow(QMainWindow):
 
     def save_pdf_as(self) -> bool:
         return self.view.save_pdf_as()
+
+    def print_pdf(self):
+        """File > Print… (Ctrl+P). Paper, out of whatever is on screen.
+
+        The work is ui/print_support.py's, and deliberately not the view's.
+        Printing needs three things a DocumentView does not put together
+        anywhere else (the document, the canvas holding the unsaved markup, and
+        the page strip's selection), it needs a window to parent two dialogs
+        and a progress bar to, and it needs none of the view's own state. So it
+        reads like every other entry in this menu: one hop out of the window,
+        and the answer comes back as a line for the status bar.
+
+        The choices made in the options dialog are remembered on this window
+        (`_print_options` and friends, set by print_active_document), because a
+        commissioning pack gets printed several times in a row.
+        """
+        result = print_active_document(self)
+        report_print_result(self, result)
+        return result
 
     def enhance_for_search(self):
         self.view.enhance_for_search()

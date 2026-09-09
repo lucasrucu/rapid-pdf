@@ -95,6 +95,7 @@ strip keeps its own size.
 | `Ctrl+Shift+S` | Save As |
 | `Ctrl+W` | Close the current tab |
 | `Ctrl+Shift+T` | Reopen the last closed tab |
+| `Ctrl+P` | Print |
 | `Ctrl+Q` | Quit every window |
 | Drop a PDF on a window | Opens it as a new tab in THAT window |
 
@@ -114,6 +115,47 @@ of those prompts cancels the whole close.
 
 Open and Save As start in the last folder you used. Edit > Preferences can pin
 them to one folder instead.
+
+## Printing
+
+| Key | Action |
+|---|---|
+| `Ctrl+P` | Print the document in front |
+
+`Ctrl+P` asks two things in turn. First what to print: all pages, the page you
+are on, the pages selected in the left strip, or a range you type (`1-5, 8`,
+`12-` for twelve to the end, `-4` for the start to four; backwards and
+overlapping ranges are read the way you meant them). Then the system printer
+dialog, which owns the printer, the paper, the copies and the collation. The
+choices you made stay put for the next `Ctrl+P` in that window.
+
+`Preview…` in the first dialog shows the job before it goes anywhere. It draws
+at most the first 50 pages, because a preview renders every page it is given up
+front; the print itself is not capped.
+
+**What comes out is what you can see, including markup you have not saved.**
+Rectangles, lines, highlights and text boxes are on the canvas until a save
+writes them into the file, so a print renders a throwaway copy with them baked
+in. Your file is not touched and nothing is marked saved.
+
+**Fit to page is the default and it never crops.** Each page is scaled by the
+same amount on both axes until it fits inside the paper, so an A1 drawing on A4
+comes out whole and smaller, with white space on one side. Actual size is the
+other choice: the page prints at its true size and anything bigger than the
+paper loses its edges, which the status bar says afterwards rather than leaving
+you to find at the printer.
+
+**Each sheet takes the orientation of the page going on it.** A pack of A4
+check sheets with A3 and A1 drawings in the middle prints each one the way
+round it wants, rather than turning the whole document sideways for the sake of
+the drawings. Turn `Match each page's orientation` off to print everything the
+way the printer is set. A page rotated in the file counts as rotated here, so
+what prints is the way round you are reading it.
+
+Pages are rendered one at a time at up to 300 DPI of paper, chosen from the
+printer's own resolution rather than the screen's. A long print puts up a
+progress bar with a Cancel button; cancelling stops at the page it is on. A
+500-page pack takes about a minute and holds one page of pixels at a time.
 
 ## Tabs
 
