@@ -1176,19 +1176,32 @@ class PDFCanvas(QGraphicsView):
     def set_search_hits(self, rects, current_index: int = -1):
         """Overlay translucent boxes for text-search hits on the CURRENT page.
 
-        `rects` are fitz.Rects in the page's displayed coordinate space (what
-        PDFDocument.search_text returns); scene coords are that times _zoom.
+        `rects` are fitz.Rects in the page's UNROTATED user space, in points,
+        which is what PDFDocument.search_text returns. Getting to scene coords
+        is `_text_matrix()`, exactly as it is for `get_text("words")`, and NOT
+        `rect * _zoom`: the pixmap under these boxes is rendered with the page's
+        rotation applied, so on a rotated page multiplying by the raster scale
+        alone lands the highlight somewhere other than the text it matched.
         The hit at `current_index` is emphasised and scrolled into view.
         These are plain QGraphicsRectItems, NOT AnnotationBase, so the canvas's
         picking/serialisation only ever looks at AnnotationBase, so search
         overlays can't be dragged, saved, or copied.
         """
         self.clear_search_hits()
-        z = self._zoom
+        if not rects:
+            return
+        if not self._doc or not self._doc.doc or self._zoom <= 0:
+            return
+        try:
+            m = self._text_matrix()
+        except Exception as e:
+            print(f"Search highlight transform error: {e}")
+            return
         current_item = None
         for i, r in enumerate(rects):
-            rect = QRectF(r.x0 * z, r.y0 * z,
-                          (r.x1 - r.x0) * z, (r.y1 - r.y0) * z).adjusted(-2, -2, 2, 2)
+            t = fitz.Rect(r) * m
+            rect = QRectF(QPointF(t.x0, t.y0),
+                          QPointF(t.x1, t.y1)).normalized().adjusted(-2, -2, 2, 2)
             item = self._scene.addRect(rect)
             if i == current_index:
                 item.setBrush(self._hit_current_fill)
