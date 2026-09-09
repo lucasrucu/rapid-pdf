@@ -58,7 +58,7 @@ import traceback
 from PySide6.QtCore import (
     QEventLoop, QMetaObject, QObject, QThread, Qt, Signal, Slot,
 )
-from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog
+from PySide6.QtWidgets import QMessageBox, QProgressDialog
 
 #: How long `shutdown_tasks` waits for a worker to notice it was cancelled
 #: before giving up on it and abandoning it. Generous, because the thing being
@@ -708,10 +708,3 @@ class DocumentSearcher(QObject):
             return
         self._pending_term = None
         self.failed.emit(message, details)
-
-
-def process_events():
-    """Let the GUI draw once. Used by tests to prove it still can."""
-    app = QApplication.instance()
-    if app is not None:
-        app.processEvents()
