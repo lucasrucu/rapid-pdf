@@ -182,6 +182,146 @@ class SavePlan(NamedTuple):
         return self.breaks_signature
 
 
+class SplitPlan(NamedTuple):
+    """One output file a split would write, decided before anything is written.
+
+    `pages` are zero-based indices into the SOURCE document, in the order they
+    go into the new file. `label` is the same thing in words for a preview list
+    ("pages 1 to 5"). `exists` is whether something is already sitting at
+    `path`, read when the plan was made, so a dialog can ask about the
+    collisions in one go rather than one modal per file.
+    """
+
+    path: str
+    pages: tuple
+    label: str
+    exists: bool = False
+
+    @property
+    def page_count(self) -> int:
+        return len(self.pages)
+
+
+class SplitReport(NamedTuple):
+    """What a split actually did. Every list holds paths.
+
+    `skipped` and `failed` are separate on purpose: a file that was already
+    there and was left alone is an answer to a question the user has not been
+    asked yet, and a file that could not be written is a problem.
+    """
+
+    written: tuple = ()
+    skipped: tuple = ()
+    failed: tuple = ()          # (path, reason) pairs
+    warnings: tuple = ()        # what the new files could not carry over
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.written) and not self.failed
+
+
+def page_range_label(pages) -> str:
+    """Page numbers in words, ONE-BASED because that is what the user sees.
+
+    "page 3", "pages 3 to 7", "pages 3, 5 and 9". Contiguity is worked out
+    rather than assumed: a split produces runs and an extract usually does not.
+    """
+    rows = [int(p) + 1 for p in pages]
+    if not rows:
+        return "no pages"
+    if len(rows) == 1:
+        return f"page {rows[0]}"
+    ascending = sorted(rows)
+    if ascending == list(range(ascending[0], ascending[0] + len(ascending))):
+        return f"pages {ascending[0]} to {ascending[-1]}"
+    return "pages " + _join_words([str(r) for r in rows])
+
+
+def page_range_suffix(pages) -> str:
+    """The part of a file name that says which pages are in it, one-based.
+
+    "p3", "p3-7", "p3-9-selection". A non-contiguous set is NOT spelled out:
+    forty comma-separated numbers is not a file name, and Windows has a path
+    length to spend.
+    """
+    rows = sorted({int(p) + 1 for p in pages})
+    if not rows:
+        return "pages"
+    if len(rows) == 1:
+        return f"p{rows[0]}"
+    contiguous = rows == list(range(rows[0], rows[0] + len(rows)))
+    if contiguous:
+        return f"p{rows[0]}-{rows[-1]}"
+    return f"p{rows[0]}-{rows[-1]}-selection"
+
+
+#: Characters Windows will not accept in a file name, plus the ones that make a
+#: name awkward to type. Replaced rather than stripped so two different stems
+#: cannot collapse onto one name.
+_UNSAFE_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def sanitise_stem(stem: str) -> str:
+    """A file-name stem that Windows will actually accept.
+
+    The stem usually comes from the source document's own name, so it is
+    already legal, but a split dialog lets the user type one and a future
+    commissioning run will build one out of a certificate number read off a
+    scan. Neither can be trusted to be a legal file name.
+    """
+    cleaned = _UNSAFE_NAME_CHARS.sub("_", str(stem or "")).strip().rstrip(".")
+    return cleaned or "document"
+
+
+def unique_path(path: str) -> str:
+    """`path`, or the first free "name (2).pdf" beside it.
+
+    Explorer's idiom, so the result reads like something the user did rather
+    than like something a program did. Gives up after a thousand tries and
+    hands back a name with the process id in it, which is still better than
+    looping forever on a folder somebody is filling as fast as this reads it.
+    """
+    if not os.path.exists(path):
+        return path
+    stem, ext = os.path.splitext(path)
+    for n in range(2, 1002):
+        candidate = f"{stem} ({n}){ext}"
+        if not os.path.exists(candidate):
+            return candidate
+    return f"{stem} ({os.getpid()}){ext}"
+
+
+def every_n_groups(page_count: int, n: int) -> list[tuple]:
+    """Page indices grouped into runs of `n`, the last run taking the remainder.
+
+    A pure function of two numbers, so the "3 files of 4 and one of 2" arithmetic
+    is testable without a document, a dialog or a disk.
+    """
+    page_count, n = int(page_count), int(n)
+    if page_count <= 0 or n <= 0:
+        return []
+    return [tuple(range(start, min(start + n, page_count)))
+            for start in range(0, page_count, n)]
+
+
+def groups_at_cuts(page_count: int, cuts) -> list[tuple]:
+    """Page indices split so that each index in `cuts` STARTS a new file.
+
+    Cuts are zero-based indices into the document. A cut at 0 is meaningless
+    (the first file starts there anyway) and is dropped rather than producing
+    an empty first group, as is any cut outside the document or repeated.
+    """
+    page_count = int(page_count)
+    if page_count <= 0:
+        return []
+    points = sorted({int(c) for c in cuts if 0 < int(c) < page_count})
+    groups, start = [], 0
+    for point in points + [page_count]:
+        groups.append(tuple(range(start, point)))
+        start = point
+    return [g for g in groups if g]
+
+
 def _signature_widgets(doc) -> list[str]:
     """Names of the signature fields in `doc` that have actually been SIGNED.
 
@@ -207,6 +347,50 @@ def _signature_widgets(doc) -> list[str]:
             if kind and kind != "null":
                 names.append(widget.field_name or "(unnamed)")
     return names
+
+
+def _strip_signature_values(doc) -> int:
+    """Empty the /V of every signature field in `doc`. Returns how many.
+
+    RUN ON EVERYTHING PULLED OUT OF ANOTHER DOCUMENT, and it is a correctness
+    fix rather than tidying. `insert_pdf(widgets=True)` copies a signature
+    WIDGET across with its signature dictionary intact, so a page extracted out
+    of a signed bundle lands in a brand new file that claims to be signed. It
+    cannot be: a signature covers a byte range of the file it was applied to,
+    and that file no longer exists. Measured: without this, `is_signed()` on
+    the extracted file answers True.
+
+    Two things go wrong if the claim is left in place. This app's own save path
+    starts protecting a signature that is not there, forcing incremental writes
+    and warning the user about breaking something already broken. And the
+    warning `split_warnings()` gives ("the new files will not be signed") would
+    be a lie the file itself contradicts.
+
+    The FIELD survives, empty, which is what an unsigned certificate carries
+    anyway. Only the claim goes.
+    """
+    cleared = 0
+    try:
+        if doc.get_sigflags() < 0:
+            return 0
+    except Exception:
+        pass
+    try:
+        for page in doc:
+            for widget in page.widgets():
+                if widget.field_type != fitz.PDF_WIDGET_TYPE_SIGNATURE:
+                    continue
+                try:
+                    kind, _value = doc.xref_get_key(widget.xref, "V")
+                except Exception:
+                    continue
+                if not kind or kind == "null":
+                    continue
+                doc.xref_set_key(widget.xref, "V", "null")
+                cleared += 1
+    except Exception as e:
+        print(f"Signature strip error: {e}")
+    return cleared
 
 
 def _highlight_quad(visible_rect, derot) -> "fitz.Quad":
@@ -326,6 +510,10 @@ class PDFDocument:
         # AUTH_OWNER). Counts and bit flags only; see unlock().
         self.failed_unlock_attempts: int = 0
         self._authenticated_as: int = 0
+        # Why the last split/extract write failed, in words fit to show a user,
+        # or None. Same read-it-straight-after-a-False contract as
+        # last_save_error.
+        self.last_split_error: str | None = None
 
     # ------------------------------------------------------------------
     # Rendered-page pixmap cache
@@ -1422,6 +1610,199 @@ class PDFDocument:
                                 start_at=max(0, min(at, len(self.doc))))
         self.invalidate_render_cache()   # page set/indices changed
         self._note_structure_change()
+
+    # ------------------------------------------------------------------
+    # Extract and split: pages OUT of this document into new files
+    #
+    # The inverse of Combine, and the mechanical half of the commissioning
+    # feature that cuts a combined scan into one file per certificate. Every
+    # decision a dialog would make is a value here (`SplitPlan`) and every
+    # write is one call (`run_split`), so the future feature builds its own
+    # groups and paths and reuses the writer without a dialog anywhere near it.
+    #
+    # NOTHING WRITTEN HERE INHERITS THE SOURCE'S PROTECTION. Each output is a
+    # brand new document that pages were copied into, so it carries no
+    # encryption, no permission restrictions and no signature, whatever the
+    # source carried. `split_warnings()` says all three out loud rather than
+    # letting the user find out from the file they have already sent on.
+    # ------------------------------------------------------------------
+
+    def build_extract(self, page_nums: list) -> "fitz.Document":
+        """A standalone in-memory PDF holding `page_nums`, in the order given.
+
+        The difference from `extract_pages` is the ORDER and what travels.
+        `extract_pages` is the undo stash: it sorts, because a delete has to go
+        back where it came from, and it takes the insert_pdf defaults. This is
+        the user-facing extract, so the caller's order is kept and links,
+        annotations and form widgets are asked for by name, the same three
+        `transfer_pages_from` asks for.
+
+        Duplicates are kept: pulling the same page out twice is a legitimate
+        thing to ask for and silently collapsing it would be a surprise.
+        Caller owns the returned document.
+        """
+        out = fitz.open()
+        if not self.is_open():
+            return out
+        count = self.page_count()
+        for page_num in page_nums:
+            page_num = int(page_num)
+            if not (0 <= page_num < count):
+                continue
+            out.insert_pdf(self.doc, from_page=page_num, to_page=page_num,
+                           links=True, annots=True, widgets=True)
+        _strip_signature_values(out)
+        return out
+
+    def split_warnings(self) -> list[str]:
+        """What the user loses by pulling pages out of THIS document.
+
+        Finished sentences, in the order they matter. Empty for the ordinary
+        case, which is most documents.
+        """
+        out = []
+        if self.is_signed():
+            who = ", ".join(self.signature_names())
+            out.append(
+                f"This PDF is digitally signed ({who}). A signature covers the "
+                "whole file, so it cannot come with pages copied out of it. The "
+                "new files will NOT be signed: the signature field comes across "
+                "empty rather than carrying a signature that no reader could "
+                "verify. Nothing in them can be taken as signed.")
+        if self.is_encrypted():
+            out.append(
+                "This PDF is encrypted. The new files will NOT be password "
+                "protected: anything pulled out of it is written in the clear.")
+        elif self.denied_operations():
+            out.append(
+                "This PDF withholds " + _join_words(self.denied_operations())
+                + ". The new files will carry no such restriction.")
+        return out
+
+    def write_extract(self, page_nums: list, out_path: str,
+                      overwrite: bool = False) -> bool:
+        """Write `page_nums` to `out_path` as a new PDF. The source is untouched.
+
+        False leaves the reason in `last_split_error`, and the two refusals it
+        makes on purpose are worth naming: a target that already exists (unless
+        `overwrite`), and a target that IS the source document, which would eat
+        the file the pages are being read out of.
+        """
+        self.last_split_error = None
+        if not self.is_open():
+            self.last_split_error = "There is no document to take pages from."
+            return False
+        rows = [int(p) for p in page_nums if 0 <= int(p) < self.page_count()]
+        if not rows:
+            self.last_split_error = "No pages were selected."
+            return False
+        try:
+            same_as_source = (self.path is not None
+                              and os.path.abspath(out_path) == os.path.abspath(self.path))
+        except (OSError, ValueError):
+            same_as_source = False
+        if same_as_source:
+            self.last_split_error = (
+                "That would write over the document the pages are being taken "
+                "from. Choose another name.")
+            return False
+        if os.path.exists(out_path) and not overwrite:
+            self.last_split_error = f"A file already exists here:\n{out_path}"
+            return False
+        out = None
+        try:
+            out = self.build_extract(rows)
+            if not len(out):
+                self.last_split_error = "No pages could be copied."
+                return False
+            parent = os.path.dirname(os.path.abspath(out_path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            out.save(out_path, garbage=4, deflate=True)
+            return True
+        except Exception as e:
+            print(f"Extract error: {e}")
+            self.last_split_error = f"Could not write:\n{out_path}\n\n{e}"
+            return False
+        finally:
+            if out is not None:
+                try:
+                    out.close()
+                except Exception:
+                    pass
+
+    def plan_split(self, groups: list, out_dir: str | None = None,
+                   stem: str | None = None) -> list["SplitPlan"]:
+        """Turn page groups into the exact files that would be written.
+
+        Decided in full before anything is written, so a dialog can show the
+        list, and a caller with no dialog at all can take the plans, change a
+        path and hand them straight to `run_split`.
+
+        `out_dir` defaults to the folder the document is in, `stem` to its name
+        without the extension. Names are `<stem>_part01.pdf`, zero padded to
+        the width of the count so ten or more parts sort correctly in Explorer.
+        `exists` is set per plan rather than raised: overwriting is the user's
+        call and `run_split` will not make it for them.
+        """
+        plans: list[SplitPlan] = []
+        groups = [tuple(int(p) for p in g) for g in groups if len(g)]
+        if not groups:
+            return plans
+        if out_dir is None:
+            out_dir = (os.path.dirname(os.path.abspath(self.path))
+                       if self.path else os.getcwd())
+        if stem is None:
+            stem = (os.path.splitext(os.path.basename(self.path))[0]
+                    if self.path else "document")
+        width = max(2, len(str(len(groups))))
+        for index, pages in enumerate(groups, start=1):
+            name = f"{sanitise_stem(stem)}_part{index:0{width}d}.pdf"
+            path = os.path.join(out_dir, name)
+            plans.append(SplitPlan(path, pages, page_range_label(pages),
+                                   os.path.exists(path)))
+        return plans
+
+    def run_split(self, plans: list, overwrite: bool = False) -> "SplitReport":
+        """Write every plan. The source document is never touched.
+
+        Carries on past a failure rather than stopping at it: a split of forty
+        certificates where one target is locked by Acrobat should still produce
+        the other thirty nine, and the report says which one did not land.
+        `skipped` is separate from `failed` because a target that already
+        exists is a question for the user, not an error.
+        """
+        self.last_split_error = None
+        warnings = tuple(self.split_warnings())
+        written, skipped, failed = [], [], []
+        for plan in plans:
+            if os.path.exists(plan.path) and not overwrite:
+                skipped.append(plan.path)
+                continue
+            if self.write_extract(list(plan.pages), plan.path, overwrite=True):
+                written.append(plan.path)
+            else:
+                failed.append((plan.path,
+                               self.last_split_error or "Could not write the file."))
+        self.last_split_error = None
+        return SplitReport(tuple(written), tuple(skipped), tuple(failed), warnings)
+
+    def suggest_extract_path(self, page_nums: list,
+                             out_dir: str | None = None) -> str:
+        """A file name for extracting `page_nums`, in a folder that exists.
+
+        Never collides: an existing name gets " (2)", " (3)" and so on, which
+        is the idiom Explorer uses and the one a user recognises. A dialog
+        still asks before overwriting anything, because the user can type a
+        name of their own over this one.
+        """
+        if out_dir is None:
+            out_dir = (os.path.dirname(os.path.abspath(self.path))
+                       if self.path else os.getcwd())
+        stem = (os.path.splitext(os.path.basename(self.path))[0]
+                if self.path else "document")
+        name = f"{sanitise_stem(stem)}_{page_range_suffix(page_nums)}.pdf"
+        return unique_path(os.path.join(out_dir, name))
 
     # ------------------------------------------------------------------
     # Moving pages between two LIVE documents (phase 5 of docs/tabs-plan.md)
