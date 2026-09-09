@@ -1,0 +1,208 @@
+RapidPDF
+Copyright (C) 2026 Lucas Ruiz
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version. The full text is in the LICENSE file at the root of this
+repository, and at https://www.gnu.org/licenses/agpl-3.0.html.
+
+Source code: https://github.com/lucasrucu/rapid-pdf
+
+If you received RapidPDF as a binary (the installer or the portable zip), the
+complete corresponding source for that version is the tagged commit of the same
+version number in the repository above, under the same licence. Every release
+on the Releases page has a matching tag.
+
+
+================================================================================
+THIRD-PARTY SOFTWARE
+================================================================================
+
+RapidPDF is distributed as a frozen Windows bundle, so everything listed below
+ships inside the installer and the portable zip, not just alongside the source.
+Each entry names the licence that was verified, and how. Anything that could
+not be confirmed from a file on this machine is marked UNVERIFIED LOCALLY and
+carries the upstream project's own statement instead.
+
+
+--------------------------------------------------------------------------------
+PyMuPDF 1.27.2.3
+--------------------------------------------------------------------------------
+Copyright (C) Artifex Software, Inc.
+Licence: GNU AGPL-3.0, or an Artifex commercial licence.
+https://github.com/pymupdf/PyMuPDF
+
+Verified from the installed distribution metadata, which states
+"Dual Licensed - GNU AFFERO GPL 3.0 or Artifex Commercial License", and from
+the COPYING file in pymupdf-1.27.2.3.dist-info, which carries the same line.
+
+This is the library RapidPDF is built on. It renders every page, performs every
+save, and its extension modules (_mupdf.pyd, mupdfcpp64.dll, _extra.pyd) ship
+inside the bundle. It is the dependency that decides RapidPDF's own licence:
+distributing a binary built on an AGPL library, without an Artifex commercial
+licence, requires the binary be offered under AGPL-compatible terms. See
+docs/licensing-decision.md.
+
+
+--------------------------------------------------------------------------------
+MuPDF
+--------------------------------------------------------------------------------
+Copyright (C) Artifex Software, Inc.
+Licence: GNU AGPL-3.0 or later, or an Artifex commercial licence.
+https://mupdf.com/
+
+MuPDF is the C library underneath PyMuPDF. It is not installed as a separate
+package: it is compiled into mupdfcpp64.dll and _mupdf.pyd, which the PyMuPDF
+wheel ships and the bundle copies. The PyMuPDF COPYING file above is the only
+licence document present for it in this tree, and it covers the whole
+distribution including MuPDF. No separate MuPDF licence file is installed.
+
+
+--------------------------------------------------------------------------------
+Libraries compiled into MuPDF
+--------------------------------------------------------------------------------
+UNVERIFIED LOCALLY. These were confirmed to be PRESENT by reading the symbol
+and string tables of the installed mupdfcpp64.dll, so they genuinely ship. No
+licence file for any of them exists anywhere in this tree, so the terms below
+are the upstream projects' own and should be checked against the exact MuPDF
+build before being relied on in a legal context.
+
+  FreeType        font rasterisation      FreeType Licence (BSD-style) or GPLv2
+  HarfBuzz        text shaping            MIT (the "Old MIT" licence)
+  Tesseract OCR   the OCR engine          Apache-2.0
+  Leptonica       image processing        BSD-2-Clause
+  jbig2dec        JBIG2 image decoding    GNU AGPL-3.0 (Artifex Software)
+  OpenJPEG        JPEG 2000 decoding      BSD-2-Clause
+  zlib            deflate compression     zlib licence
+  Brotli          brotli compression      MIT
+
+Note that jbig2dec is Artifex's and is itself AGPL, which reinforces rather
+than complicates RapidPDF's position.
+
+
+--------------------------------------------------------------------------------
+Qt for Python (PySide6) 6.11.1, and Qt 6
+--------------------------------------------------------------------------------
+Copyright (C) The Qt Company Ltd. and other contributors.
+Licence: LGPL-3.0-only, or GPL-2.0-only, or GPL-3.0-only, or a Qt commercial
+licence. RapidPDF relies on the LGPL-3.0 option.
+https://doc.qt.io/qtforpython/
+
+Verified from the installed distribution metadata of PySide6, PySide6-Essentials,
+PySide6-Addons and shiboken6, all 6.11.1, each of which states
+"LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only". Each also records a
+LicenseRef-Qt-Commercial.txt, which is the alternative, not the one in use here.
+
+THE RELINKING OBLIGATION, WHICH A PYINSTALLER BUNDLE IS EXACTLY WHERE PEOPLE
+MISS IT. LGPL-3.0 requires that a recipient of the binary be able to replace the
+LGPL library with their own modified version and still run the program. In a
+onedir PyInstaller bundle the Qt libraries are ordinary DLLs sitting next to the
+executable, loaded dynamically at run time, so this is satisfied in practice:
+a recipient can drop in a rebuilt Qt DLL of the same version and the app picks
+it up. Two build settings that RapidPDF already sets for unrelated reasons keep
+it that way, and both must stay:
+
+  - onedir, not onefile. A onefile build unpacks to a temp folder on every
+    launch, which makes substitution far harder to argue.
+  - upx=False. Packing the DLLs would obscure exactly what is being replaced.
+
+Both are set in rapid-pdf.spec, where the comments explain the antivirus
+reasoning. This paragraph is the second reason not to change them. Since
+RapidPDF is itself AGPL-3.0 and its complete source is public, the LGPL's other
+conditions are met by the same source offer that covers the rest of the app.
+
+
+--------------------------------------------------------------------------------
+QtAwesome 1.4.2
+--------------------------------------------------------------------------------
+Copyright (c) 2015 The Spyder development team
+Licence: MIT
+https://github.com/spyder-ide/qtawesome
+
+Verified from the installed distribution metadata and from the MIT text in
+qtawesome-1.4.2.dist-info/licenses/LICENSE.txt.
+
+
+--------------------------------------------------------------------------------
+Icon fonts bundled by QtAwesome
+--------------------------------------------------------------------------------
+UNVERIFIED LOCALLY. rapid-pdf.spec pulls QtAwesome's package data with
+collect_data_files, so all of these .ttf files ship in the bundle. QtAwesome
+installs the fonts without their licence files, so the terms below are the
+upstream projects' own.
+
+  Font Awesome 5.15.4 and 6.7.2        fonts under SIL OFL 1.1
+  Material Design Icons 5.9.55, 6.9.96 SIL OFL 1.1
+  Elusive Icons 2.0                    SIL OFL 1.1
+  Phosphor Icons 1.3.0                 MIT
+  Remix Icon 2.5.0                     Apache-2.0
+  Codicons 0.0.36                      CC BY 4.0
+
+
+--------------------------------------------------------------------------------
+Tesseract language data: eng.traineddata
+--------------------------------------------------------------------------------
+Licence: Apache-2.0
+https://github.com/tesseract-ocr/tessdata_fast
+
+Verified from assets/tessdata/README.txt, which records the source repository,
+the Apache-2.0 terms and the SHA256 of the exact file that ships
+(7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2). The file is
+the English fast variant, roughly 4 MB, and it is what makes "Enhance for
+Search (OCR)" work on a machine with no Tesseract installation of its own.
+
+
+--------------------------------------------------------------------------------
+pywinstyles 1.8
+--------------------------------------------------------------------------------
+Licence: Creative Commons Zero v1.0 Universal (CC0 1.0, public domain
+dedication).
+https://github.com/Akascape/py-window-styles
+
+Verified from the installed distribution metadata, which states
+"Creative Commons Zero v1.0 Universal" and carries the classifier
+"License :: CC0 1.0 Universal (CC0 1.0) Public Domain Dedication". Note this is
+NOT Apache-2.0 or MIT, which is what a list would probably have guessed.
+
+Optional, Windows only. It provides the Win11 Mica and acrylic window backdrop,
+and the app degrades to a silent no-op without it.
+
+
+--------------------------------------------------------------------------------
+PyInstaller 6.21.0
+--------------------------------------------------------------------------------
+Licence: GPL-2.0-or-later, with the PyInstaller bootloader exception.
+https://pyinstaller.org/
+
+Verified from the installed distribution metadata, which states
+"GPLv2-or-later with a special exception which allows to use PyInstaller to
+build and distribute non-free programs (including commercial ones)".
+
+Listed because it is not merely a build tool: the compiled bootloader becomes
+part of rapid-pdf.exe. The exception above is what permits distributing the
+resulting executable under RapidPDF's own terms. docs/build.md documents
+building that bootloader from source, which is also the antivirus mitigation.
+
+
+--------------------------------------------------------------------------------
+CPython 3.12.10
+--------------------------------------------------------------------------------
+Copyright (C) 2001 Python Software Foundation. All rights reserved.
+Licence: PSF License Agreement (Python-2.0.1), a permissive GPL-compatible
+licence.
+https://docs.python.org/3/license.html
+
+The interpreter and standard library are frozen into the bundle by PyInstaller.
+Version read from the project virtual environment.
+
+
+--------------------------------------------------------------------------------
+Landing site (landing/)
+--------------------------------------------------------------------------------
+The marketing site is part of this repository and is covered by the same
+AGPL-3.0 licence. Its npm dependencies (Next.js, React, Tailwind CSS,
+lucide-react, clsx, tailwind-merge and their transitive tree) are MIT, ISC,
+Apache-2.0, BSD-3-Clause, 0BSD and CC-BY-4.0 as recorded per package in
+landing/package-lock.json. They are build-time and site-time only. None of them
+ship in the Windows application, so they are not enumerated here.

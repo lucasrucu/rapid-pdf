@@ -20,6 +20,10 @@
 #define OldAppName "Rapid PDF"
 #define AppVersion "2.0.0"
 #define AppPublisher "Lucas Ruiz"
+; Shown on the wizard and in the Add/Remove Programs entry. The licence
+; is named here because the uninstall entry is the one place a user
+; looks up what they installed once the wizard is long gone.
+#define AppCopyright "Copyright (C) 2026 Lucas Ruiz. GNU AGPL-3.0 or later."
 #define AppExeName "rapid-pdf.exe"
 ; Stable GUID for upgrades/uninstall. Keep this fixed across versions.
 #define AppId "{{A7E3C9F1-4B2D-4E6A-9C8F-1D5B7A0E3F42}"
@@ -30,6 +34,14 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
 AppVerName={#AppName} {#AppVersion}
+AppCopyright={#AppCopyright}
+; The licence page in the wizard. RapidPDF is AGPL-3.0 (the reasoning is
+; in docs/licensing-decision.md), and the AGPL grants rights to whoever
+; receives the BINARY, not only to contributors, so the installer is
+; exactly where it belongs in front of them. LICENSE is the verbatim
+; gnu.org text and Inno reads it as plain text. Do not repoint this at a
+; reformatted or trimmed copy.
+LicenseFile=LICENSE
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes

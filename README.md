@@ -2,6 +2,8 @@
 
 A fast, focused desktop PDF editor for page management and visual markup. OCR when you ask for it, never on open. No wait.
 
+Free software under the [GNU AGPL-3.0](LICENSE). Source: [github.com/lucasrucu/rapid-pdf](https://github.com/lucasrucu/rapid-pdf).
+
 ## What it is
 
 Acrobat runs OCR and form-field detection every time it opens a file, which makes large technical PDFs slow to work with. Rapid PDF opens the file and nothing else, then does the two things that matter for field work, reorganizing pages and adding markup, instantly. Open an A1 engineering drawing, move or delete pages, drop highlights and shapes, and save, all without the wait. OCR is still there when a scan needs to be searchable, but it runs only when you pick it off the File menu.
@@ -129,3 +131,49 @@ Installing over the top by hand still works: the installer keeps a stable app id
 - [Build & packaging](docs/build.md): freezing to an installable Windows app.
 - [Keyboard & mouse shortcuts](docs/shortcuts.md): every key and gesture.
 - [Product requirements](docs/PRD.md): the problem, target user, and feature scope.
+- [Licensing decision](docs/licensing-decision.md): why AGPL-3.0, and what forced it.
+
+## Licence
+
+RapidPDF is free software, licensed under the **GNU Affero General Public
+License, version 3 or later**. The full text is in [LICENSE](LICENSE).
+
+```
+Copyright (C) 2026 Lucas Ruiz
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License along
+with this program. If not, see <https://www.gnu.org/licenses/>.
+```
+
+AGPL rather than something shorter because RapidPDF is built on **PyMuPDF**,
+which Artifex distributes under AGPL-3.0 or a paid commercial licence, and the
+installer ships it. The reasoning is written out in
+[docs/licensing-decision.md](docs/licensing-decision.md).
+
+### Getting the source
+
+Everything RapidPDF is made of is in this repository, publicly, at
+[github.com/lucasrucu/rapid-pdf](https://github.com/lucasrucu/rapid-pdf).
+
+If you have a **binary** (the installer or the portable zip from the Releases
+page), the complete corresponding source for that exact version is the git tag
+of the same version number in that repository, under the same AGPL-3.0 terms.
+Every release has a matching tag. No request is needed and nothing is charged.
+
+### Third-party components
+
+RapidPDF bundles PyMuPDF and MuPDF (AGPL-3.0, Artifex), Qt and PySide6
+(LGPL-3.0), QtAwesome and its icon fonts, Tesseract language data, pywinstyles,
+and the PyInstaller bootloader. Every one of them, with the licence that was
+actually verified and how, is in [NOTICE](NOTICE). If you are repackaging or
+redistributing RapidPDF, read that file: the Qt entry in particular records the
+LGPL relinking obligation and the two build settings that keep it satisfied.

@@ -13,6 +13,32 @@ export function Footer() {
           <p className="text-sm text-muted-foreground">
             A Qori tool. Built in Python with PySide6 and PyMuPDF.
           </p>
+          {/* THE SOURCE OFFER, AND IT HAS TO LIVE HERE. This site is where the
+              installer is handed out, and the AGPL gives rights to whoever
+              receives the binary, so the licence and the source have to be
+              reachable from the same page as the download button. The README
+              carries the same offer for anyone who reaches the repo first. */}
+          <p className="text-sm text-muted-foreground">
+            Free software under the{" "}
+            <a
+              href={LINKS.license}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-foreground transition-colors hover:text-muted-foreground"
+            >
+              GNU AGPL-3.0
+            </a>
+            . Copyright (C) 2026 Lucas Ruiz.{" "}
+            <a
+              href={LINKS.github}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-foreground transition-colors hover:text-muted-foreground"
+            >
+              Get the source
+            </a>
+            .
+          </p>
           {/* The very small link at the end. Quiet on purpose: the loud one is
               the maker band above. */}
           <p className="text-sm text-muted-foreground">
