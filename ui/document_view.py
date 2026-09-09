@@ -304,6 +304,9 @@ class DocumentView(QWidget):
         self._opening = False
         # The last open ended at the Cancel button rather than at an error.
         self._open_cancelled = False
+        # The last open already put its own message in front of the user, so
+        # `open_path` must not say it again.
+        self._open_error_reported = False
         self._setup_ui()
 
     # ------------------------------------------------------------------
@@ -745,9 +748,11 @@ class DocumentView(QWidget):
         if self._doc.doc:
             return False
         if not self._load_document(path):
-            if self._open_cancelled:
-                # The user cancelled the read. Nothing to say and nothing to
-                # clean up: the tab is empty, which is where it started.
+            if self._open_cancelled or self._open_error_reported:
+                # Either the user cancelled the read, in which case there is
+                # nothing to say and nothing to clean up, or the worker's own
+                # failure has already been reported WITH its traceback. The tab
+                # is empty either way, which is where it started.
                 return False
             if self._doc.needs_password():
                 # The prompt owns every word the user sees for a locked file:
@@ -810,6 +815,7 @@ class DocumentView(QWidget):
         leave off, since this document does have a file behind it.
         """
         self._open_cancelled = False
+        self._open_error_reported = False
         if self._opening or not self._should_thread_open(path):
             return self._doc.open(path)
 
@@ -834,6 +840,9 @@ class DocumentView(QWidget):
             report_task_error(self.window(), "Open Error",
                               f"Could not open:\n{path}\n\n{message}", details)
             self._doc.last_open_error = f"Could not open the PDF:\n{message}"
+            # Said once, with the traceback. `open_path`'s own box would be the
+            # same news a second time, and without the useful half.
+            self._open_error_reported = True
             return False
         if status == "cancelled":
             # The user said no. `open_path` reads this and stays quiet, because

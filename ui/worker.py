@@ -152,6 +152,18 @@ class _Job(QObject):
                              traceback.format_exc())
         finally:
             self.ended.emit()
+            # THE THREAD ENDS ITSELF, FROM ITSELF, and the usual
+            # `worker.finished.connect(thread.quit)` will not do. The QThread
+            # object lives on the GUI thread, so that connection is QUEUED to
+            # the GUI thread's event loop, and `shutdown()` joins by BLOCKING
+            # the GUI thread. Nothing would ever deliver the quit, so every
+            # shutdown would sit out its full timeout and then abandon a worker
+            # that had already finished. Called from here it is direct, and Qt
+            # handles a quit that lands before `exec()` by returning from it
+            # immediately.
+            thread = QThread.currentThread()
+            if thread is not None:
+                thread.quit()
 
 
 class BackgroundTask(QObject):
@@ -183,7 +195,6 @@ class BackgroundTask(QObject):
         self._job.succeeded.connect(self._on_succeeded)
         self._job.cancelled.connect(self._on_cancelled)
         self._job.failed.connect(self._on_failed)
-        self._job.ended.connect(self._thread.quit)
         self._thread.finished.connect(self._on_thread_finished)
 
         if owner is not None and hasattr(owner, "destroyed"):
@@ -195,7 +206,14 @@ class BackgroundTask(QObject):
         return self._owner
 
     def is_running(self) -> bool:
-        return self._running
+        """The THREAD is the authority, not a flag set by a queued slot.
+
+        `_on_thread_finished` only runs when the event loop is pumped, so a
+        flag would still say "running" for a worker that has already stopped,
+        which is the difference between a test that waits and a test that
+        fails.
+        """
+        return bool(self._thread.isRunning())
 
     def start(self) -> "BackgroundTask":
         if self._running:
@@ -220,12 +238,11 @@ class BackgroundTask(QObject):
             return
         self._abandoned = True
         self._job.cancel()
-        for signal in (self.progressed, self.succeeded, self.cancelled,
-                       self.failed, self.finished):
-            try:
-                signal.disconnect()
-            except (RuntimeError, TypeError):
-                pass          # nothing was connected, which is fine
+        # blockSignals rather than disconnect: it cuts every outward wire in
+        # one call, it does not complain about the ones nobody had connected,
+        # and it leaves the INWARD connection from the thread alone, so
+        # `_on_thread_finished` still runs and still unregisters this task.
+        self.blockSignals(True)
 
     def wait(self, timeout_ms: int = SHUTDOWN_WAIT_MS) -> bool:
         """Block until the worker is done. True if it finished in time."""
@@ -241,6 +258,12 @@ class BackgroundTask(QObject):
         """
         self.cancel()
         if self.wait(timeout_ms):
+            # Unregistered HERE rather than left to `_on_thread_finished`,
+            # which is queued and would not have run yet. A caller that has
+            # just joined a thread is entitled to see it gone from the
+            # registry, and unregistering twice is a no-op.
+            self._running = False
+            _unregister(self)
             return True
         self.abandon()
         return False
