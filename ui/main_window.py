@@ -142,6 +142,7 @@ from ui.print_support import (
 )
 from ui.reopen_stack import capture_view, reopen_stack
 from ui.session import recorder
+from ui.split_dialog import SplitDialog
 from ui.theme import ThemeManager, apply_mica, themed_icon, qtawesome_available, LIGHT
 from ui.undo import WindowUndoStack
 from ui.window_registry import WindowRegistry, same_file
@@ -961,6 +962,7 @@ class MainWindow(QMainWindow):
         # asked for by name.
         self._add_action(fm, "Open PDFs…", self.open_pdf, QKeySequence.StandardKey.Open)
         self._add_action(fm, "Combine PDFs…", self.combine_pdfs)
+        self._add_action(fm, "Split or Extract Pages…", self.split_pdf)
         self._add_action(fm, "Close PDF", self.close_pdf, "Ctrl+W")
         # Directly under Close, and on the key every browser uses for it. The
         # literal string for the same reason Quit is spelled out below: a
@@ -1472,6 +1474,25 @@ class MainWindow(QMainWindow):
 
     def combine_pdfs(self):
         self.view.combine_pdfs()
+
+    def split_pdf(self):
+        """Split or extract from the open document, into new files.
+
+        Whatever the page strip has selected is offered as the extract, since
+        picking the pages and then asking for them is the order the work
+        actually happens in.
+        """
+        view = self.view
+        if view is None or not view.has_document():
+            QMessageBox.warning(self, "No PDF", "Open a PDF first.")
+            return
+        dlg = SplitDialog(view.document(),
+                          selected_pages=view.selected_page_rows(),
+                          parent=self)
+        dlg.exec()
+        line = dlg.summary_line()
+        if line:
+            view.show_status(line)
 
     def combine_paths(self, paths: list):
         """Stage a combine and land the merge in a tab of its own.

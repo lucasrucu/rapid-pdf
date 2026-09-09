@@ -470,7 +470,7 @@ class PDFDocument:
         # allow_signature_break=True will write it. The window reads this right
         # after a False to decide between an error box and a question box.
         self.last_save_blocked_by_signature: bool = False
-        # Whether pages have been added, removed or reordered since this file
+        # Whether pages have been added, removed, reordered or rotated since this file
         # was opened or last saved. An incremental save can still write that,
         # but no reader will accept a signature over a page tree that has moved
         # underneath it, so it is the difference between a save that keeps a

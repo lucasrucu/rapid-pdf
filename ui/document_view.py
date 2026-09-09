@@ -101,6 +101,7 @@ from ui.page_commands import (
     DeletePagesCommand, ReorderPagesCommand, TransferPagesCommand,
 )
 from ui.page_drag import find_source_view
+from ui.password_prompt import ask_for_password
 from ui.page_panel import PagePanel
 from ui.search_bar import SearchBar
 from ui.theme import ThemeManager
@@ -329,6 +330,28 @@ class DocumentView(QWidget):
 
     def has_document(self) -> bool:
         return self._doc.doc is not None
+
+    def document(self):
+        """The PDFDocument this view holds, for a dialog that needs to read it."""
+        return self._doc
+
+    def selected_page_rows(self) -> list:
+        """Whichever panel is in front, the pages the user has picked.
+
+        Split and Extract offers this as its starting selection, because
+        picking the pages and then asking for them is the order the work
+        happens in.
+        """
+        if self._tabs.currentIndex() == 1:      # Organizer tab
+            # rotate_rows() is the grid's own answer to "what is lit up", and
+            # it is the only public one. selected_rows() is the strip's name
+            # for the same thing; the two panels have never shared it.
+            return list(self._organizer.rotate_rows())
+        return list(self._page_panel.selected_rows())
+
+    def show_status(self, message: str):
+        """Put one line in the status bar, next to the usual page position."""
+        self._update_status(message)
 
     def is_pending(self) -> bool:
         """A restored tab that has not been opened yet. See `_pending_path`."""
@@ -643,13 +666,18 @@ class DocumentView(QWidget):
         if self._doc.doc:
             return False
         if not self._doc.open(path):
-            # The document knows WHY, and for a password-protected file that
-            # reason is the whole message (known bug 4: it used to open, then
-            # throw on the first render). Falls back to the old line otherwise.
-            QMessageBox.critical(
-                self.window(), "Error",
-                self._doc.last_open_error or f"Could not open:\n{path}")
-            return False
+            if self._doc.needs_password():
+                # The prompt owns every word the user sees for a locked file:
+                # a cancel is silent, and an exhausted retry has already
+                # warned. A box from here would be the same news twice.
+                if not ask_for_password(self._doc, parent=self.window()):
+                    return False
+            else:
+                # The document knows WHY. Falls back to the old line otherwise.
+                QMessageBox.critical(
+                    self.window(), "Error",
+                    self._doc.last_open_error or f"Could not open:\n{path}")
+                return False
         self._reset_revisions()       # freshly opened, in sync with disk
         self._canvas.set_document(self._doc)
         self._page_panel.set_document(self._doc)
