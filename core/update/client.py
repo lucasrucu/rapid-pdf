@@ -15,46 +15,49 @@ file.
            safe thing to do with those is stop, delete them, and say so.
 
 WHAT STAGE DOES NOT DO: touch the install. Not one byte. It downloads beside
-the install, verifies the whole archive against the release's own sha256,
-unpacks it, and only then hands the result to swap.py, which is the part that
-needs the app to have exited. Up to the moment the swap runs, giving up costs
-nothing but a folder.
+the install and verifies every byte against the release's own sha256, and only
+then hands the result to installer.py, which is the part that needs the app to
+have exited. Up to the moment the installer runs, giving up costs nothing but a
+folder.
 
-WHY THE PORTABLE ZIP AND NOT THE SETUP EXE. Both are published on every
-release, and the zip is the one a self-update can take:
+WHY THE SETUP EXE AND NOT THE PORTABLE ZIP. This is the reverse of what this
+file said up to 1.9.0, and the reason it changed is worth reading before it is
+changed back.
 
-  * The exe is not code-signed. A setup.exe downloaded over HTTPS gets a
-    mark-of-the-web, and SmartScreen puts "Windows protected your PC" in front
-    of an unsigned one. That is an unskippable two-click detour ("More info",
-    "Run anyway") in the middle of an update the user has already agreed to,
-    and it is exactly the kind of prompt that teaches people to click through
-    warnings. The zip is data: nothing executes it, so nothing screens it, and
-    the files this code writes itself carry no mark.
-  * The zip IS the install. It holds `rapid-pdf/` with the exe and _internal/
-    exactly as they sit in an install folder, so applying it is a file swap
-    this code can verify first. Running an installer means handing the whole
-    outcome to a wizard and finding out afterwards.
-  * Running the installer would not update a portable install, it would create
-    a SECOND one. Inno puts it in %LocalAppData%\\Programs\\Rapid PDF whatever
-    folder the running copy is in, and the user would be left with a stale copy
-    where their shortcut points. A file swap updates whichever install is
-    actually running, which is the only one that matters.
-  * The zip needs no elevation either way. Inno runs PrivilegesRequired=lowest
-    so an installed copy is already under %LocalAppData% and writable, and a
-    portable copy is wherever the user unzipped it. A swap in place is
-    therefore no more privileged than the app already is.
+The zip was chosen because it IS the install folder, so applying it was a file
+swap this code could verify itself, and because an unsigned setup.exe fetched
+by a browser carries a mark-of-the-web that puts SmartScreen in front of it.
+Both of those were true. What they missed is that the file swap had to be
+carried out by something that outlives the app, and everything capable of that
+on Windows, chained the way a swap needs, reads as a dropper to a behavioural
+engine. Sophos convicted this repo's own test suite for it on 9 September 2026.
+See the docstring at the top of core/update/installer.py.
 
-The one thing the installer does that this does not is maintain the Start-menu
-entry and the uninstall registration, and a swap leaves both pointing at the
-same folder, so both keep working.
+Point by point, on the two reasons that were right at the time:
+
+  * MARK-OF-THE-WEB IS A BROWSER'S DOING, not the network's. The Zone.Identifier
+    stream is written by the program that fetches the file, and urllib does not
+    write one, so a setup.exe downloaded HERE has no mark and SmartScreen has
+    nothing to gate on. Note what is NOT being done about this: nothing strips
+    a mark, ever. Deleting a Zone.Identifier is itself a catalogued evasion
+    (T1553.005) and would trade one conviction for a worse one. This code just
+    never creates one.
+  * THE INSTALLER REALLY WOULD NOT UPDATE A PORTABLE COPY. That objection
+    stands, completely, and it is why a portable copy is no longer offered a
+    self-update at all. See install_kind() below and installer.py's docstring.
+
+What the installer does that a swap never did: it maintains the Start-menu
+entry, the uninstall registration and the whole [Registry] section, so an
+updated install stops drifting away from a freshly installed one. Two bugs in
+the 1.8.x series were exactly that drift.
 """
 
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
 import sys
-import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -64,40 +67,50 @@ from core.update.release import Asset, Release, human_size
 from core.version import running_version as _running_version
 
 #: The staging folder is named beside the install, never inside it: a folder
-#: inside would end up in the tree the swap moves files into.
+#: inside would be sitting in the tree Setup is about to replace.
 STAGING_SUFFIX = ".update"
 
-#: The exe an install is built around. Only a frozen build has one to swap.
+#: The exe an install is built around. Only a frozen build has one.
 EXE_NAME = "rapid-pdf.exe"
 
-#: The folder PyInstaller puts a onedir build's runtime in, beside the exe.
-#: An install without it is an exe with nothing to run against: it starts, it
-#: fails to find python3xx.dll, and it dies before it can say so.
-INTERNAL_DIR = "_internal"
+#: The update's log, beside the exe. Inno writes it (see installer.py), and it
+#: is named here because both halves need to agree on where it goes.
+LOG_NAME = "update.log"
 
-#: The floor on how many files an archive has to hold before it is believed to
-#: be a build at all.
-#:
-#: A real portable zip unpacks to about 252 files: the exe, _internal with the
-#: Python runtime and the PySide6 and Qt DLLs, the Qt plugin folders, and the
-#: bundled tessdata. The floor is set far below that, on purpose. This is a
-#: sanity check, not a manifest. It exists to reject an archive that unpacked
-#: to a handful of files, which is what a truncated build, a zip of the wrong
-#: thing, or a release published half-uploaded looks like, WITHOUT rejecting a
-#: legitimately slimmer future build that drops a language pack or stops
-#: bundling tessdata. Fifty is comfortably under any build that could start
-#: PySide6 at all and comfortably over anything that could not.
-MIN_PAYLOAD_FILES = 50
-
-#: Read size for the download and for hashing. The asset is 67 MB, and the
+#: Read size for the download and for hashing. The asset is tens of MB, and the
 #: default 64 KB turns that into a syscall benchmark rather than a disk one.
 CHUNK = 1 << 20
 
-#: A ceiling on what the archive is allowed to expand to, as a multiple of its
-#: own size. The real ratio is about 3. A zip bomb is not the threat model
-#: here (the digest is published by GitHub for a file GitHub stores), but an
-#: unpack with no ceiling at all is a disk nobody meant to fill.
-MAX_EXPANSION = 20
+#: The floor on how big the downloaded installer has to be before it is
+#: believed to be an installer at all.
+#:
+#: A real rapid-pdf setup exe is around 50 MB: the whole PyInstaller onedir
+#: tree, lzma2 compressed. The floor is set far below that on purpose, for the
+#: same reason the old payload file-count floor was. This is a sanity check,
+#: not a manifest. GitHub's digest proves the bytes are the ones that were
+#: uploaded; it says nothing about whether what was uploaded is a build. A
+#: placeholder file, a wrong upload or a stub named rapid-pdf-setup-X.Y.Z.exe
+#: would hash perfectly and still not be an installer. A megabyte is
+#: comfortably under anything that could carry PySide6 and comfortably over
+#: anything that could not.
+MIN_INSTALLER_BYTES = 1 << 20
+
+#: A PE starts with these two bytes and everything Windows will execute as a
+#: program is a PE. Checked because what happens next is running the file.
+PE_MAGIC = b"MZ"
+
+#: What an install of this app is, as far as updating goes.
+INSTALLED = "installed"     # made by setup, and updatable by setup
+PORTABLE = "portable"       # a folder somebody unzipped, updated by hand
+SOURCE = "source"           # not frozen at all, so there is nothing to update
+
+#: The AppId from rapid-pdf.iss, and the key Inno names after it. Typed out
+#: rather than read: the .iss is a build input, it is not shipped, and there is
+#: nothing to parse at run time. It must stay in step with rapid-pdf.iss, and
+#: tests/test_update.py reads both files to say so.
+APP_ID = "{A7E3C9F1-4B2D-4E6A-9C8F-1D5B7A0E3F42}"
+UNINSTALL_KEY = (r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
+                 rf"\{APP_ID}_is1")
 
 
 class UpdateError(Exception):
@@ -127,25 +140,19 @@ class UpdateInfo:
 
 
 @dataclass(frozen=True)
-class StagedUpdate:
-    """A verified copy of the new build, unpacked and ready to be swapped in.
+class StagedInstaller:
+    """A verified copy of the release's installer, ready to be run.
 
-    THE THREE NUMBERS ARE NOT STATISTICS. swap.build_script writes file_count
-    and exe_bytes into the batch file, and that file refuses to call an update
-    finished unless the install ends up holding at least file_count files and
-    an exe of exactly exe_bytes bytes. They are the only thing standing between
-    a robocopy that moved almost nothing and a log line claiming it worked:
-    that is not hypothetical, it is the 34 file install this check was written
-    for. Do not let them go stale, and do not let them go unread.
+    `installer_bytes` is measured off the file on disk after the download, not
+    taken from the release JSON, for the same reason the old payload numbers
+    were measured rather than trusted: what matters is what is actually there.
     """
 
     info: UpdateInfo
     install_dir: Path
     staging_dir: Path
-    payload_dir: Path
-    file_count: int
-    payload_bytes: int
-    exe_bytes: int
+    installer_path: Path
+    installer_bytes: int
 
     def discard(self) -> None:
         """Throw the staging folder away. Safe to call twice."""
@@ -156,25 +163,122 @@ def install_dir() -> Path | None:
     """The folder holding the running exe, or None when running from source.
 
     None is not a failure, it is the everyday development case: there is no
-    exe to swap, so there is nothing for swap.py to do. The UI turns that into
-    "open the release page" instead of "update now".
+    install to update. The UI turns that into "open the release page" instead
+    of "update now".
     """
     if not getattr(sys, "frozen", False):
         return None
     return Path(sys.executable).resolve().parent
 
 
-def staging_dir_for(target: Path) -> Path:
-    """Where a staged update goes for a given install.
+def installed_location() -> Path | None:
+    """Where Inno Setup says RapidPDF is installed, or None if it says nothing.
 
-    BESIDE THE INSTALL, AND THAT IS LOAD BEARING. swap.py moves the staged
-    files into place, and a move is only a rename (instant, and unable to
-    leave a half-written file under a real name) when both ends are on the
-    same volume. Staging in %TEMP% would put the payload on C: while the
-    install can be on a USB stick, and every move would silently become a copy.
+    Read out of Inno's own uninstall registration, which is written by setup
+    and by nothing else. That is what makes it a trustworthy answer to "was
+    this copy installed": a portable copy cannot have one, because nothing
+    ever ran setup for it.
+
+    THE ALTERNATIVE, AND WHY IT DOES NOT WORK. The obvious approach is a marker
+    file in the portable zip. It cannot be used here, because 1.9.0 and earlier
+    update by laying the zip's CONTENTS over the install folder, so an INSTALLED
+    copy that reaches 1.10.0 through the old updater would have the marker in it
+    and would look portable for the rest of its life. Detecting installed
+    POSITIVELY, from a key the old updater never wrote, has no such hole.
+
+    None on anything unexpected: not Windows, no winreg, key absent, value
+    absent, value empty. Every one of those means "cannot show this was
+    installed", which install_kind() reads as portable, and portable is the
+    answer that never runs an installer.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import winreg
+    except ImportError:      # pragma: no cover - Windows always has it
+        return None
+    # HKCU first: PrivilegesRequired=lowest means that is where a normal
+    # install registers. HKLM is read after it for a per-machine install, in
+    # both registry views, because which one Inno wrote depends on how it was
+    # compiled and reading the wrong one would report "portable" for a machine
+    # that is anything but.
+    places = [
+        (winreg.HKEY_CURRENT_USER, 0),
+        (winreg.HKEY_LOCAL_MACHINE, getattr(winreg, "KEY_WOW64_64KEY", 0)),
+        (winreg.HKEY_LOCAL_MACHINE, getattr(winreg, "KEY_WOW64_32KEY", 0)),
+    ]
+    for root, view in places:
+        try:
+            with winreg.OpenKey(root, UNINSTALL_KEY, 0,
+                                winreg.KEY_READ | view) as key:
+                value = winreg.QueryValueEx(key, "InstallLocation")[0]
+        except OSError:
+            continue
+        # Inno writes this with a trailing backslash, and quotes turn up in
+        # hand-edited registries. Path() copes with the first, not the second.
+        text = str(value or "").strip().strip('"')
+        if text:
+            return Path(text)
+    return None
+
+
+def same_folder(left: Path | None, right: Path | None) -> bool:
+    """Do these two paths name the same folder, as Windows sees it.
+
+    Case-insensitive and trailing-separator-insensitive, because the registry
+    value and sys.executable are written by different programs and agree on
+    neither.
+    """
+    if left is None or right is None:
+        return False
+    try:
+        a = os.path.normcase(os.path.normpath(str(Path(left).resolve())))
+        b = os.path.normcase(os.path.normpath(str(Path(right).resolve())))
+    except OSError:
+        return False
+    return a == b
+
+
+def install_kind(target: Path | None = None) -> str:
+    """INSTALLED, PORTABLE or SOURCE. What kind of copy is running.
+
+    Only INSTALLED gets a self-update, and it gets it by running the same
+    installer a person would run by hand. PORTABLE is sent to the release page
+    to fetch the zip, because running the installer against a portable folder
+    would build a second install somewhere else and leave this one stale.
+    SOURCE has no exe at all.
+
+    PORTABLE IS THE FALLBACK FOR EVERY DOUBT, deliberately. Being wrong towards
+    portable costs a manual download. Being wrong towards installed runs an
+    installer against a folder it does not own.
+    """
+    target = install_dir() if target is None else Path(target)
+    if target is None:
+        return SOURCE
+    return INSTALLED if same_folder(installed_location(), target) else PORTABLE
+
+
+def staging_dir_for(target: Path) -> Path:
+    """Where a staged download goes for a given install.
+
+    BESIDE THE INSTALL, still, though for a smaller reason than it used to be.
+    The old swap needed staging on the same volume so every move was a rename;
+    nothing renames anything now. What is left is that the installer is a large
+    file which should land on the same disk the install is on rather than
+    filling C: for a copy running off a stick, and that a folder next to the
+    install is somewhere a person can find and delete.
     """
     target = Path(target)
     return target.parent / f"{target.name}{STAGING_SUFFIX}"
+
+
+def log_path(target: Path) -> Path:
+    """The update log, beside the exe.
+
+    Beside the exe because that is where somebody looks when the app did not
+    come back, and the app is not running to show it anywhere else.
+    """
+    return Path(target) / LOG_NAME
 
 
 def check(current_version: str | None = None, feed=None) -> UpdateInfo | None:
@@ -190,7 +294,7 @@ def check(current_version: str | None = None, feed=None) -> UpdateInfo | None:
       * no network, DNS not resolving, a proxy or captive portal in the way,
       * GitHub rate limiting this address, or having an outage,
       * the repo has no releases, or the newest one is a draft,
-      * the newest release was published without its portable zip,
+      * the newest release was published without its setup exe,
       * the asset publishes no sha256, so nothing could verify a download,
       * either side's version cannot be read, so there is nothing to compare,
       * the release is the same as this build, or older.
@@ -210,17 +314,20 @@ def check(current_version: str | None = None, feed=None) -> UpdateInfo | None:
         return None
 
 
-def stage(info: UpdateInfo, target: Path, feed=None, progress=None) -> StagedUpdate:
-    """Download, verify and unpack the release beside the install.
+def stage(info: UpdateInfo, target: Path, feed=None,
+          progress=None) -> StagedInstaller:
+    """Download and verify the release's installer beside the install.
 
     `progress(done_bytes, total_bytes, phase)` is called as the download runs
-    and once when the unpack starts. 67 MB over a site link is why there is a
-    bar at all.
+    and once when the checking starts. Tens of MB over a site link is why there
+    is a bar at all.
 
-    THE ARCHIVE IS HASHED BEFORE IT IS OPENED, against the digest GitHub
-    publishes for the asset. A mismatch deletes everything staged and raises.
-    Half an update is not a smaller update, it is a broken app, and staging
-    exists so that there is a moment where stopping is free. This is it.
+    THE DOWNLOAD IS HASHED AS IT LANDS, against the digest GitHub publishes for
+    the asset, and a mismatch deletes everything staged and raises. What is
+    downloaded here is a program that is about to be RUN, which makes this the
+    single most important check in the whole updater. Half an update is not a
+    smaller update, it is a broken app, and staging exists so that there is a
+    moment where stopping is free. This is it.
 
     Raises UpdateError for anything that stops it. Nothing it raises can leave
     the install different from how it found it, because it never writes there.
@@ -232,7 +339,7 @@ def stage(info: UpdateInfo, target: Path, feed=None, progress=None) -> StagedUpd
 
     # A staging folder left by an abandoned update is stale by definition: it
     # was built against a different release. Cleared rather than reused,
-    # because reusing it would mean trusting files nothing has checked since.
+    # because reusing it would mean trusting a file nothing has checked since.
     shutil.rmtree(staging, ignore_errors=True)
     try:
         staging.mkdir(parents=True, exist_ok=True)
@@ -242,18 +349,13 @@ def stage(info: UpdateInfo, target: Path, feed=None, progress=None) -> StagedUpd
             f"({exc.strerror or exc}). Nothing has been changed."
         ) from exc
 
-    archive = staging / asset.name
-    payload = staging / "payload"
+    setup = staging / asset.name
     try:
-        digest = _download(source, asset, archive, progress)
-        _verify(asset, archive, digest)
+        digest = _download(source, asset, setup, progress)
+        _verify(asset, setup, digest)
         if progress is not None:
-            progress(asset.size, asset.size, "unpacking")
-        count, size = _unpack(archive, payload, asset.size)
-        # Measured here, from the file on disk, and not taken from the zip's
-        # own header: what the swap has to match is what was actually written.
-        exe_bytes = (payload / EXE_NAME).stat().st_size
-        archive.unlink(missing_ok=True)
+            progress(asset.size, asset.size, "checking")
+        size = _check_installer(setup)
     except UpdateError:
         shutil.rmtree(staging, ignore_errors=True)
         raise
@@ -269,10 +371,9 @@ def stage(info: UpdateInfo, target: Path, feed=None, progress=None) -> StagedUpd
             "Nothing has been changed."
         ) from exc
 
-    return StagedUpdate(
+    return StagedInstaller(
         info=info, install_dir=target, staging_dir=staging,
-        payload_dir=payload, file_count=count, payload_bytes=size,
-        exe_bytes=exe_bytes,
+        installer_path=setup, installer_bytes=size,
     )
 
 
@@ -281,7 +382,7 @@ def _download(source, asset: Asset, target: Path, progress) -> str:
 
     Written through a `.part` and renamed, so a transfer that dies mid-file
     leaves a stray part-file rather than a short file under the real name.
-    Hashed on the way past rather than in a second pass: it is 67 MB, and
+    Hashed on the way past rather than in a second pass: it is tens of MB, and
     reading it twice to learn something the first read already knew is a
     minute of somebody's day.
     """
@@ -323,136 +424,34 @@ def _verify(asset: Asset, archive: Path, digest: str) -> None:
     )
 
 
-def _unpack(archive: Path, payload: Path, archive_size: int) -> tuple[int, int]:
-    """Unpack the verified archive into `payload`, returning (files, bytes).
+def _check_installer(setup: Path) -> int:
+    """Is the verified download actually a program. Returns its size.
 
-    THE TOP-LEVEL FOLDER IS STRIPPED. The published zip holds everything under
-    `rapid-pdf/`, because it is the PyInstaller onedir folder zipped whole, and
-    what the swap needs is the CONTENTS of that folder laid over an install.
-    Stripping is conditional: if a future zip is ever published flat, the
-    entries are taken as they are rather than losing their first path segment.
+    A THIRD CLAIM, AND IT IS NOT THE SAME AS THE OTHER TWO. The digest says the
+    bytes are the ones GitHub stored, and the size check says the transfer was
+    complete. Neither says the file is an installer. The zip path had three
+    shape checks for exactly this reason, and dropping them because the file
+    is now an exe rather than an archive would be dropping the lesson: a
+    release published with a placeholder, or with the wrong file attached under
+    the right name, hashes perfectly and is not a build.
 
-    EVERY NAME IS CHECKED before anything is written, even though the archive
-    has already been verified against GitHub's digest. The digest proves the
-    bytes are the published ones; it says nothing about whether the published
-    ones contain `..\\..\\Windows\\System32\\something`. Those are different
-    claims and only one of them is about trust.
-
-    AND WHAT CAME OUT IS CHECKED FOR SHAPE, which is a third claim again. The
-    digest says the bytes are the published ones and the name check says they
-    landed where they should; neither says the archive is a Rapid PDF build.
-    For a long time the only shape check here was that a file called
-    rapid-pdf.exe existed, so a zip holding exactly that one file staged
-    happily and the swap then laid it over a working install. The three checks
-    at the bottom are the cheapest place in the whole update to stop: nothing
-    outside the staging folder has been touched yet, so giving up costs a
-    folder.
+    This is the LAST place an update can be stopped for free. After it, the
+    file gets run.
     """
-    try:
-        with zipfile.ZipFile(archive) as zf:
-            entries = [item for item in zf.infolist() if not item.is_dir()]
-            if not entries:
-                raise UpdateError(
-                    "The update stopped: the downloaded archive is empty. "
-                    "Nothing has been changed."
-                )
-
-            total = sum(item.file_size for item in entries)
-            if total > archive_size * MAX_EXPANSION:
-                raise UpdateError(
-                    f"The update stopped: the archive claims to unpack to "
-                    f"{human_size(total)} from {human_size(archive_size)}, "
-                    "which is not what a Rapid PDF release looks like. "
-                    "Nothing has been changed."
-                )
-
-            prefix = _common_prefix([item.filename for item in entries])
-            payload.mkdir(parents=True, exist_ok=True)
-            root = payload.resolve()
-
-            for item in entries:
-                rel = _safe_relative(item.filename, prefix)
-                target = (payload / rel)
-                # The belt to the braces of _safe_relative: whatever the name
-                # was, the resolved path has to land inside the payload.
-                if not str(target.resolve()).startswith(str(root)):
-                    raise UpdateError(
-                        f"The update stopped: the archive contains an entry "
-                        f"that would be written outside the update folder "
-                        f"({item.filename!r}). Nothing has been changed."
-                    )
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with zf.open(item) as source, open(target, "wb") as out:
-                    shutil.copyfileobj(source, out, CHUNK)
-
-            if not (payload / EXE_NAME).is_file():
-                raise UpdateError(
-                    f"The update stopped: the downloaded archive has no "
-                    f"{EXE_NAME} in it, so it is not a Rapid PDF build. "
-                    "Nothing has been changed."
-                )
-            if not (payload / INTERNAL_DIR).is_dir():
-                raise UpdateError(
-                    f"The update stopped: the downloaded archive has "
-                    f"{EXE_NAME} but no {INTERNAL_DIR} folder beside it, and "
-                    f"an exe with no {INTERNAL_DIR} cannot start. It is not a "
-                    "complete Rapid PDF build. Nothing has been changed."
-                )
-            if len(entries) < MIN_PAYLOAD_FILES:
-                raise UpdateError(
-                    f"The update stopped: the downloaded archive holds "
-                    f"{len(entries)} files, and a Rapid PDF build is around "
-                    f"250. Something that small cannot be a whole build, and "
-                    f"laying it over this install would leave an app that "
-                    "does not start. Nothing has been changed."
-                )
-            return len(entries), total
-    except zipfile.BadZipFile as exc:
+    size = setup.stat().st_size
+    if size < MIN_INSTALLER_BYTES:
         raise UpdateError(
-            f"The update stopped: the downloaded archive could not be opened "
-            f"({exc}). Nothing has been changed."
-        ) from exc
-
-
-def _common_prefix(names: list[str]) -> str:
-    """The single top-level folder every entry sits under, or "" if there isn't one."""
-    tops = {name.replace("\\", "/").split("/", 1)[0] for name in names}
-    if len(tops) != 1:
-        return ""
-    top = tops.pop()
-    if not top or top in (".", ".."):
-        return ""
-    # Only a prefix if every entry actually has something after it, otherwise
-    # a flat archive of one file would lose its only path segment.
-    if all("/" in name.replace("\\", "/") for name in names):
-        return top
-    return ""
-
-
-def _safe_relative(name: str, prefix: str) -> Path:
-    """The archive entry's path inside the payload, or raise.
-
-    Absolute paths, drive letters and any `..` segment are refused rather than
-    sanitised: a name that needs rewriting to be safe is a name this code does
-    not understand, and quietly repairing it would hide that.
-    """
-    rel = name.replace("\\", "/").lstrip("/")
-    if prefix and rel.startswith(prefix + "/"):
-        rel = rel[len(prefix) + 1:]
-    if not rel:
-        raise UpdateError(
-            f"The update stopped: the archive contains an unusable entry "
-            f"({name!r}). Nothing has been changed."
+            f"The update stopped: {setup.name} is {human_size(size)}, and a "
+            f"Rapid PDF installer is around 50 MB. Something that small "
+            "cannot be a whole build, and it is not going to be run. "
+            "Nothing has been changed."
         )
-    if len(rel) >= 2 and rel[1] == ":":
+    with open(setup, "rb") as handle:
+        magic = handle.read(len(PE_MAGIC))
+    if magic != PE_MAGIC:
         raise UpdateError(
-            f"The update stopped: the archive contains an absolute path "
-            f"({name!r}). Nothing has been changed."
+            f"The update stopped: {setup.name} does not start like a Windows "
+            "program, so whatever was published under that name is not an "
+            "installer. Nothing has been changed."
         )
-    parts = rel.split("/")
-    if any(part in ("", ".", "..") for part in parts):
-        raise UpdateError(
-            f"The update stopped: the archive contains an entry that points "
-            f"outside itself ({name!r}). Nothing has been changed."
-        )
-    return Path(*parts)
+    return size

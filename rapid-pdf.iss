@@ -18,7 +18,7 @@
 ; created has to name what that build actually created.
 #define AppName "RapidPDF"
 #define OldAppName "Rapid PDF"
-#define AppVersion "1.9.0"
+#define AppVersion "1.10.0"
 #define AppPublisher "Lucas Ruiz"
 #define AppExeName "rapid-pdf.exe"
 ; Stable GUID for upgrades/uninstall. Keep this fixed across versions.
@@ -57,6 +57,22 @@ ArchitecturesInstallIn64BitMode=x64compatible
 ; (verified: 1.1.0 -> 1.2.1 /SILENT upgrade produced no desktop shortcut
 ; until this line was added).
 UsePreviousTasks=no
+
+; -- What the in-app updater relies on. Both of these are Inno's defaults, and
+; -- both are written out because from 1.10.0 the app runs this installer
+; -- itself (core/update/installer.py) and a default that moved underneath it
+; -- would break an update on a machine nobody is watching.
+;
+; CloseApplications: Setup asks the Windows Restart Manager to close whatever
+; is holding the files it needs to replace. Running silently that happens
+; without a prompt, which is what lets the app hand over the update and quit
+; without racing it.
+CloseApplications=yes
+; RestartApplications: OFF, and this one is NOT the default. Inno can only
+; restart an application that called RegisterApplicationRestart, and RapidPDF
+; does not, so leaving it on would be a promise nothing keeps. The relaunch is
+; the [Run] entry gated on RelaunchAfterUpdate below, which actually happens.
+RestartApplications=no
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -231,7 +247,16 @@ Root: HKCU; Subkey: "Software\{#AppName}\Capabilities\FileAssociations"; ValueTy
 Root: HKCU; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueName: "{#AppName}"; ValueData: "Software\{#AppName}\Capabilities"; Flags: uninsdeletevalue
 
 [Run]
+; A person running setup by hand gets the usual "Launch RapidPDF" checkbox on
+; the last page. postinstall is what makes it a checkbox and skipifsilent is
+; what keeps it out of an unattended install.
 Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+; The in-app updater's relaunch. A PLAIN [Run] entry: no postinstall, so it is
+; not a checkbox and does not depend on a wizard page that a silent install
+; never shows, and no skipifsilent, so it runs in exactly the case it is for.
+; RelaunchAfterUpdate keeps it off every other install, so the two entries can
+; never both fire and start the app twice.
+Filename: "{app}\{#AppExeName}"; Flags: nowait; Check: RelaunchAfterUpdate
 
 ; -----------------------------------------------------------------------------
 ; CODE SIGNING (deferred, see docs/build.md "Adding code signing later").
@@ -289,4 +314,20 @@ begin
   // should be drawn instead of a stale RapidPDF entry.
   if CurUninstallStep = usPostUninstall then
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, 0, 0);
+end;
+
+// The switch the in-app updater passes, and the only thing that turns the
+// relaunch [Run] entry on. core/update/installer.py builds the command line,
+// and tests/test_update.py reads both files to check they still agree on the
+// spelling of this one string, because a typo in it is silent: the update
+// works perfectly and the app never comes back.
+//
+// WHY A SWITCH OF OUR OWN rather than just reading /SILENT. Silent is not the
+// same question. Somebody scripting a deployment installs silently and does
+// NOT want the app started on every machine; the updater does, because the
+// app was open a moment ago and somebody is waiting for it to come back. Only
+// the caller knows which of those this is, so the caller says.
+function RelaunchAfterUpdate: Boolean;
+begin
+  Result := ExpandConstant('{param:RAPIDPDFRELAUNCH|0}') = '1';
 end;

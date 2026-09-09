@@ -5,12 +5,15 @@ one place, the [Registry] section of `rapid-pdf.iss`, which means they were
 written by the INSTALLER and by nothing else. Two shipping mechanisms then
 walked straight through that assumption:
 
-  The in-app updater. `core/update/swap.py` replaces the files in the install
-  folder and restarts the app. It never runs setup, so it never writes a
-  registry value. Lucas updated to 1.6.0 on 31 Aug 2026 and to 1.7.0 on 2 Sept
-  through the updater, and the document-icon fix that shipped in 1.6.0 sat in
+  The in-app updater, as it was up to 1.9.0. It replaced the files in the
+  install folder and restarted the app, and it never ran setup, so it never
+  wrote a registry value. Lucas updated to 1.6.0 on 31 Aug 2026 and to 1.7.0
+  on 2 Sept through it, and the document-icon fix that shipped in 1.6.0 sat in
   his install folder without ever reaching his registry. He reported the same
-  bug twice against two builds that both contained the fix.
+  bug twice against two builds that both contained the fix. From 1.10.0 the
+  updater runs setup (`core/update/installer.py`), so the registry is written
+  on every update, but this file stays: a portable copy still never runs setup
+  at all, and it is the cheaper of the two guarantees anyway.
 
   The uninstaller. Inno's `uninsdeletekey` and `uninsdeletevalue` flags remove
   the ProgID and the `.pdf\\OpenWithProgids` value, which is correct on a real

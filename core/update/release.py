@@ -28,9 +28,9 @@ something happens", and it is the single worst thing this code could do:
 Refusing to guess costs one skipped update and nothing else.
 
 WHY THE RELEASE PARSE IS STRICT. Everything checked here is trusted later:
-client.stage() writes the asset to disk and swap.py moves it into a working
-install. A release that is half readable is the worst outcome, because it
-would download a payload and verify it against nothing. So a release with no
+client.stage() writes the asset to disk and core/update/installer.py RUNS it.
+A release that is half readable is the worst outcome, because it would
+download a payload and verify it against nothing. So a release with no
 usable digest is not a release this app will install, and it is refused here
 rather than being downloaded and hoped about. client.check() turns every raise
 into "no update", so strictness costs nothing at run time.
@@ -47,8 +47,22 @@ from dataclasses import dataclass
 #: read is a version it declines to compare rather than one it guesses at.
 _SEMVER = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 
-#: The asset a self-update takes. See client.py for why it is the portable zip
-#: and not the setup exe.
+#: The asset a self-update RUNS. From 1.10.0 an installed build hands the
+#: update to the same Inno Setup installer that created the install, so this
+#: is the setup exe and not the portable zip. See the docstring at the top of
+#: core/update/installer.py for the whole argument.
+#:
+#: Matched on both ends because "rapid-pdf-setup-1.10.0.exe" is the only exe a
+#: release publishes, and a bare ".exe" match would happily pick up anything
+#: somebody attached to a release afterwards.
+SETUP_PREFIX = "rapid-pdf-setup-"
+SETUP_SUFFIX = ".exe"
+
+#: The portable zip. Nothing here installs it: a portable copy is replaced by
+#: hand, because running the installer against one would not update it, it
+#: would create a SECOND install somewhere else and leave the user's shortcut
+#: pointing at the stale copy. It is read anyway, and it is OPTIONAL, so the
+#: notice can name the download a portable user is being sent to fetch.
 PORTABLE_SUFFIX = "-portable.zip"
 
 #: A digest as the Releases API publishes it: "sha256:" and 64 hex characters.
@@ -113,17 +127,26 @@ class Release:
     notes: str
     published_at: str
     html_url: str
-    asset: Asset
+    asset: Asset              # the setup exe, which is what an update runs
+    portable: Asset | None    # the zip, for a portable copy replaced by hand
 
 
 def parse_latest(payload: bytes | str,
-                 asset_suffix: str = PORTABLE_SUFFIX) -> Release:
+                 asset_prefix: str = SETUP_PREFIX,
+                 asset_suffix: str = SETUP_SUFFIX) -> Release:
     """Turn the /releases/latest body into a Release, or raise ReleaseError.
 
-    `asset_suffix` names the file a self-update installs. Exactly one uploaded
-    asset must match it: zero means the release was published without the
-    payload (which has happened, see docs/build.md), and two would mean
-    guessing which one to install.
+    `asset_prefix` and `asset_suffix` name the file a self-update runs.
+    Exactly one uploaded asset must match: zero means the release was published
+    without the payload (which has happened, see docs/build.md), and two would
+    mean guessing which one to run.
+
+    THE PORTABLE ZIP IS OPTIONAL AND THE SETUP EXE IS NOT, which is the
+    opposite of how this read up to 1.9.0. The reason is that only one of them
+    is ever executed by this app. A release with no setup exe cannot be
+    installed by anybody, so it is refused outright; a release with no zip is
+    still perfectly installable, and all a missing zip costs is that the notice
+    cannot say how big the manual download is.
     """
     data = _as_object(payload)
 
@@ -144,7 +167,8 @@ def parse_latest(payload: bytes | str,
             f"(tag {tag!r}, title {title!r})"
         )
 
-    asset = _asset_from(data.get("assets"), asset_suffix)
+    asset = _asset_from(data.get("assets"), asset_suffix, prefix=asset_prefix)
+    portable = _asset_from(data.get("assets"), PORTABLE_SUFFIX, required=False)
 
     notes = str(data.get("body") or "").strip()
     if len(notes) > NOTES_LIMIT:
@@ -158,6 +182,7 @@ def parse_latest(payload: bytes | str,
         published_at=str(data.get("published_at") or ""),
         html_url=str(data.get("html_url") or ""),
         asset=asset,
+        portable=portable,
     )
 
 
@@ -192,8 +217,19 @@ def _version_from(tag: str, title: str) -> str | None:
     return "{}.{}.{}".format(*parts)
 
 
-def _asset_from(assets, suffix: str) -> Asset:
+def _asset_from(assets, suffix: str, *, prefix: str = "",
+                required: bool = True) -> Asset | None:
+    """The one uploaded asset matching prefix+suffix, or None when optional.
+
+    `required=False` is only for the portable zip. Everything else about an
+    asset is checked exactly as strictly either way: an optional asset that IS
+    published and publishes no digest is still a broken release, because the
+    only reason to read it at all is to tell somebody what to download.
+    """
+    label = f"{prefix}*{suffix}" if prefix else suffix
     if not isinstance(assets, list):
+        if not required:
+            return None
         raise ReleaseError("the release lists no assets")
 
     matches = []
@@ -201,7 +237,7 @@ def _asset_from(assets, suffix: str) -> Asset:
         if not isinstance(item, dict):
             continue
         name = str(item.get("name") or "")
-        if not name.endswith(suffix):
+        if not (name.startswith(prefix) and name.endswith(suffix)):
             continue
         if str(item.get("state") or "") != "uploaded":
             # An asset still uploading has a size and a URL and is not there.
@@ -209,10 +245,12 @@ def _asset_from(assets, suffix: str) -> Asset:
         matches.append(item)
 
     if not matches:
-        raise ReleaseError(f"the release carries no {suffix} asset")
+        if not required:
+            return None
+        raise ReleaseError(f"the release carries no {label} asset")
     if len(matches) > 1:
         names = ", ".join(sorted(str(m.get("name")) for m in matches))
-        raise ReleaseError(f"the release carries more than one {suffix} "
+        raise ReleaseError(f"the release carries more than one {label} "
                            f"asset: {names}")
 
     item = matches[0]

@@ -12,23 +12,37 @@ WHAT IS ACTUALLY BEING PINNED, in order of how expensive getting it wrong is:
      switches updates off forever, depending on which side it lands on.
   2. check()'s "never raises" contract, against a feed that fails in every way
      a feed can fail.
-  3. That a download whose hash does not match is never unpacked, and that a
-     failed update leaves nothing behind.
-  4. The swap helper, which is the one piece that runs while the app is not
-     there to report anything.
+  3. That a download whose hash does not match is never run, and that a failed
+     update leaves nothing behind.
+  4. install_kind(), which decides whether an update is applied at all. Getting
+     it wrong towards "installed" runs an installer against a folder Inno does
+     not own.
+  5. The command line handed to the installer, which is the one thing that
+     runs while the app is not there to report anything.
 
-THE LAST ONE ACTUALLY RUNS THE BATCH FILE, and it is careful about it: the
-process it relaunches is a copy of rundll32.exe (a GUI-subsystem exe that
-exits immediately, so no console window is ever created), every process is
-started with CREATE_NO_WINDOW, and every process and temp folder is registered
-with addCleanup before it is created. A test that spawns real processes and
-does not clean up after itself leaves consoles all over somebody's desktop
-overnight; that has happened on this machine, on the sibling project this
-design came from, and it is not happening here.
+WHY THERE IS NO LONGER A TEST THAT COPIES rundll32.exe. Up to 1.9.0 the swap
+helper was a batch file, so testing it meant running it, which meant a fake
+install with a real exe in it, and the exe used was a copy of System32's
+rundll32.exe under another name. That is MITRE ATT&CK T1036.003, "Masquerading:
+Rename System Utilities", and on 9 September 2026 Sophos Endpoint Agent
+detected it (Evade_13a) on this repo's own suite and deleted the files
+mid-test. It was right about what it saw. The batch file is gone (see
+core/update/installer.py), and where a real process is still needed the exe is
+a five line stub compiled here with MSVC, which is a program written for this
+test and not a Windows component wearing a different name.
+
+THE STUB IS STILL HANDLED CAREFULLY, for the reason the old fixture was: it is
+GUI subsystem so nothing ever creates a console window, it returns immediately,
+and every process and temp folder is registered with addCleanup before it is
+created. A test that spawns real processes and does not clean up after itself
+leaves consoles all over somebody's desktop overnight; that has happened on
+this machine, on the sibling project this design came from, and it is not
+happening here.
 """
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -36,11 +50,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
-import zipfile
 from pathlib import Path
 
-from core.update import client, swap
+from core.update import client, installer
 from core.update.feed import FeedUnavailable
 from core.update.release import (
     ReleaseError, human_size, is_newer, parse_latest, parse_version,
@@ -48,33 +62,55 @@ from core.update.release import (
 
 WINDOWS = sys.platform == "win32"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+ROOT = Path(__file__).resolve().parent.parent
 
 
 # ---------------------------------------------------------------------------
 # Fixtures: a release payload shaped like the real one, and a feed to serve it
 # ---------------------------------------------------------------------------
 
+def setup_asset(version: str, *, sha: str, size: int) -> dict:
+    return {
+        "name": f"rapid-pdf-setup-{version}.exe",
+        "state": "uploaded",
+        "size": size,
+        "digest": f"sha256:{sha}",
+        "content_type": "application/octet-stream",
+        "browser_download_url": (
+            "https://github.com/lucasrucu/rapid-pdf/releases/download/"
+            f"v{version}/rapid-pdf-setup-{version}.exe"),
+    }
+
+
+def portable_asset(version: str) -> dict:
+    return {
+        "name": f"rapid-pdf-{version}-portable.zip",
+        "state": "uploaded",
+        "size": 67262398,
+        "digest": "sha256:" + "b" * 64,
+        "content_type": "application/zip",
+        "browser_download_url": (
+            "https://github.com/lucasrucu/rapid-pdf/releases/download/"
+            f"v{version}/rapid-pdf-{version}-portable.zip"),
+    }
+
+
 def release_payload(version: str = "1.4.0", *, sha: str | None = None,
-                    size: int = 67262398, assets: list | None = None,
+                    size: int = 48293712, assets: list | None = None,
                     **overrides) -> dict:
     """A /releases/latest reply, trimmed to the fields this app reads.
 
     The field names and the digest format are copied from the real reply for
     lucasrucu/rapid-pdf v1.3.0, so a change in the API shape shows up here.
+    Both assets are attached by default because every real release carries
+    both: the setup exe an update runs, and the zip a portable copy is sent to
+    fetch by hand.
     """
     sha = sha or ("b6219c1b5bca85be60106d5595f9d713"
                   "c3df3f2d25f09e97bbe3d6757db86f5e")
     if assets is None:
-        assets = [{
-            "name": f"rapid-pdf-{version}-portable.zip",
-            "state": "uploaded",
-            "size": size,
-            "digest": f"sha256:{sha}",
-            "content_type": "application/zip",
-            "browser_download_url": (
-                "https://github.com/lucasrucu/rapid-pdf/releases/download/"
-                f"v{version}/rapid-pdf-{version}-portable.zip"),
-        }]
+        assets = [setup_asset(version, sha=sha, size=size),
+                  portable_asset(version)]
     payload = {
         "tag_name": f"v{version}",
         "name": f"Rapid PDF {version}",
@@ -119,39 +155,40 @@ class FakeFeed:
         return io.BytesIO(self.asset_bytes)
 
 
-def build_zip(entries: dict[str, bytes]) -> bytes:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for name, body in entries.items():
-            zf.writestr(name, body)
-    return buf.getvalue()
+def fake_installer(size: int | None = None) -> bytes:
+    """Something shaped enough like a setup exe to get past the shape check.
 
-
-#: The exe body every fixture bundle carries, so a test can assert on the size
-#: the staged copy reports without recomputing it.
-NEW_EXE_BODY = b"the new exe" * 100
-
-
-def release_zip(version: str = "1.4.0", *, files: int = 60,
-                top: str = "rapid-pdf/") -> bytes:
-    """The shape the real portable zip has: one top folder, exe plus _internal.
-
-    IT HAS TO BE A PLAUSIBLE BUNDLE NOW, not the token four files it used to
-    be. A real portable zip is about 252 files, staging refuses anything that
-    could not be a build, and a fixture that would be refused in the field is
-    a fixture that pins the wrong behaviour. The four named entries are the
-    ones the tests actually look for; the rest is filler standing in for the
-    Qt plugins that make up most of a real build's file count.
+    "MZ" and a plausible length, and nothing else. The staging code checks
+    those two things and no more, on purpose: it is the last cheap place to
+    stop, not a PE parser, and a real installer's internals are Inno's problem.
     """
-    entries = {
-        f"{top}{client.EXE_NAME}": NEW_EXE_BODY,
-        f"{top}_internal/python312.dll": b"a dll" * 100,
-        f"{top}_internal/base_library.zip": b"stdlib" * 100,
-        f"{top}assets/tessdata/eng.traineddata": b"ocr data" * 100,
-    }
-    for n in range(files - len(entries)):
-        entries[f"{top}_internal/PySide6/plugins/qt{n:03d}.dll"] = b"qt" * 50
-    return build_zip(entries)
+    size = client.MIN_INSTALLER_BYTES if size is None else size
+    body = client.PE_MAGIC + b"\x90" * max(0, size - len(client.PE_MAGIC))
+    return body[:size]
+
+
+#: Built once. It is a megabyte, and rebuilding it per test would be a
+#: megabyte of memset for every assertion in this file.
+GOOD_INSTALLER = fake_installer()
+
+
+def remove_tree(path: Path, tries: int = 20) -> None:
+    """rmtree, but it keeps trying for a second before it gives up.
+
+    For the tests that start a real process. Windows does not release a
+    directory handle the instant a process exits, so a single
+    rmtree(ignore_errors=True) straight after one silently leaves the folder
+    behind, and one leaked folder per run is how somebody's TEMP fills up.
+    """
+    for _ in range(tries):
+        try:
+            shutil.rmtree(path)
+        except OSError:
+            pass
+        if not Path(path).exists():
+            return
+        time.sleep(0.05)
+    shutil.rmtree(path, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +214,8 @@ class VersionComparison(unittest.TestCase):
 
     def test_the_comparison_is_numeric_not_alphabetical(self):
         # The case a string comparison gets wrong, and the reason this module
-        # exists: as text, "1.10.0" sorts BEFORE "1.9.0".
+        # exists: as text, "1.10.0" sorts BEFORE "1.9.0". No longer
+        # hypothetical, this is the release that crossed it.
         self.assertTrue(is_newer("1.10.0", "1.9.0"))
         self.assertFalse(is_newer("1.9.0", "1.10.0"))
         self.assertTrue(is_newer("2.0.0", "1.99.99"))
@@ -213,9 +251,17 @@ class ReleaseParsing(unittest.TestCase):
         rel = parse_latest(json.dumps(release_payload("1.4.0")))
         self.assertEqual(rel.version, "1.4.0")
         self.assertEqual(rel.tag, "v1.4.0")
-        self.assertEqual(rel.asset.name, "rapid-pdf-1.4.0-portable.zip")
+        self.assertEqual(rel.asset.name, "rapid-pdf-setup-1.4.0.exe")
         self.assertEqual(len(rel.asset.sha256), 64)
         self.assertTrue(rel.asset.url.startswith("https://"))
+
+    def test_the_zip_is_read_too_but_is_not_the_one_that_gets_run(self):
+        # Both are on every release. Only the setup exe is ever executed; the
+        # zip is carried so a portable copy can be told what to go and fetch.
+        rel = parse_latest(json.dumps(release_payload("1.4.0")))
+        self.assertEqual(rel.asset.name, "rapid-pdf-setup-1.4.0.exe")
+        self.assertIsNotNone(rel.portable)
+        self.assertEqual(rel.portable.name, "rapid-pdf-1.4.0-portable.zip")
 
     def test_the_version_falls_back_to_the_title(self):
         payload = release_payload("1.4.0", tag_name="release-2026-08")
@@ -232,18 +278,27 @@ class ReleaseParsing(unittest.TestCase):
         with self.assertRaises(ReleaseError):
             parse_latest(json.dumps(release_payload(prerelease=True)))
 
-    def test_a_release_without_the_portable_zip_is_refused(self):
-        # This is v1.3.0's actual situation for the setup exe, in reverse: a
-        # release can be published missing an asset, and the answer is "no
-        # update", never "install whatever else is there".
-        payload = release_payload("1.4.0", assets=[{
-            "name": "rapid-pdf-setup-1.4.0.exe",
-            "state": "uploaded", "size": 40_000_000,
-            "digest": "sha256:" + "a" * 64,
-            "browser_download_url": "https://example.invalid/setup.exe",
-        }])
+    def test_a_release_without_the_setup_exe_is_refused(self):
+        # v1.3.0's actual situation, and it is the strict half of the rule: the
+        # setup exe is the thing an update RUNS, so a release published without
+        # it offers no update at all, to anybody. Never "install whatever else
+        # is there".
+        payload = release_payload("1.4.0", assets=[portable_asset("1.4.0")])
         with self.assertRaises(ReleaseError):
             parse_latest(json.dumps(payload))
+
+    def test_a_release_without_the_portable_zip_is_still_installable(self):
+        # The loose half of the same rule, and it changed at 1.10.0. Nothing
+        # here installs the zip any more, so a release missing it is perfectly
+        # installable and all that is lost is being able to name the manual
+        # download. Refusing it would switch updates off over a file nothing
+        # reads.
+        sha = hashlib.sha256(GOOD_INSTALLER).hexdigest()
+        payload = release_payload("1.4.0", assets=[
+            setup_asset("1.4.0", sha=sha, size=len(GOOD_INSTALLER))])
+        rel = parse_latest(json.dumps(payload))
+        self.assertEqual(rel.asset.name, "rapid-pdf-setup-1.4.0.exe")
+        self.assertIsNone(rel.portable)
 
     def test_an_asset_still_uploading_does_not_count(self):
         payload = release_payload("1.4.0")
@@ -253,7 +308,7 @@ class ReleaseParsing(unittest.TestCase):
 
     def test_an_asset_with_no_digest_is_refused(self):
         # Nothing could verify the download, and what would be done with it is
-        # overwriting a working install. Refused rather than trusted.
+        # RUNNING it. Refused rather than trusted.
         payload = release_payload("1.4.0")
         payload["assets"][0]["digest"] = None
         with self.assertRaises(ReleaseError):
@@ -267,17 +322,30 @@ class ReleaseParsing(unittest.TestCase):
 
     def test_a_non_https_download_url_is_refused(self):
         payload = release_payload("1.4.0")
-        payload["assets"][0]["browser_download_url"] = "http://example.invalid/x.zip"
+        payload["assets"][0]["browser_download_url"] = "http://example.invalid/x.exe"
         with self.assertRaises(ReleaseError):
             parse_latest(json.dumps(payload))
 
     def test_two_matching_assets_are_refused_rather_than_guessed_between(self):
         payload = release_payload("1.4.0")
         second = dict(payload["assets"][0])
-        second["name"] = "rapid-pdf-1.4.0-x64-portable.zip"
+        second["name"] = "rapid-pdf-setup-1.4.0-x64.exe"
         payload["assets"].append(second)
         with self.assertRaises(ReleaseError):
             parse_latest(json.dumps(payload))
+
+    def test_some_other_exe_on_the_release_is_not_taken_for_the_installer(self):
+        # The match is on BOTH ends of the name. A bare ".exe" match would pick
+        # up anything somebody attached afterwards, and what happens to the
+        # match is that it gets run.
+        payload = release_payload("1.4.0")
+        payload["assets"].append({
+            "name": "debug-symbols.exe", "state": "uploaded", "size": 100,
+            "digest": "sha256:" + "c" * 64,
+            "browser_download_url": "https://example.invalid/debug.exe",
+        })
+        rel = parse_latest(json.dumps(payload))
+        self.assertEqual(rel.asset.name, "rapid-pdf-setup-1.4.0.exe")
 
     def test_rubbish_is_refused(self):
         for text in ("", "not json", "[]", "null", '"a string"', b"\xff\xfe\x00"):
@@ -352,13 +420,85 @@ class Check(unittest.TestCase):
                 self.assertIsNone(client.check("1.3.0", feed=feed))
 
     def test_check_never_downloads_anything(self):
-        feed = FakeFeed(release_payload("1.4.0"), asset_bytes=release_zip())
+        feed = FakeFeed(release_payload("1.4.0"), asset_bytes=GOOD_INSTALLER)
         client.check("1.3.0", feed=feed)
         self.assertEqual(feed.asset_calls, 0)
 
 
 # ---------------------------------------------------------------------------
-# stage(): download, verify, unpack, and never touch the install
+# Which kind of install is this. Nothing is applied without this answer.
+# ---------------------------------------------------------------------------
+
+class InstallKind(unittest.TestCase):
+    """install_kind() decides whether an update happens at all.
+
+    The dangerous direction is one-way: reporting PORTABLE for an installed
+    copy costs a manual download, and reporting INSTALLED for a portable copy
+    runs Inno against a folder it does not own, which does not update it and
+    quietly creates a second install somewhere else.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="rapidpdf-kind-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.install = self.tmp / "RapidPDF"
+        self.install.mkdir()
+
+    def _registered(self, value):
+        """Pretend Inno's uninstall key says this."""
+        original = client.installed_location
+        client.installed_location = lambda: value
+        self.addCleanup(setattr, client, "installed_location", original)
+
+    def test_no_exe_at_all_is_source(self):
+        self.assertEqual(client.install_kind(None), client.SOURCE)
+
+    def test_a_folder_inno_registered_is_installed(self):
+        self._registered(self.install)
+        self.assertEqual(client.install_kind(self.install), client.INSTALLED)
+
+    def test_a_folder_inno_never_heard_of_is_portable(self):
+        self._registered(self.tmp / "somewhere else")
+        self.assertEqual(client.install_kind(self.install), client.PORTABLE)
+
+    def test_no_registration_at_all_is_portable(self):
+        # The everyday portable case: nothing ever ran setup, so there is no
+        # key to read.
+        self._registered(None)
+        self.assertEqual(client.install_kind(self.install), client.PORTABLE)
+
+    def test_the_trailing_backslash_inno_writes_does_not_break_the_match(self):
+        # Inno stores InstallLocation with a trailing separator and
+        # sys.executable never has one. Comparing the strings raw would report
+        # every installed copy as portable.
+        self._registered(Path(str(self.install) + os.sep))
+        self.assertEqual(client.install_kind(self.install), client.INSTALLED)
+
+    @unittest.skipUnless(WINDOWS, "case-insensitive paths are a Windows thing")
+    def test_the_case_inno_wrote_does_not_break_the_match(self):
+        self._registered(Path(str(self.install).upper()))
+        self.assertEqual(client.install_kind(self.install), client.INSTALLED)
+
+    def test_the_app_id_matches_the_one_in_the_installer_script(self):
+        # client.APP_ID names the registry key Inno writes. If the .iss ever
+        # changes its AppId, every installed copy starts reporting portable and
+        # self-update silently stops working, with no error anywhere.
+        text = (ROOT / "rapid-pdf.iss").read_text(encoding="utf-8")
+        # Inno escapes a leading brace by doubling it: {{GUID} in the file is
+        # the AppId {GUID}.
+        self.assertIn(f'#define AppId "{{{client.APP_ID}"', text)
+        self.assertIn(f"{client.APP_ID}_is1", client.UNINSTALL_KEY)
+
+    @unittest.skipUnless(WINDOWS, "the registry read is Windows only")
+    def test_reading_the_real_registry_answers_without_raising(self):
+        # Whatever this machine has, the read must produce a Path or None and
+        # must not raise: it runs on every launch that offers an update.
+        answer = client.installed_location()
+        self.assertTrue(answer is None or isinstance(answer, Path))
+
+
+# ---------------------------------------------------------------------------
+# stage(): download, verify, and never touch the install
 # ---------------------------------------------------------------------------
 
 class Staging(unittest.TestCase):
@@ -370,50 +510,39 @@ class Staging(unittest.TestCase):
         self.install.mkdir()
         (self.install / client.EXE_NAME).write_bytes(b"the old exe")
 
-    def _feed_for(self, zip_bytes: bytes, version: str = "1.4.0",
+    def _feed_for(self, body: bytes, version: str = "1.4.0",
                   sha: str | None = None):
-        import hashlib
-        digest = sha or hashlib.sha256(zip_bytes).hexdigest()
-        payload = release_payload(version, sha=digest, size=len(zip_bytes))
-        return FakeFeed(payload, asset_bytes=zip_bytes)
+        digest = sha or hashlib.sha256(body).hexdigest()
+        payload = release_payload(version, sha=digest, size=len(body))
+        return FakeFeed(payload, asset_bytes=body)
 
     def test_a_good_release_stages_and_the_install_is_untouched(self):
-        zip_bytes = release_zip()
-        feed = self._feed_for(zip_bytes)
+        feed = self._feed_for(GOOD_INSTALLER)
         info = client.check("1.3.0", feed=feed)
 
         seen = []
         staged = client.stage(info, self.install, feed=feed,
                               progress=lambda d, t, p: seen.append(p))
 
-        payload = staged.payload_dir
-        self.assertTrue((payload / client.EXE_NAME).is_file())
-        self.assertTrue((payload / "_internal" / "python312.dll").is_file())
-        # The zip's `rapid-pdf/` wrapper is stripped: what lands is the
-        # CONTENTS of an install, ready to be laid over one.
-        self.assertFalse((payload / "rapid-pdf").exists())
-        self.assertEqual(staged.file_count, 60)
-        # Measured off the unpacked file, and load bearing: swap.build_script
-        # writes it into the batch file as the size the swapped-in exe has to
-        # have before the update may call itself finished.
-        self.assertEqual(staged.exe_bytes, len(NEW_EXE_BODY))
-        self.assertEqual(
-            staged.exe_bytes, (payload / client.EXE_NAME).stat().st_size)
+        self.assertTrue(staged.installer_path.is_file())
+        self.assertEqual(staged.installer_path.name,
+                         "rapid-pdf-setup-1.4.0.exe")
+        self.assertEqual(staged.installer_path.read_bytes(), GOOD_INSTALLER)
+        # Measured off the file on disk, not read out of the release JSON.
+        self.assertEqual(staged.installer_bytes, len(GOOD_INSTALLER))
         self.assertEqual(staged.staging_dir, self.tmp / "Rapid PDF.update")
-        # The archive itself is cleaned up once unpacked.
-        self.assertFalse((staged.staging_dir / info.asset.name).exists())
+        self.assertEqual(staged.installer_path.parent, staged.staging_dir)
         # Not one byte of the install has moved.
         self.assertEqual((self.install / client.EXE_NAME).read_bytes(),
                          b"the old exe")
         self.assertIn("downloading", seen)
-        self.assertIn("unpacking", seen)
+        self.assertIn("checking", seen)
 
         staged.discard()
         self.assertFalse(staged.staging_dir.exists())
 
-    def test_a_hash_mismatch_stops_before_anything_is_unpacked(self):
-        zip_bytes = release_zip()
-        feed = self._feed_for(zip_bytes, sha="0" * 64)
+    def test_a_hash_mismatch_stops_before_anything_is_run(self):
+        feed = self._feed_for(GOOD_INSTALLER, sha="0" * 64)
         info = client.check("1.3.0", feed=feed)
         with self.assertRaises(client.UpdateError) as caught:
             client.stage(info, self.install, feed=feed)
@@ -424,106 +553,65 @@ class Staging(unittest.TestCase):
                          b"the old exe")
 
     def test_a_truncated_download_stops(self):
-        zip_bytes = release_zip()
-        feed = self._feed_for(zip_bytes)
+        feed = self._feed_for(GOOD_INSTALLER)
         info = client.check("1.3.0", feed=feed)
-        feed.asset_bytes = zip_bytes[:-500]
+        feed.asset_bytes = GOOD_INSTALLER[:-500]
         with self.assertRaises(client.UpdateError):
             client.stage(info, self.install, feed=feed)
         self.assertFalse(client.staging_dir_for(self.install).exists())
 
     def test_a_download_that_dies_mid_transfer_leaves_nothing(self):
-        zip_bytes = release_zip()
-        feed = self._feed_for(zip_bytes)
+        feed = self._feed_for(GOOD_INSTALLER)
         info = client.check("1.3.0", feed=feed)
         feed.asset_error = FeedUnavailable("the link dropped")
         with self.assertRaises(client.UpdateError):
             client.stage(info, self.install, feed=feed)
         self.assertFalse(client.staging_dir_for(self.install).exists())
 
-    def test_an_archive_that_writes_outside_itself_is_refused(self):
-        # The digest proves the bytes are the ones GitHub stored. It says
-        # nothing about what those bytes contain, which is a different claim.
-        evil = build_zip({
-            f"rapid-pdf/{client.EXE_NAME}": b"x" * 100,
-            "rapid-pdf/../../../../Windows/System32/evil.dll": b"x" * 100,
-        })
-        feed = self._feed_for(evil)
-        info = client.check("1.3.0", feed=feed)
-        with self.assertRaises(client.UpdateError) as caught:
-            client.stage(info, self.install, feed=feed)
-        self.assertIn("outside", str(caught.exception))
-        self.assertFalse(client.staging_dir_for(self.install).exists())
-
-    def test_an_archive_with_no_exe_in_it_is_refused(self):
-        wrong = build_zip({"rapid-pdf/readme.txt": b"not a build" * 50})
-        feed = self._feed_for(wrong)
-        info = client.check("1.3.0", feed=feed)
-        with self.assertRaises(client.UpdateError) as caught:
-            client.stage(info, self.install, feed=feed)
-        self.assertIn(client.EXE_NAME, str(caught.exception))
-
-    def test_an_archive_too_small_to_be_a_build_is_refused(self):
-        # THE BUG, caught at the earliest place it can be caught. The swap
-        # decided success on things a two file payload passes (robocopy
-        # exiting under 8, and an exe existing as a name), so a two file
-        # payload must never reach the swap in the first place. This is what
-        # the 34 file install would have looked like on the way in, if the
-        # zip had been the thing at fault.
-        thin = build_zip({
-            f"rapid-pdf/{client.EXE_NAME}": NEW_EXE_BODY,
-            "rapid-pdf/_internal/python312.dll": b"a dll" * 100,
-        })
+    def test_something_too_small_to_be_an_installer_is_refused(self):
+        # THE BUG THE OLD FILE-COUNT FLOOR CAUGHT, in its new shape. GitHub's
+        # digest matches whatever was uploaded, so a placeholder attached under
+        # the right name verifies perfectly. The floor is the only thing
+        # between that and running it.
+        thin = fake_installer(client.MIN_INSTALLER_BYTES - 1)
         feed = self._feed_for(thin)
         info = client.check("1.3.0", feed=feed)
         with self.assertRaises(client.UpdateError) as caught:
             client.stage(info, self.install, feed=feed)
-        self.assertIn("2 files", str(caught.exception))
+        self.assertIn("cannot be a whole build", str(caught.exception))
         self.assertIn("Nothing has been changed", str(caught.exception))
         self.assertFalse(client.staging_dir_for(self.install).exists())
         self.assertEqual((self.install / client.EXE_NAME).read_bytes(),
                          b"the old exe")
 
-    def test_an_archive_with_the_exe_but_no_internal_folder_is_refused(self):
-        # A PySide6 onedir build is an exe plus _internal. An exe on its own
-        # is a file with the right name that cannot start.
-        entries = {f"rapid-pdf/{client.EXE_NAME}": NEW_EXE_BODY}
-        for n in range(80):
-            entries[f"rapid-pdf/docs/page{n:03d}.txt"] = b"x" * 40
-        feed = self._feed_for(build_zip(entries))
+    def test_the_floor_is_a_floor_and_not_a_manifest(self):
+        # Set far under a real installer's ~50 MB on purpose, so a slimmer
+        # future build is not refused. Exactly the floor stages; one under it
+        # does not, which is the test above.
+        feed = self._feed_for(fake_installer(client.MIN_INSTALLER_BYTES))
+        info = client.check("1.3.0", feed=feed)
+        staged = client.stage(info, self.install, feed=feed)
+        self.assertEqual(staged.installer_bytes, client.MIN_INSTALLER_BYTES)
+        staged.discard()
+
+    def test_something_that_is_not_a_program_is_refused(self):
+        # Right name, right size, right hash, and not an executable. The digest
+        # says the bytes are the published ones; it does not say they are a
+        # build, and this is the last place that can be asked for free.
+        not_a_program = b"PK\x03\x04" + b"z" * client.MIN_INSTALLER_BYTES
+        feed = self._feed_for(not_a_program)
         info = client.check("1.3.0", feed=feed)
         with self.assertRaises(client.UpdateError) as caught:
             client.stage(info, self.install, feed=feed)
-        self.assertIn(client.INTERNAL_DIR, str(caught.exception))
+        self.assertIn("does not start like a Windows program",
+                      str(caught.exception))
         self.assertFalse(client.staging_dir_for(self.install).exists())
-
-    def test_the_floor_is_a_floor_and_not_a_manifest(self):
-        # Set well under a real build's ~252 files on purpose, so a slimmer
-        # future build is not refused. Exactly the floor stages; one under it
-        # does not.
-        feed = self._feed_for(release_zip(files=client.MIN_PAYLOAD_FILES))
-        info = client.check("1.3.0", feed=feed)
-        staged = client.stage(info, self.install, feed=feed)
-        self.assertEqual(staged.file_count, client.MIN_PAYLOAD_FILES)
-        staged.discard()
-
-        feed = self._feed_for(release_zip(files=client.MIN_PAYLOAD_FILES - 1))
-        info = client.check("1.3.0", feed=feed)
-        with self.assertRaises(client.UpdateError):
-            client.stage(info, self.install, feed=feed)
-
-    def test_something_that_is_not_a_zip_is_refused(self):
-        feed = self._feed_for(b"this is not a zip file, it is a sentence.")
-        info = client.check("1.3.0", feed=feed)
-        with self.assertRaises(client.UpdateError):
-            client.stage(info, self.install, feed=feed)
 
     def test_a_download_aborted_from_the_progress_callback_leaves_nothing(self):
         # How closing the app mid-download stops it: the worker's progress
         # callback raises, and stage()'s own cleanup takes the half-written
         # folder with it. See ui/update_notice._StageWorker.cancel.
-        zip_bytes = release_zip()
-        feed = self._feed_for(zip_bytes)
+        feed = self._feed_for(GOOD_INSTALLER)
         info = client.check("1.3.0", feed=feed)
 
         def abort(done, total, phase):
@@ -537,339 +625,448 @@ class Staging(unittest.TestCase):
 
     def test_a_stale_staging_folder_is_cleared_not_reused(self):
         stale = client.staging_dir_for(self.install)
-        (stale / "payload").mkdir(parents=True)
-        (stale / "payload" / "leftover.txt").write_bytes(b"from a dead update")
-        zip_bytes = release_zip()
-        feed = self._feed_for(zip_bytes)
+        stale.mkdir(parents=True)
+        (stale / "leftover.exe").write_bytes(b"from a dead update")
+        feed = self._feed_for(GOOD_INSTALLER)
         info = client.check("1.3.0", feed=feed)
         staged = client.stage(info, self.install, feed=feed)
-        self.assertFalse((staged.payload_dir / "leftover.txt").exists())
+        self.assertFalse((staged.staging_dir / "leftover.exe").exists())
 
-    def test_a_flat_archive_keeps_its_paths(self):
-        feed = self._feed_for(release_zip(top=""))
+    def test_the_part_file_does_not_survive_a_dead_transfer(self):
+        # The download is written through a .part and renamed, so a transfer
+        # that dies leaves no short file under the real name. Nothing at all
+        # should be left here, because the whole folder goes.
+        feed = self._feed_for(GOOD_INSTALLER)
         info = client.check("1.3.0", feed=feed)
-        staged = client.stage(info, self.install, feed=feed)
-        self.assertTrue((staged.payload_dir / client.EXE_NAME).is_file())
-        self.assertTrue((staged.payload_dir / "_internal"
-                         / "python312.dll").is_file())
+        feed.asset_error = FeedUnavailable("the link dropped")
+        with self.assertRaises(client.UpdateError):
+            client.stage(info, self.install, feed=feed)
+        self.assertFalse(client.staging_dir_for(self.install).exists())
 
 
 # ---------------------------------------------------------------------------
-# The swap helper, as text
+# The command the installer is run with
 # ---------------------------------------------------------------------------
 
 def fake_staged(install: Path, version: str = "1.4.0", *,
-                file_count: int = 252, payload_bytes: int = 264_000_000,
-                exe_bytes: int = 4_600_000) -> client.StagedUpdate:
-    """A staged copy with numbers in it, because the script checks them.
+                installer_path: Path | None = None,
+                installer_bytes_: int = 48_293_712) -> client.StagedInstaller:
+    """A staged installer pointing at a file that really is on disk.
 
-    The defaults are a real 1.4.x portable build's shape. file_count and
-    exe_bytes are not decoration: they are written into the batch file and
-    compared against the disk before the update is allowed to say it worked.
+    build_command refuses a path that is not there, so the file is created:
+    "the download is gone" is a real failure with a test of its own and must
+    not be the accidental state of every other one.
     """
     staging = client.staging_dir_for(install)
+    if installer_path is None:
+        installer_path = staging / f"rapid-pdf-setup-{version}.exe"
+        installer_path.parent.mkdir(parents=True, exist_ok=True)
+        if not installer_path.exists():
+            installer_path.write_bytes(client.PE_MAGIC)
     info = client.UpdateInfo(
         release=parse_latest(json.dumps(release_payload(version))),
         running="1.3.0")
-    return client.StagedUpdate(
+    return client.StagedInstaller(
         info=info, install_dir=install, staging_dir=staging,
-        payload_dir=staging / "payload", file_count=file_count,
-        payload_bytes=payload_bytes, exe_bytes=exe_bytes)
+        installer_path=installer_path, installer_bytes=installer_bytes_)
 
 
-class SwapScript(unittest.TestCase):
+class InstallerCommand(unittest.TestCase):
+    """What gets handed to CreateProcess, read as text.
 
-    def setUp(self):
-        self.install = Path(r"C:\Users\someone\AppData\Local\Programs\Rapid PDF")
-        self.script = swap.build_script(fake_staged(self.install), pid=4242)
-
-    def test_every_external_command_is_fully_qualified(self):
-        # A bare `find` on a machine with Git for Windows on PATH is GNU find,
-        # which fails and reports a running app as closed. The exe would then
-        # be swapped under a live process.
-        for command in ("tasklist.exe", "find.exe", "ping.exe", "robocopy.exe"):
-            with self.subTest(command=command):
-                self.assertIn(f'"%SYS%\\{command}"', self.script)
-        self.assertIn('set "SYS=%SystemRoot%\\System32"', self.script)
-
-    def test_it_waits_for_the_app_to_exit_and_gives_up_rather_than_racing(self):
-        self.assertIn('set "PID=4242"', self.script)
-        self.assertIn('/FI "PID eq %PID%"', self.script)
-        self.assertIn(":wait", self.script)
-        self.assertIn(":stuck", self.script)
-        self.assertIn("if %WAITED% GEQ %LIMIT% goto stuck", self.script)
-
-    def test_the_old_exe_is_kept_and_restored_on_failure(self):
-        self.assertIn('move /Y "%INSTALL%\\%EXE%" "%INSTALL%\\%EXE%.bak"',
-                      self.script)
-        self.assertIn(":rollback", self.script)
-        self.assertIn('if exist "%INSTALL%\\%EXE%.bak" move /Y '
-                      '"%INSTALL%\\%EXE%.bak" "%INSTALL%\\%EXE%"', self.script)
-        self.assertIn(":restart", self.script)
-
-    def test_the_exe_is_swapped_by_rename_never_copied_over(self):
-        self.assertIn('move /Y "%PAYLOAD%\\%EXE%" "%INSTALL%\\%EXE%"',
-                      self.script)
-        self.assertIn('/XF "%PAYLOAD%\\%EXE%"', self.script)
-
-    def test_it_logs_beside_the_install_and_deletes_itself(self):
-        self.assertIn(f'set "LOG=%INSTALL%\\{swap.LOG_NAME}"', self.script)
-        self.assertIn('(goto) 2>nul & del "%~f0"', self.script)
-
-    def test_it_is_ascii_and_crlf_so_cmd_can_read_it(self):
-        self.script.encode("ascii")
-        self.assertTrue(self.script.startswith("@echo off\r\n"))
-
-    def test_a_path_cmd_cannot_carry_is_refused_rather_than_mangled(self):
-        for bad in (r"C:\odd%path\Rapid PDF", 'C:\\a"b\\Rapid PDF'):
-            with self.subTest(path=bad):
-                with self.assertRaises(swap.SwapNotStarted):
-                    swap.build_script(fake_staged(Path(bad)), pid=1)
-
-    # -- what the script checks before it claims to have worked -------------
-
-    def test_the_staged_numbers_are_written_into_the_script(self):
-        # They were dead fields on StagedUpdate for a while: computed at
-        # staging time and read by nothing. This is what makes them matter.
-        script = swap.build_script(
-            fake_staged(self.install, file_count=252, exe_bytes=4_600_000),
-            pid=1)
-        self.assertIn('set "EXPECT=252"', script)
-        self.assertIn('set "EXESIZE=4600000"', script)
-
-    def test_it_counts_the_files_it_wrote_and_measures_the_exe(self):
-        self.assertIn(
-            'for /f %%N in (\'dir /a-d /s /b "%INSTALL%" ^| '
-            '"%SYS%\\find.exe" /c /v ""\') do set "COUNT=%%N"', self.script)
-        self.assertIn('for %%A in ("%INSTALL%\\%EXE%") do set "NEWSIZE=%%~zA"',
-                      self.script)
-        self.assertIn("if %COUNT% LSS %EXPECT% goto shortcount", self.script)
-        self.assertIn("if not %NEWSIZE% EQU %EXESIZE% goto badexe",
-                      self.script)
-        self.assertIn(":shortcount", self.script)
-        self.assertIn(":badexe", self.script)
-
-    def test_both_new_checks_end_in_a_rollback(self):
-        for label in (":shortcount", ":badexe", ":copyfailed"):
-            with self.subTest(label=label):
-                tail = self.script.split(label, 1)[1]
-                self.assertIn("goto rollback",
-                              tail.split("\r\n\r\n", 1)[0],
-                              f"{label} does not roll back")
-
-    def test_update_finished_comes_after_the_checks_and_nowhere_else(self):
-        # The defect in one assertion: the old script wrote this line whatever
-        # had actually landed on disk.
-        self.assertEqual(self.script.count("update finished"), 1)
-        self.assertLess(self.script.index("if %COUNT% LSS %EXPECT%"),
-                        self.script.index("update finished"))
-        self.assertLess(self.script.index("if not %NEWSIZE% EQU %EXESIZE%"),
-                        self.script.index("update finished"))
-
-    def test_the_payload_survives_until_the_checks_have_passed(self):
-        # rd used to run before the success line was written, so a bad update
-        # destroyed the only copy of the new build on the machine.
-        self.assertEqual(self.script.count('rd /s /q "%STAGING%"'), 1)
-        self.assertLess(self.script.index("if %COUNT% LSS %EXPECT%"),
-                        self.script.index('rd /s /q "%STAGING%"'))
-
-    def test_the_log_records_the_numbers_and_not_just_the_verdict(self):
-        self.assertIn("%COUNT% files in the install, expected at least "
-                      "%EXPECT%", self.script)
-        self.assertIn("%EXE% is %NEWSIZE% bytes, expected %EXESIZE%",
-                      self.script)
-        # /NJH and /NJS suppressed robocopy's own header and summary, so
-        # update.log structurally could not say how many files moved. Read off
-        # the command itself, since the comment above it names both flags.
-        [command] = [line for line in self.script.split("\r\n")
-                     if line.startswith('"%SYS%\\robocopy.exe"')]
-        self.assertNotIn("/NJH", command)
-        self.assertNotIn("/NJS", command)
-        self.assertIn("/NFL /NDL", command)
-
-    def test_there_is_no_check_that_cannot_fire(self):
-        # `start` returns 0 as soon as it hands the exe to Windows, so the
-        # errorlevel test that used to follow it detected nothing.
-        started = self.script.index('start "" /D "%INSTALL%"')
-        after = self.script[started:started + 400]
-        self.assertNotIn("if errorlevel 1 goto rollback", after)
-
-    def test_the_rollback_puts_the_new_exe_back_before_restoring_the_old(self):
-        put_back = self.script.index(
-            'move /Y "%INSTALL%\\%EXE%" "%PAYLOAD%\\%EXE%"')
-        restore = self.script.index(
-            'if exist "%INSTALL%\\%EXE%.bak" move /Y "%INSTALL%\\%EXE%.bak"')
-        self.assertLess(put_back, restore,
-                        "the new exe is overwritten before it is kept")
-
-    def test_a_staged_copy_with_nothing_to_check_against_is_refused(self):
-        # Zeroes would make the count check pass on any install and the size
-        # check fail on every one. Refusing while nothing has been touched is
-        # the better of those two.
-        for kwargs in ({"file_count": 0}, {"exe_bytes": 0}):
-            with self.subTest(**kwargs):
-                with self.assertRaises(swap.SwapNotStarted):
-                    swap.build_script(fake_staged(self.install, **kwargs),
-                                      pid=1)
-
-
-# ---------------------------------------------------------------------------
-# The swap helper, actually running
-# ---------------------------------------------------------------------------
-
-@unittest.skipUnless(WINDOWS, "the swap helper is cmd.exe and Windows only")
-class SwapRun(unittest.TestCase):
-    """Runs the real generated .cmd against a fake install.
-
-    CLEANUP IS PART OF THE TEST, not an afterthought. Every process is started
-    with CREATE_NO_WINDOW and registered with addCleanup before it is started,
-    and the exe the helper relaunches is a copy of rundll32.exe: GUI subsystem,
-    so `start` creates no console for it, and it exits on its own in about a
-    tenth of a second. The sibling project's version of this test used
-    `cmd /K` and left 45 console windows on the desktop overnight.
+    This replaced a class that read a generated batch file the same way. The
+    batch file is gone because every step in it was on a behavioural detection
+    list; what is left is one process, started with documented switches, and
+    the switches are what these tests pin.
     """
 
-    #: Not "rapid-pdf.exe": the cleanup sweep matches on image name, and it
-    #: must not be able to reach a real Rapid PDF somebody has open.
-    EXE = "rapid-pdf-swaptest.exe"
-
-    #: How many files the payload really holds. Not two: the whole point of
-    #: the checks being tested is that a payload of two files must not be able
-    #: to end an update with "update finished" in the log.
-    PAYLOAD_FILES = 60
-
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="rapidpdf-swap-test-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="rapidpdf-cmd-test-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
-        self.addCleanup(self._sweep)
-
+        # A space in the path on purpose: that is every install made before the
+        # 1.8.0 rename, and it is what a batch file could not carry safely.
         self.install = self.tmp / "Rapid PDF"
         self.install.mkdir()
-        stand_in = Path(os.environ["SystemRoot"]) / "System32" / "rundll32.exe"
-        shutil.copy2(stand_in, self.install / self.EXE)
-        (self.install / "_internal").mkdir()
-        (self.install / "_internal" / "old.txt").write_bytes(b"the old build")
+        self.staged = fake_staged(self.install)
+        self.command = installer.build_command(self.staged)
 
-        payload = client.staging_dir_for(self.install) / "payload"
-        (payload / "_internal").mkdir(parents=True)
-        # The same working exe plus a marker byte, so "did the swap happen"
-        # is a byte comparison and not a guess.
-        new_exe = stand_in.read_bytes() + b"\x00NEW"
-        (payload / self.EXE).write_bytes(new_exe)
-        (payload / "_internal" / "new.txt").write_bytes(b"the new build")
-        for n in range(self.PAYLOAD_FILES - 2):
-            (payload / "_internal" / f"qt{n:03d}.dll").write_bytes(b"x" * 20)
-        self.new_exe = new_exe
-        self.old_exe = (self.install / self.EXE).read_bytes()
-        # The truthful numbers for the payload that is actually on disk.
-        self.staged = self._staged()
+    def test_the_installer_itself_is_what_runs(self):
+        self.assertEqual(self.command[0], str(self.staged.installer_path))
 
-    def _staged(self, **kwargs) -> client.StagedUpdate:
-        """The staged copy, honest by default and wrong on request."""
-        kwargs.setdefault("file_count", self.PAYLOAD_FILES)
-        kwargs.setdefault("exe_bytes", len(self.new_exe))
-        return fake_staged(self.install, **kwargs)
+    def test_it_is_silent_but_not_invisible(self):
+        # /SILENT hides the wizard and SHOWS the progress window.
+        # /VERYSILENT would hide that too, which is both worse for the user
+        # and the property that makes a thing look like a dropper.
+        self.assertIn("/SILENT", self.command)
+        self.assertNotIn("/VERYSILENT", self.command)
 
-    def _run(self, staged, *, seconds: str = "1.5", wait_turns: int = 60):
-        """Run the helper against an app that exits on its own. Returns the log."""
-        app = subprocess.Popen(
-            [sys.executable, "-c", f"import time; time.sleep({seconds})"],
-            creationflags=NO_WINDOW)
-        self.addCleanup(app.kill)
-        script = swap.write_script(staged, exe_name=self.EXE, pid=app.pid,
-                                   wait_turns=wait_turns)
-        helper = swap.launch(script, self.install)
-        self.addCleanup(helper.kill)
-        app.wait(timeout=30)
-        self.assertEqual(helper.wait(timeout=90), 0)
-        self.script_file = script
-        return (self.install / swap.LOG_NAME).read_text(errors="replace")
+    def test_the_one_prompt_silent_does_not_suppress_is_suppressed(self):
+        # /SILENT does not stop the "This will install... continue?" box, and
+        # an update that stops on a modal box after the app has closed is an
+        # app that never comes back.
+        self.assertIn("/SP-", self.command)
 
-    def _sweep(self):
-        """Kill anything still carrying the test's image name. Normally a no-op."""
-        subprocess.run(["taskkill", "/F", "/IM", self.EXE],
-                       creationflags=NO_WINDOW, capture_output=True,
-                       check=False)
+    def test_error_boxes_are_left_switched_on(self):
+        # The opposite call, on purpose. Once the app has closed, a message
+        # box is the only way an install that went wrong can say so.
+        self.assertNotIn("/SUPPRESSMSGBOXES", self.command)
 
-    def test_the_helper_waits_swaps_and_restarts(self):
-        log = self._run(self.staged)
+    def test_it_asks_setup_to_close_the_app_rather_than_racing_it(self):
+        # This is what replaced polling tasklist.exe for the app's own PID.
+        self.assertIn("/CLOSEAPPLICATIONS", self.command)
 
-        installed = self.install / self.EXE
-        self.assertEqual(installed.read_bytes(), self.new_exe,
-                         "the new exe is not the one in the install")
-        self.assertTrue((self.install / f"{self.EXE}.bak").is_file(),
-                        "the previous exe was not kept as a .bak")
-        self.assertTrue((self.install / "_internal" / "new.txt").is_file(),
-                        "the supporting files were not moved in")
-        self.assertFalse(self.staged.staging_dir.exists(),
-                         "the staging folder was not cleaned up")
-        self.assertFalse(self.script_file.exists(),
-                         "the helper did not delete itself")
+    def test_the_relaunch_is_ours_and_not_the_restart_manager(self):
+        # Inno can only restart an app that called RegisterApplicationRestart,
+        # and this one does not, so /RESTARTAPPLICATIONS would be a promise
+        # nothing keeps. The [Run] entry gated on the switch below is what
+        # actually starts the app again.
+        self.assertIn("/NORESTARTAPPLICATIONS", self.command)
+        self.assertNotIn("/RESTARTAPPLICATIONS", self.command)
+        self.assertIn("/RAPIDPDFRELAUNCH=1", self.command)
 
-        self.assertIn("update finished", log)
-        # The log has to name what it checked, not just that it was happy.
-        self.assertIn("expected at least 60", log)
-        self.assertIn(f"expected {len(self.new_exe)}", log)
-        # robocopy's own header and summary are the record of how many files
-        # moved. Matched on the product name, which is the one part of that
-        # banner a non-English Windows does not translate.
-        self.assertIn("ROBOCOPY", log)
+    def test_the_relaunch_switch_is_spelled_the_same_in_the_installer_script(self):
+        # A typo here is silent: the update works and the app never comes back.
+        text = (ROOT / "rapid-pdf.iss").read_text(encoding="utf-8")
+        name = installer.RELAUNCH_SWITCH.lstrip("/").split("=")[0]
+        self.assertIn(f"{{param:{name}|0}}", text)
+        self.assertIn("Check: RelaunchAfterUpdate", text)
+        self.assertIn("function RelaunchAfterUpdate", text)
 
-    def test_a_copy_that_lands_short_rolls_back_and_says_so(self):
-        # The reported bug, reproduced: the install ends up with far fewer
-        # files than the update was supposed to bring. Everything the old
-        # script checked still passes here (robocopy exits 1, the exe exists
-        # under the right name), and it used to write "update finished".
-        log = self._run(self._staged(file_count=self.PAYLOAD_FILES * 20))
+    def test_it_names_the_folder_it_is_updating(self):
+        # Belt and braces against Inno's own UsePreviousAppDir, and the thing
+        # that stops an update ever making a SECOND install beside the first.
+        self.assertIn(f"/DIR={self.install}", self.command)
 
-        self.assertNotIn("update finished", log)
-        self.assertIn("FAILED", log)
-        self.assertIn("so the copy did not finish", log)
-        self.assertEqual((self.install / self.EXE).read_bytes(), self.old_exe,
-                         "the previous exe was not put back")
-        self.assertFalse((self.install / f"{self.EXE}.bak").exists(),
-                         "the .bak was left behind instead of being restored")
-        self.assertTrue(self.staged.staging_dir.exists(),
-                        "the staging folder was destroyed after a failure")
-        self.assertTrue((self.staged.payload_dir / self.EXE).is_file(),
-                        "the new exe was thrown away, so there is nothing "
-                        "left to retry the update from")
+    def test_a_path_with_a_space_needs_no_escaping_and_gets_none(self):
+        # The old helper refused paths carrying a quote or a percent sign,
+        # because they had to survive being pasted into a batch file. An argv
+        # list has no shell to survive, so the path goes through whole.
+        [dir_arg] = [a for a in self.command if a.startswith("/DIR=")]
+        self.assertEqual(dir_arg[len("/DIR="):], str(self.install))
+        self.assertIn(" ", dir_arg)
 
-    def test_an_exe_that_is_not_the_downloaded_one_rolls_back(self):
-        # The other half of the old bug: `if not exist` passed on a name, so
-        # a zero byte or truncated exe counted as a successful swap. Here the
-        # count is right and only the size is wrong.
-        log = self._run(self._staged(exe_bytes=len(self.new_exe) + 1))
+    def test_a_path_a_batch_file_could_not_carry_is_now_fine(self):
+        odd = self.tmp / "odd%path"
+        odd.mkdir()
+        staged = fake_staged(odd)
+        command = installer.build_command(staged)
+        self.assertIn(f"/DIR={odd}", command)
 
-        self.assertNotIn("update finished", log)
-        self.assertIn("is not the new build", log)
-        self.assertIn(f"{len(self.new_exe)} bytes", log)
-        self.assertEqual((self.install / self.EXE).read_bytes(), self.old_exe,
-                         "the previous exe was not put back")
-        self.assertTrue((self.staged.payload_dir / self.EXE).is_file())
+    def test_the_log_goes_beside_the_exe_when_it_is_asked_for(self):
+        log = client.log_path(self.install)
+        command = installer.build_command(self.staged, log=log)
+        self.assertIn(f"/LOG={log}", command)
+        self.assertEqual(log.name, "update.log")
 
-    def test_it_refuses_to_swap_while_the_app_is_still_running(self):
-        # The failure that matters most: a wait loop that reads "no output"
-        # as "gone" would replace the exe under a live process. One turn of
-        # the loop, so it gives up almost immediately.
-        app = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(30)"],
-            creationflags=NO_WINDOW)
-        self.addCleanup(app.kill)
+    def test_the_log_switch_is_left_off_when_there_is_no_log_to_write_to(self):
+        # /LOG="filename" ABORTS the install when Setup cannot create the file,
+        # so a logging convenience must never be able to fail an update. No
+        # log means no switch, and Inno writes into TEMP under a name of its
+        # own, which is worse to find and much better than not updating.
+        self.assertFalse([a for a in self.command if a.startswith("/LOG=")])
 
-        script = swap.write_script(self.staged, exe_name=self.EXE,
-                                   pid=app.pid, wait_turns=1)
-        helper = swap.launch(script, self.install)
-        self.addCleanup(helper.kill)
-        self.assertEqual(helper.wait(timeout=60), 0)
+    def test_a_download_that_is_no_longer_there_is_refused(self):
+        staged = fake_staged(self.install)
+        staged.installer_path.unlink()
+        with self.assertRaises(installer.InstallerNotStarted) as caught:
+            installer.build_command(staged)
+        self.assertIn("Nothing has been changed", str(caught.exception))
 
-        app.kill()
-        self.assertNotEqual((self.install / self.EXE).read_bytes(), self.new_exe,
-                            "the exe was replaced while the app was running")
-        self.assertTrue((self.staged.payload_dir / self.EXE).is_file(),
-                        "the staged update should still be there to retry")
-        log = (self.install / swap.LOG_NAME).read_text(errors="replace")
-        self.assertIn("GAVE UP", log)
+    def test_prepare_log_creates_the_file_and_names_it(self):
+        path = installer.prepare_log(self.install)
+        self.assertEqual(path, client.log_path(self.install))
+        self.assertTrue(path.is_file())
+
+    def test_prepare_log_gives_up_rather_than_raising(self):
+        # A folder where the file should be: the open() cannot work, and the
+        # answer is None (log to TEMP) rather than an exception that would
+        # stop an update that is otherwise fine.
+        blocked = self.tmp / "blocked"
+        blocked.mkdir()
+        client.log_path(blocked).mkdir()
+        self.assertIsNone(installer.prepare_log(blocked))
+
+    def test_nothing_in_the_command_is_a_shell(self):
+        # The whole point. No cmd.exe, no powershell, no script written to
+        # disk, no ping used as a timer, no robocopy, no tasklist. If any of
+        # these comes back, so does the detection that caused this rewrite.
+        joined = " ".join(self.command).lower()
+        for banned in ("cmd.exe", "powershell", "ping.exe", "robocopy",
+                       "tasklist", ".cmd", ".bat", ".ps1"):
+            with self.subTest(banned=banned):
+                self.assertNotIn(banned, joined)
+
+
+class NoSwapMachineryLeftAnywhere(unittest.TestCase):
+    """The behaviours that got convicted, checked for across the whole app.
+
+    Not a style rule. Sophos fired Evade_13a on this repo on 9 September 2026
+    for a chain of exactly these calls, and each one on its own is enough to
+    put an unsigned binary back on a behavioural engine's list. A test is the
+    only thing that stops one drifting back in, because every one of them
+    looks reasonable in isolation at the moment somebody types it.
+    """
+
+    #: Where the updater lives, plus the UI that drives it. The sweep is
+    #: deliberately narrow: `subprocess` is used elsewhere in this app for
+    #: things that have nothing to do with an update.
+    FILES = ("core/update/client.py", "core/update/installer.py",
+             "core/update/release.py", "core/update/feed.py",
+             "core/update/__init__.py", "ui/update_notice.py")
+
+    def _code(self, name: str) -> str:
+        """The file with its comments and its prose taken out.
+
+        Read off the source rather than grepped raw, because these modules
+        spend most of their length EXPLAINING why they no longer do any of
+        this, and a raw grep would match the explanation. Comments go, and so
+        does every triple-quoted string, which in this package is always a
+        docstring and never a value.
+        """
+        import tokenize
+        text = (ROOT / name).read_text(encoding="utf-8")
+        kept = []
+        for token in tokenize.generate_tokens(io.StringIO(text).readline):
+            if token.type == tokenize.COMMENT:
+                continue
+            if token.type == tokenize.STRING:
+                body = token.string.lstrip("rbfuRBFU")
+                if body.startswith('"""') or body.startswith("'''"):
+                    continue
+            kept.append(token.string)
+        return " ".join(kept).lower()
+
+    def test_no_updater_code_writes_or_runs_a_script(self):
+        for name in self.FILES:
+            code = self._code(name)
+            for banned in ("cmd.exe", "comspec", "powershell", "robocopy",
+                           "tasklist", "ping.exe", ".cmd", ".bat", ".ps1"):
+                with self.subTest(file=name, banned=banned):
+                    self.assertNotIn(banned, code)
+
+    def test_no_updater_code_hides_a_window(self):
+        # CREATE_NO_WINDOW on the process that rewrites a program directory is
+        # concealment, and it is what the old helper used. Setup shows its own
+        # progress window and there is nothing to hide.
+        for name in self.FILES:
+            with self.subTest(file=name):
+                self.assertNotIn("create_no_window", self._code(name))
+
+    def test_the_swap_module_is_gone_and_stays_gone(self):
+        self.assertFalse((ROOT / "core" / "update" / "swap.py").exists())
+
+
+# ---------------------------------------------------------------------------
+# Actually starting a process
+# ---------------------------------------------------------------------------
+
+STUB_SOURCE = r"""
+/* The stand-in installer for tests/test_update.py.
+ *
+ * GUI subsystem, so CreateProcess never makes a console window for it. It
+ * writes the command line it was given to the file named by
+ * RAPIDPDF_STUB_LOG, which is how the test reads back what launch() actually
+ * passed rather than only what build_command() said it would, then waits a
+ * third of a second and returns. The wait is there so a test can see that
+ * launch() came back while the process was still alive, which is the whole
+ * contract: the app has to be free to close.
+ *
+ * IT IS COMPILED, NOT COPIED. The fixture this replaced copied
+ * System32\rundll32.exe under another name, which is MITRE ATT&CK T1036.003
+ * and which Sophos detected on this machine.
+ */
+#include <windows.h>
+
+int WINAPI wWinMain(HINSTANCE self, HINSTANCE prev, PWSTR args, int show)
+{
+    wchar_t path[1024];
+    DWORD n = GetEnvironmentVariableW(L"RAPIDPDF_STUB_LOG", path, 1024);
+    if (n > 0 && n < 1024) {
+        HANDLE out = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                                 FILE_ATTRIBUTE_NORMAL, NULL);
+        if (out != INVALID_HANDLE_VALUE) {
+            LPWSTR whole = GetCommandLineW();
+            DWORD wrote = 0;
+            WriteFile(out, whole,
+                      (DWORD)(lstrlenW(whole) * sizeof(wchar_t)), &wrote, NULL);
+            CloseHandle(out);
+        }
+    }
+    Sleep(300);
+    return 0;
+}
+"""
+
+VCVARS = (r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
+          r"\VC\Auxiliary\Build\vcvars64.bat")
+
+
+def find_vcvars() -> Path | None:
+    """The MSVC environment script, or None when there is no compiler here.
+
+    Tried in the order they are likely to exist: the Build Tools install this
+    was written against, then whatever vswhere reports, which covers a full
+    Visual Studio. None is not a failure, it is a machine with no compiler,
+    and the one test that needs one skips.
+    """
+    if not WINDOWS:
+        return None
+    direct = Path(VCVARS)
+    if direct.is_file():
+        return direct
+    vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+                   ) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    if not vswhere.is_file():
+        return None
+    try:
+        found = subprocess.run(
+            [str(vswhere), "-latest", "-products", "*", "-requires",
+             "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+             "-property", "installationPath"],
+            capture_output=True, text=True, timeout=30,
+            creationflags=NO_WINDOW, check=False).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not found:
+        return None
+    script = Path(found) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+    return script if script.is_file() else None
+
+
+def build_stub(where: Path) -> Path | None:
+    """Compile the stand-in installer, or None when there is no compiler.
+
+    The vcvars call is a normal MSVC bootstrap and the only reason cmd.exe
+    appears anywhere in this file: it is how the toolchain is entered on
+    Windows, it is running a compiler, and it is nothing to do with what the
+    app does at run time.
+    """
+    vcvars = find_vcvars()
+    if vcvars is None:
+        return None
+    source = where / "stub.c"
+    source.write_text(STUB_SOURCE, encoding="ascii")
+    # Not "rapid-pdf.exe" and not the real setup name either: nothing in this
+    # file should be able to name a process somebody actually has running.
+    target = where / "rapid-pdf-setup-stub.exe"
+    line = (f'call "{vcvars}" >nul && cl /nologo /O1 /MT '
+            f'/Fo"{where}\\stub.obj" /Fe"{target}" "{source}" '
+            f'/link /SUBSYSTEM:WINDOWS /ENTRY:wWinMainCRTStartup '
+            f'kernel32.lib >nul')
+    try:
+        # shell=True on purpose: cmd.exe's own /c quoting rules and
+        # subprocess's argv quoting disagree about a command holding both
+        # quoted paths and &&, and this is the form that survives both.
+        done = subprocess.run(line, shell=True, cwd=str(where),
+                              capture_output=True, text=True, timeout=300,
+                              check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return target if target.is_file() and done.returncode == 0 else None
+
+
+@unittest.skipUnless(WINDOWS, "starting the installer is Windows only")
+class LaunchingTheInstaller(unittest.TestCase):
+    """launch() really starts a process, against a stub compiled here.
+
+    SKIPS CLEANLY WITH NO COMPILER. Everything else in this file is pure and
+    runs everywhere; this one class needs a real exe to start, and a machine
+    with no MSVC gets a skip with the reason on it rather than a failure.
+    """
+
+    stub: Path | None = None
+    stub_home: Path | None = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.stub_home = Path(tempfile.mkdtemp(prefix="rapidpdf-stub-"))
+        cls.stub = build_stub(cls.stub_home)
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.stub_home is not None:
+            shutil.rmtree(cls.stub_home, ignore_errors=True)
+
+    def setUp(self):
+        if self.stub is None:
+            self.skipTest(
+                "no MSVC toolchain on this machine, so there is no stand-in "
+                "installer to start. Install VS Build Tools with the C++ "
+                "workload, or read the command line tests above, which cover "
+                "everything except the Popen itself.")
+        self.tmp = Path(tempfile.mkdtemp(prefix="rapidpdf-launch-test-"))
+        # Registered FIRST so it runs LAST: addCleanup is last in, first out,
+        # and nothing may still be holding this folder when it goes.
+        self.addCleanup(remove_tree, self.tmp)
+        self.started = []
+        self.addCleanup(self._stop_everything)
+        self.install = self.tmp / "Rapid PDF"
+        self.install.mkdir()
+        staging = client.staging_dir_for(self.install)
+        staging.mkdir(parents=True)
+        stand_in = staging / self.stub.name
+        shutil.copy2(self.stub, stand_in)
+        self.staged = fake_staged(self.install, installer_path=stand_in)
+        self.record = self.tmp / "command-line.txt"
+        os.environ["RAPIDPDF_STUB_LOG"] = str(self.record)
+        self.addCleanup(os.environ.pop, "RAPIDPDF_STUB_LOG", None)
+
+    def _stop_everything(self):
+        """Nothing the test started may outlive it, or outlive the folder.
+
+        launch() gives the installer the install's PARENT as its working
+        directory, which in this test IS the temp folder, so a process still
+        winding down keeps a handle on the thing that is about to be deleted.
+        Every process is waited for here, before the folder goes.
+        """
+        for process in self.started:
+            try:
+                process.kill()
+                process.wait(timeout=30)
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+    def _launch(self, how=None):
+        """Start the stand-in installer and remember it, so cleanup can wait."""
+        started = (how or installer.launch)(self.staged)
+        self.started.append(started)
+        return started
+
+    def _command_line(self) -> str:
+        return self.record.read_bytes().decode("utf-16-le", errors="replace")
+
+    def test_it_starts_the_installer_with_the_switches_it_said_it_would(self):
+        started = self._launch(installer.apply)
+        self.assertEqual(started.wait(timeout=60), 0)
+
+        line = self._command_line()
+        for switch in ("/SILENT", "/SP-", "/CLOSEAPPLICATIONS",
+                       "/NORESTARTAPPLICATIONS", "/RAPIDPDFRELAUNCH=1"):
+            with self.subTest(switch=switch):
+                self.assertIn(switch, line)
+        # The install path has a space in it, and it arrived in one piece.
+        self.assertIn(f"/DIR={self.install}", line)
+        self.assertIn(f"/LOG={client.log_path(self.install)}", line)
+
+    def test_it_does_not_wait_for_the_installer(self):
+        # The app has to be free to close the moment this returns: Setup is
+        # waiting for it to go. The stub holds itself open for a third of a
+        # second, so a launch() that waited would be caught here.
+        started = self._launch()
+        self.assertIsNone(started.poll(),
+                          "launch() waited for the installer to finish")
+        started.wait(timeout=60)
+
+    def test_the_log_is_created_beside_the_exe_before_setup_runs(self):
+        # Written by us and not by Inno, because /LOG= aborts the install when
+        # Setup cannot create the file.
+        self._launch().wait(timeout=60)
+        self.assertTrue(client.log_path(self.install).is_file())
+
+    def test_a_missing_installer_is_refused_before_anything_starts(self):
+        self.staged.installer_path.unlink()
+        with self.assertRaises(installer.InstallerNotStarted):
+            installer.launch(self.staged)
 
 
 if __name__ == "__main__":

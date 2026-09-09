@@ -113,13 +113,19 @@ coll = COLLECT(
 # layout change can never move.
 #
 # WHY THE INSTALLER'S [Files] LINE IS NOT ENOUGH. Inno copies this file to
-# {app} at INSTALL time, but an in-app update never runs Inno: it downloads
-# the portable zip, which is exactly this onedir folder, and robocopies it
-# over the install (core/update/swap.py). So anything that reaches users only
-# through the installer never reaches anyone who updates from inside the app.
-# That is the real 1.7.0 defect: the DefaultIcon fix shipped, and the file it
-# points at did not. Putting the icon in the onedir folder puts it in the zip,
-# which puts it on both paths.
+# {app} at INSTALL time, and there is a whole class of user who never runs
+# Inno: a portable copy is this onedir folder, unzipped by hand, and it is
+# updated by unzipping the next one over it. So anything that reaches users
+# only through the installer never reaches any of them. That is the real 1.7.0
+# defect: the DefaultIcon fix shipped, and the file it points at did not.
+# Putting the icon in the onedir folder puts it in the zip, which puts it on
+# both paths.
+#
+# It was worse before 1.10.0, when the in-app updater laid the zip over an
+# INSTALLED copy too, so the installer's [Files] line reached nobody who
+# updated from inside the app. That updater is gone (core/update/installer.py)
+# and an installed copy now runs setup like everybody else, but the rule below
+# is unchanged: the portable zip still has to be complete on its own.
 # ---------------------------------------------------------------------------
 import shutil
 from pathlib import Path
