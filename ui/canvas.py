@@ -1,14 +1,17 @@
+from typing import NamedTuple
+
 import fitz
 from PySide6.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsLineItem,
     QGraphicsPixmapItem, QGraphicsTextItem, QGraphicsItem,
-    QInputDialog, QStyle, QApplication,
+    QInputDialog, QStyle, QApplication, QToolTip,
 )
 from PySide6.QtCore import (
     Qt, QRectF, QRect, QPointF, QLineF, Signal, QBuffer, QIODevice, QTimer,
+    QElapsedTimer,
 )
 from PySide6.QtGui import (
-    QPen, QBrush, QColor, QPainter, QFont, QPixmap,
+    QPen, QBrush, QColor, QCursor, QPainter, QFont, QPixmap,
     QUndoStack, QUndoCommand,
 )
 
@@ -31,6 +34,46 @@ MAX_FONT_SIZE = 144
 # and the weaker one was a yellow that appeared in no palette at all.
 _HIT_CURRENT_ALPHA = 120
 _HIT_ALPHA = 60
+
+# Selected page text is the same accent wash, pitched between the two search
+# strengths: stronger than the "there are other hits" hint, weaker than the hit
+# you are standing on, because a text selection is a thing you made rather than
+# a thing the app found for you.
+_TEXT_SELECTION_ALPHA = 90
+# How far outside a word's box a click still counts as landing on it. Word boxes
+# are tight around the glyphs, and without a little slack the gap between two
+# characters of a tag number reads as empty page.
+TEXT_HIT_SLOP = 2.0
+# Words are bucketed into horizontal bands for hit-testing, because the hover
+# cursor asks "is there a word here?" on every mouse move and a P&ID carries
+# thousands. Band height is the mean word height, floored here so a page of
+# hairline text cannot produce a bucket per pixel.
+_TEXT_BAND_MIN = 8.0
+# A press this soon after a double-click, and this close to it in VIEWPORT
+# pixels, is the third click of a triple. Qt has no triple-click event, so the
+# count is kept by hand. Viewport pixels, not scene units, so the tolerance does
+# not shrink as you zoom in.
+TRIPLE_CLICK_SLOP_PX = 4
+# Said when somebody asks for a word on a page that has no text layer. Most of
+# what lands in this app is scanned drawings, so "nothing happened" is the wrong
+# answer: the app has OCR on the File menu and this is where you learn that.
+NO_TEXT_LAYER_HINT = ("No selectable text on this page.\n"
+                      "It looks like a scan: try File > OCR This Page.")
+
+
+class PageWord(NamedTuple):
+    """One word of the current page, already mapped into scene coordinates.
+
+    `rect` is in scene units (rendered pixels), NOT the PDF points PyMuPDF hands
+    back; see PDFCanvas._text_matrix for the transform and why it is not just a
+    multiply. block/line/index are PyMuPDF's own reading-order numbering, kept
+    so a selection can be split back into lines when it is copied.
+    """
+    rect: QRectF
+    text: str
+    block: int
+    line: int
+    index: int
 
 # Rapid page switches coalesce within this window, so only the page you land on
 # pays for a full fitz render (fast-scroll, render-on-land).
@@ -764,6 +807,7 @@ class PDFCanvas(QGraphicsView):
     page_changed = Signal(int)   # canvas-initiated page turn (continuous scroll)
     fit_mode_broken = Signal()   # emitted when the user zooms manually while fit is active
     page_loaded = Signal(int)    # a page render just completed (search bar re-applies hits)
+    text_selection_changed = Signal(int)   # characters of page text now selected (0 = none)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -849,6 +893,23 @@ class PDFCanvas(QGraphicsView):
 
         # Transient text-search highlight overlays (current page only)
         self._search_items: list = []
+
+        # Page-text selection. The page's own words (not annotation text), cached
+        # per (page, raster scale) because hit-testing runs on every mouse move
+        # and re-extracting a P&ID's text each time would be felt.
+        self._words: list[PageWord] = []
+        self._words_key = None            # (page_num, zoom) the cache belongs to
+        self._word_band = 0.0             # band height for the y-bucket index
+        self._word_bands: dict[int, list[int]] = {}
+        self._text_range: tuple[int, int] | None = None   # inclusive word indices
+        self._text_anchor: int | None = None              # where the drag started
+        self._text_selecting = False
+        self._text_sel_items: list = []
+        self._text_sel_fill = QColor(LIGHT.accent)
+        self._text_sel_fill.setAlpha(_TEXT_SELECTION_ALPHA)
+        # Triple-click bookkeeping: when the last double-click landed, and where.
+        self._last_dbl = QElapsedTimer()
+        self._last_dbl_vp = None
 
         # Copy-confirmation flash: a brief pulsing outline over the copied items
         self._flash_items: list = []
@@ -996,6 +1057,9 @@ class PDFCanvas(QGraphicsView):
         self._hit_current_fill.setAlpha(_HIT_CURRENT_ALPHA)
         self._hit_fill = QColor(palette.accent)
         self._hit_fill.setAlpha(_HIT_ALPHA)
+        self._text_sel_fill = QColor(palette.accent)
+        self._text_sel_fill.setAlpha(_TEXT_SELECTION_ALPHA)
+        self._paint_text_selection()   # re-tint a selection that is already up
         self.viewport().update()
 
     def _push(self, command):
@@ -1033,9 +1097,19 @@ class PDFCanvas(QGraphicsView):
         if self._bg_item is not None and self._doc and page_num == self._current_page:
             self._bg_item.setPixmap(self._doc.render_page_cached(page_num, self._zoom))
             self._bg_item.update()   # invalidate the item cache so the change shows
+            # The page's text may have moved with its content (a lift, an OCR
+            # pass). The word cache is keyed on page+scale, neither of which
+            # changed, so it has to be dropped by hand.
+            self.clear_text_selection()
+            self._forget_page_words()
 
     def _cancel_interaction(self):
-        """Drop any in-progress marquee/drag so a page or tool switch starts clean."""
+        """Drop any in-progress marquee/drag so a page or tool switch starts clean.
+
+        The page-text selection goes with it, which is what makes the selection
+        clear on a page change and on a tool change: both go through here.
+        """
+        self.clear_text_selection()
         if self._rubber_item is not None and self._rubber_item.scene() is not None:
             self._scene.removeItem(self._rubber_item)
         self._rubber_item = None
@@ -1063,8 +1137,10 @@ class PDFCanvas(QGraphicsView):
         self._embedded_images_page = -1
         self._pending_page = None
         self._current_page = 0
-        self._scene.clear()          # deletes any search overlays C++-side too
+        self._scene.clear()          # deletes any search/selection overlays C++-side too
         self._search_items = []
+        self._text_sel_items = []
+        self._forget_page_words()
         self._bg_item = None
         self.clear_own_history()
         self._cancel_interaction()
@@ -1135,6 +1211,315 @@ class PDFCanvas(QGraphicsView):
             except RuntimeError:
                 pass   # C++ side already deleted (e.g. scene.clear on close)
         self._search_items = []
+
+    # ------------------------------------------------------------------
+    # Page-text selection
+    #
+    # NOT A TOOL. Selecting text is what the SELECT pointer does when the press
+    # lands on a word and not on an annotation, a resize handle or empty page.
+    # A tool of its own was the other option and it is the wrong one here: the
+    # thing this exists for is lifting a tag number out of a P&ID while you are
+    # marking the same drawing up, and a mode you have to switch into and back
+    # out of taxes exactly that. It is also what every PDF reader does, so the
+    # gesture is already in the user's hands. The cost is that a marquee can no
+    # longer be STARTED on top of a word; it can still be started anywhere else
+    # on the page, which on a drawing is nearly all of it.
+    #
+    # Precedence on a select-tool press, and the order matters:
+    #   resize handle > annotation > word > embedded image > empty (marquee).
+    #
+    # Selection is by whole words. A commissioning engineer wants "4100-PU-001",
+    # not four characters of it, and word granularity means the copied string
+    # comes straight out of PyMuPDF's own tokens instead of being re-extracted
+    # from a bounding box that would sweep in whatever else shares the line.
+    # ------------------------------------------------------------------
+
+    def _text_matrix(self) -> "fitz.Matrix":
+        """PDF user space -> scene (rendered pixel) coordinates for this page.
+
+        Two steps, and the first one is the one that is easy to miss.
+        `get_text("words")` and `search_for` both answer in the page's UNROTATED
+        user space, while the pixmap the canvas draws is rendered with the
+        rotation applied. `page.rotation_matrix` is the mapping between them for
+        every page, rot=0 included (where it is the identity). Only then does
+        the raster scale apply. Same transform `_embedded_image_at` uses, and
+        for the same reason; it was verified there against ground truth.
+        """
+        page = self._doc.doc[self._current_page]
+        return page.rotation_matrix * fitz.Matrix(self._zoom, self._zoom)
+
+    def _build_page_words(self, page_num: int) -> list:
+        if (not self._doc or not self._doc.doc or self._zoom <= 0
+                or page_num >= self._doc.page_count()):
+            return []
+        try:
+            page = self._doc.doc[page_num]
+            m = page.rotation_matrix * fitz.Matrix(self._zoom, self._zoom)
+            out = []
+            for x0, y0, x1, y1, text, block, line, index in page.get_text("words"):
+                r = fitz.Rect(x0, y0, x1, y1) * m
+                rect = QRectF(QPointF(r.x0, r.y0), QPointF(r.x1, r.y1)).normalized()
+                out.append(PageWord(rect, text, block, line, index))
+        except Exception as e:
+            # A page whose text cannot be read is a page with no selectable
+            # text, which is a state this already handles. It is not a reason
+            # to break a click.
+            print(f"Text extraction error (page {page_num}): {e}")
+            return []
+        # Reading order. get_text already returns this order, but the range
+        # arithmetic below depends on it, so it is asserted rather than assumed.
+        out.sort(key=lambda w: (w.block, w.line, w.index))
+        return out
+
+    def _forget_page_words(self):
+        """Drop the cached word list so the next hit-test re-extracts."""
+        self._words = []
+        self._words_key = None
+        self._word_band = 0.0
+        self._word_bands = {}
+
+    def page_words(self) -> list:
+        """Every word on the current page, in scene coordinates and reading order.
+
+        Empty list on a page with no text layer, which is what a scan is, and
+        which every caller here treats as "there is nothing to select" rather
+        than as an error.
+        """
+        key = (self._current_page, self._zoom)
+        if self._words_key != key:
+            self._words = self._build_page_words(self._current_page)
+            self._words_key = key
+            self._word_band, self._word_bands = self._index_words(self._words)
+        return self._words
+
+    def page_has_selectable_text(self) -> bool:
+        """True if the current page carries text a selection could pick up."""
+        return bool(self.page_words())
+
+    @staticmethod
+    def _index_words(words: list) -> tuple[float, dict]:
+        """Bucket word indices by horizontal band, for O(few) hover hit-tests."""
+        if not words:
+            return 0.0, {}
+        band = max(_TEXT_BAND_MIN,
+                   sum(w.rect.height() for w in words) / len(words))
+        bands: dict[int, list[int]] = {}
+        for i, w in enumerate(words):
+            first = int(w.rect.top() // band)
+            last = int(w.rect.bottom() // band)
+            for b in range(first, last + 1):
+                bands.setdefault(b, []).append(i)
+        return band, bands
+
+    def _word_index_at(self, scene_pos: QPointF, nearest: bool = False):
+        """Index of the word under scene_pos, or None.
+
+        `nearest` is for a drag in progress: once a selection has started, the
+        cursor wandering into the gutter should extend along the line it is
+        level with rather than dropping the selection. A PRESS never uses it,
+        which is what leaves empty page free for the marquee.
+        """
+        words = self.page_words()
+        if not words:
+            return None
+        if self._word_band > 0:
+            lo = int((scene_pos.y() - TEXT_HIT_SLOP) // self._word_band)
+            hi = int((scene_pos.y() + TEXT_HIT_SLOP) // self._word_band)
+            for b in range(lo, hi + 1):
+                for i in self._word_bands.get(b, ()):
+                    if words[i].rect.adjusted(
+                            -TEXT_HIT_SLOP, -TEXT_HIT_SLOP,
+                            TEXT_HIT_SLOP, TEXT_HIT_SLOP).contains(scene_pos):
+                        return i
+        if not nearest:
+            return None
+        # Vertical distance dominates so that dragging off the right-hand end of
+        # a line runs on along THAT line instead of jumping to whatever column
+        # happens to be closest in a straight line.
+        best, best_key = None, None
+        for i, w in enumerate(words):
+            r = w.rect
+            dy = 0.0 if r.top() <= scene_pos.y() <= r.bottom() else \
+                min(abs(scene_pos.y() - r.top()), abs(scene_pos.y() - r.bottom()))
+            dx = 0.0 if r.left() <= scene_pos.x() <= r.right() else \
+                min(abs(scene_pos.x() - r.left()), abs(scene_pos.x() - r.right()))
+            key = (dy, dx)
+            if best_key is None or key < best_key:
+                best, best_key = i, key
+        return best
+
+    def _clear_text_overlays(self):
+        # A copy-confirmation flash may still be pulsing over these. Take them
+        # out of it first: drawForeground reads sceneBoundingRect off whatever
+        # is in that list, and a page change is free to delete them C++-side.
+        if self._flash_items:
+            self._flash_items = [i for i in self._flash_items
+                                 if i not in self._text_sel_items]
+        for item in self._text_sel_items:
+            try:
+                if item.scene() is not None:
+                    self._scene.removeItem(item)
+            except RuntimeError:
+                pass   # C++ side already deleted (e.g. scene.clear on close)
+        self._text_sel_items = []
+
+    def _paint_text_selection(self):
+        """Redraw the wash over the selected words.
+
+        Plain QGraphicsRectItems that take no mouse buttons, exactly like the
+        search hits: the canvas only ever picks and serialises AnnotationBase,
+        so a selection cannot be dragged, saved or copied as an object.
+        """
+        self._clear_text_overlays()
+        if self._text_range is None:
+            return
+        lo, hi = self._text_range
+        for w in self.page_words()[lo:hi + 1]:
+            item = self._scene.addRect(w.rect.adjusted(-1, -1, 1, 1))
+            item.setBrush(self._text_sel_fill)
+            item.setPen(QPen(Qt.PenStyle.NoPen))
+            item.setZValue(30)
+            item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self._text_sel_items.append(item)
+
+    def _set_text_range(self, start, end):
+        if start is None or end is None:
+            self.clear_text_selection()
+            return
+        self._text_range = (start, end) if start <= end else (end, start)
+        self._paint_text_selection()
+        self.text_selection_changed.emit(len(self.selected_text()))
+
+    def clear_text_selection(self):
+        """Drop the page-text selection, if there is one."""
+        had = self._text_range is not None
+        self._text_range = None
+        self._text_anchor = None
+        self._text_selecting = False
+        self._clear_text_overlays()
+        if had:
+            self.text_selection_changed.emit(0)
+
+    def has_text_selection(self) -> bool:
+        return self._text_range is not None
+
+    def selected_text(self) -> str:
+        """The selected words as plain text, one line per line of the page.
+
+        Built from the words themselves rather than by re-extracting a clip
+        rect, because a clip over a multi-line range is a BOX, and a box across
+        a P&ID's title block picks up three neighbouring columns as well.
+        """
+        if self._text_range is None:
+            return ""
+        lo, hi = self._text_range
+        lines, current, key = [], [], None
+        for w in self.page_words()[lo:hi + 1]:
+            k = (w.block, w.line)
+            if key is not None and k != key:
+                lines.append(" ".join(current))
+                current = []
+            key = k
+            current.append(w.text)
+        if current:
+            lines.append(" ".join(current))
+        return "\n".join(lines)
+
+    def select_word_at(self, scene_pos: QPointF) -> bool:
+        """Select the single word under scene_pos. False if there isn't one."""
+        i = self._word_index_at(scene_pos)
+        if i is None:
+            self.clear_text_selection()
+            return False
+        self._text_anchor = i
+        self._set_text_range(i, i)
+        return True
+
+    def select_line_at(self, scene_pos: QPointF) -> bool:
+        """Select the whole line the word under scene_pos belongs to."""
+        i = self._word_index_at(scene_pos)
+        if i is None:
+            self.clear_text_selection()
+            return False
+        words = self.page_words()
+        key = (words[i].block, words[i].line)
+        lo = hi = i
+        while lo > 0 and (words[lo - 1].block, words[lo - 1].line) == key:
+            lo -= 1
+        while hi + 1 < len(words) and (words[hi + 1].block, words[hi + 1].line) == key:
+            hi += 1
+        self._text_anchor = lo
+        self._set_text_range(lo, hi)
+        return True
+
+    def select_all_text(self) -> bool:
+        """Select every word on the current page. False on a page with none."""
+        words = self.page_words()
+        if not words:
+            self.clear_text_selection()
+            return False
+        self._text_anchor = 0
+        self._set_text_range(0, len(words) - 1)
+        return True
+
+    def copy_text_selection(self) -> str:
+        """Put the selected page text on the SYSTEM clipboard and flash it.
+
+        Returns the copied string, empty if there was nothing selected. The
+        flash is the app's existing copy confirmation (see _flash): an outline
+        that pulses and fades, no popup to dismiss.
+        """
+        text = self.selected_text()
+        if not text:
+            return ""
+        QApplication.clipboard().setText(text)
+        self._flash(list(self._text_sel_items))
+        return text
+
+    def _begin_text_selection(self, scene_pos: QPointF, extend: bool) -> bool:
+        """Start, or Shift-extend, a text selection at scene_pos.
+
+        False when the press is not on a word, and that return is load-bearing:
+        it is what lets the press fall through to the embedded-image lift and
+        the marquee, so a page with no text layer behaves exactly as it did
+        before any of this existed.
+        """
+        if extend and self._text_range is not None and self._text_anchor is not None:
+            i = self._word_index_at(scene_pos, nearest=True)
+            if i is None:
+                return False
+        else:
+            i = self._word_index_at(scene_pos)
+            if i is None:
+                return False
+            self._text_anchor = i
+        self._text_selecting = True
+        self._drag_items = []
+        self._drag_start = None
+        self._press_empty_pos = None
+        self._lift_candidate = None
+        self._set_text_range(self._text_anchor, i)
+        return True
+
+    def _text_double_click(self, event, scene_pos: QPointF):
+        """Double-click on the page: select the word, or explain why there isn't one."""
+        if not self.page_words():
+            self.clear_text_selection()
+            if self._doc and self._doc.doc:
+                QToolTip.showText(QCursor.pos(), NO_TEXT_LAYER_HINT, self)
+            return
+        self._last_dbl.restart()
+        self._last_dbl_vp = event.pos()
+        self.select_word_at(scene_pos)
+
+    def _is_triple_click(self, event) -> bool:
+        """True if this press is the third click of a triple on the same spot."""
+        if not self._last_dbl.isValid() or self._last_dbl_vp is None:
+            return False
+        if self._last_dbl.elapsed() > QApplication.doubleClickInterval():
+            return False
+        delta = event.pos() - self._last_dbl_vp
+        return (abs(delta.x()) + abs(delta.y())) <= TRIPLE_CLICK_SLOP_PX
 
     def set_tool(self, tool: str):
         self._cancel_interaction()
@@ -1376,8 +1761,20 @@ class PDFCanvas(QGraphicsView):
         self.annotation_changed.emit()
 
     def copy_selected(self):
-        """Snapshot the current selection into the in-app annotation clipboard."""
+        """Copy: annotations to the in-app clipboard, else page text to the system one.
+
+        Annotations win when both are selected, because this clipboard is what
+        Ctrl+V pastes from and changing that would be a regression. With nothing
+        selected on the page, a text selection goes to the SYSTEM clipboard,
+        which is the point of the whole feature: getting a tag number out of a
+        drawing and into PIMS.
+
+        Returns the number of ANNOTATIONS taken, so a text copy answers 0 and
+        the caller's "copied N object(s)" status stays true.
+        """
         selected = [i for i in self._scene.selectedItems() if isinstance(i, AnnotationBase)]
+        if not selected and self.copy_text_selection():
+            return 0
         self._clipboard_items = [i.clone() for i in selected]
         if selected:
             self._flash(selected)
@@ -2043,8 +2440,12 @@ class PDFCanvas(QGraphicsView):
 
     def _load_page(self, page_num: int):
         # Search overlays belong to the page they were computed for; drop them
-        # on any (re)load; the search bar re-applies for the new page.
+        # on any (re)load; the search bar re-applies for the new page. A text
+        # selection is the same kind of thing, except nothing re-applies it: the
+        # words it names are this page's, so it goes and does not come back.
         self.clear_search_hits()
+        self.clear_text_selection()
+        self._forget_page_words()
         # Cached render: page switches that land back on a page+zoom already shown
         # (back/forth navigation, reload-after-strip, organizer round-trips) reuse
         # the rasterised pixmap instead of re-rendering an A1 page (~120ms each).
@@ -2388,6 +2789,13 @@ class PDFCanvas(QGraphicsView):
             self._drag_moved = False
             self._drag_total = QPointF(0, 0)
             if self._tool == "select":
+                # Third click of a triple, on a word: take the line. Qt sends no
+                # triple-click event, so this is the count kept by hand.
+                if self._is_triple_click(event) and self.select_line_at(scene_pos):
+                    self._last_dbl.invalidate()
+                    event.accept()
+                    return
+
                 res_item, res_handle = self._handle_at(scene_pos)
                 if res_item and res_handle:
                     self._resize_item = res_item
@@ -2407,6 +2815,7 @@ class PDFCanvas(QGraphicsView):
                 duplicate = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
                 item = self._annotation_at(scene_pos)
                 if item:
+                    self.clear_text_selection()
                     if duplicate:
                         # Clone the whole selection (or just this item if it isn't selected).
                         base = [i for i in self._scene.selectedItems()
@@ -2433,7 +2842,16 @@ class PDFCanvas(QGraphicsView):
                     self._drag_anchor = scene_pos
                     self._drag_applied = QPointF(0, 0)
                 else:
-                    # No annotation here. Empty space begins a marquee on first move.
+                    # No annotation here, so a press ON A WORD selects text. Ctrl
+                    # is excluded: it means duplicate, and a text selection has
+                    # nothing to duplicate. See the section comment above
+                    # _text_matrix for why this is the pointer's job and not a
+                    # tool of its own.
+                    if not duplicate and self._begin_text_selection(scene_pos, additive):
+                        event.accept()
+                        return
+                    self.clear_text_selection()
+                    # Empty space begins a marquee on first move.
                     # If the press is over a (sub-page) embedded image, either a
                     # plain click or a drag lifts it into a movable object (handled
                     # on release / on drag-threshold). The near-full-page guard in
@@ -2518,8 +2936,17 @@ class PDFCanvas(QGraphicsView):
         # Any active gesture means the page is moving under the cursor → switch to
         # fast scaling until motion settles.
         if (self._resize_item or self._drag_items or self._drawing
-                or self._press_empty_pos is not None):
+                or self._press_empty_pos is not None or self._text_selecting):
             self._mark_interacting()
+
+        if self._text_selecting:
+            # Extend from the anchor to whatever word the cursor is nearest.
+            i = self._word_index_at(scene_pos, nearest=True)
+            if i is not None and self._text_anchor is not None:
+                self._set_text_range(self._text_anchor, i)
+            self._update_edge_autoscroll(event.pos())
+            event.accept()
+            return
 
         if self._resize_item and self._resize_handle:
             if isinstance(self._resize_item, LineAnnotationItem):
@@ -2664,6 +3091,11 @@ class PDFCanvas(QGraphicsView):
                 self.setCursor(self._handle_cursor(res_handle))
             elif self._annotation_at(scene_pos):
                 self.setCursor(Qt.CursorShape.SizeAllCursor)
+            elif self._word_index_at(scene_pos) is not None:
+                # An I-beam over a word, matching what a press there will do.
+                # This is the only advertisement text selection gets, since it
+                # has no toolbar button of its own.
+                self.setCursor(Qt.CursorShape.IBeamCursor)
             elif self._embedded_image_at(scene_pos) is not None:
                 # Hovering a liftable embedded image, including images placed by
                 # other apps (e.g. pasted in Acrobat's Edit PDF). A move cursor,
@@ -2690,7 +3122,15 @@ class PDFCanvas(QGraphicsView):
             return
 
         if event.button() == Qt.MouseButton.LeftButton:
-            if self._resize_item:
+            if self._text_selecting:
+                # The selection itself stays up; only the drag ends. Nothing is
+                # pushed on the undo stack because nothing about the document
+                # changed.
+                self._text_selecting = False
+                self._autoscroll_timer.stop()
+                self._restore_tool_cursor()
+
+            elif self._resize_item:
                 after = geometry_snapshot(self._resize_item)
                 if self._resize_before is not None and after != self._resize_before:
                     self._push(ResizeCommand(
@@ -2812,6 +3252,10 @@ class PDFCanvas(QGraphicsView):
                     self._apply_style_change(
                         [item], lambda it: setattr(it, "text", text), "Edit text",
                     )
+            else:
+                # Not on an annotation: the double-click is aimed at the page's
+                # own text. One word, the way it works everywhere else.
+                self._text_double_click(event, scene_pos)
         event.accept()
 
     def _min_zoom_scale(self) -> float:
@@ -2961,9 +3405,19 @@ class PDFCanvas(QGraphicsView):
             event.accept()
         elif key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             self.delete_selected()
+        elif key == Qt.Key.Key_Escape and self.has_text_selection():
+            self.clear_text_selection()
+            event.accept()
         elif key == Qt.Key.Key_A and mods & Qt.KeyboardModifier.ControlModifier:
-            for item in self._page_annotations.get(self._current_page, []):
+            # Select All means the annotations on this page, as it always has.
+            # On a page carrying none it used to mean nothing at all, so that is
+            # where selecting the page's text goes: a strict addition, and on a
+            # drawing nobody has marked up yet it is the reading everybody wants.
+            items = self._page_annotations.get(self._current_page, [])
+            for item in items:
                 item.setSelected(True)
+            if not items:
+                self.select_all_text()
         elif key in arrows:
             items = [i for i in self._scene.selectedItems() if isinstance(i, AnnotationBase)]
             if items:
