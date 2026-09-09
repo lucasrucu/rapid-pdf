@@ -33,6 +33,7 @@ the stack has touched to give up a save marker that lived in the branch about
 to disappear.
 """
 
+import traceback
 import weakref
 
 from PySide6.QtGui import QUndoStack
@@ -122,6 +123,13 @@ def _affected(command) -> tuple:
     Commands opt in by defining `affected_views()`. Anything that does not is
     still perfectly pushable; it just contributes nothing to the bookkeeping,
     which is what a command with no document behind it (a test double) wants.
+
+    A command whose getter RAISES is a different thing entirely: it is a bug in
+    that command, and the cost of it is a document that never goes dirty or a
+    save marker that is never retired. The push still goes ahead (refusing the
+    user's edit over a bookkeeping fault would be worse), but the traceback goes
+    to stderr rather than being swallowed whole, which is how this went
+    unnoticed long enough to be written up as "no output at all".
     """
     getter = getattr(command, "affected_views", None)
     if getter is None:
@@ -129,4 +137,5 @@ def _affected(command) -> tuple:
     try:
         return tuple(v for v in getter() if v is not None)
     except Exception:
+        traceback.print_exc()
         return ()

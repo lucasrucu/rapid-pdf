@@ -71,6 +71,14 @@ not read yet. `stage_path` claims one, `ensure_loaded` opens it, and
 comes to the front and never before. Everything that used to ask
 `has_document()` to mean "is this tab free" asks `is_empty()` instead, because
 a pending tab is spoken for with nothing loaded in it. See ui/session.py.
+
+ONE PAGE EDIT, TWO PANELS. Delete and reorder are asked for by the left strip
+and by the Organizer, and both asks land on `_delete_pages` / `_reorder_pages`,
+which push a command. Neither panel edits the document itself. It used to: the
+Organizer applied its own delete and this view mirrored it afterwards, which
+left nothing to undo and cleared the window's whole history, so the one Delete
+key meant two different things depending on which panel had focus. If a third
+way to remove a page ever turns up, it goes through those two methods too.
 """
 
 import os
@@ -207,8 +215,9 @@ class DocumentView(QWidget):
         self._rev = 0
         self._saved_rev = 0
         # Dirt that no command produced and no undo can take back: an Organizer
-        # merge, a page delete that had to clear the history. OR'd into dirty
-        # and cleared by a save.
+        # merge, an OCR pass. OR'd into dirty and cleared by a save. Page
+        # deletes are NOT in that list any more; they are ordinary commands on
+        # the stack, from either panel.
         self._forced_dirty = False
         # Front tab or background tab. True to start: a view is built to be
         # shown, and the only thing this flag gates is the RELEASE, so nothing
@@ -301,8 +310,11 @@ class DocumentView(QWidget):
         self._organizer.set_view(self)
         self._organizer.pages_transfer_requested.connect(self._on_pages_dropped)
         self._organizer.page_activated.connect(self._on_organizer_page_activated)
-        self._organizer.pages_reordered_perm.connect(self._on_pages_reordered_perm)
-        self._organizer.pages_deleted.connect(self._on_pages_deleted)
+        # The SAME two slots the left thumbnail strip is wired to, on purpose:
+        # one undoable code path for "delete these pages", one for "reorder
+        # them", whichever panel asked.
+        self._organizer.pages_reorder_requested.connect(self._reorder_pages)
+        self._organizer.pages_delete_requested.connect(self._delete_pages)
         self._organizer.pages_added.connect(self._on_pages_added)
         self._organizer.needs_rebuild.connect(self._refresh_organizer)
         self._tabs.addTab(self._organizer, "Organizer")
@@ -1148,7 +1160,13 @@ class DocumentView(QWidget):
     # ------------------------------------------------------------------
 
     def _delete_pages(self, rows: list):
-        """Delete the panel's selected pages as one undoable step."""
+        """Delete the selected pages as one undoable step.
+
+        Both panels arrive here. The Organizer used to delete the pages itself
+        and leave this view to clear the whole window's undo history after the
+        fact, so the same Delete key was reversible in the strip and took every
+        annotation edit with it in the grid.
+        """
         if not self._doc.doc or not rows:
             return
         if self._doc.page_count() - len(rows) < 1:
@@ -1162,16 +1180,19 @@ class DocumentView(QWidget):
             f"Deleted {count} page{'s' if count > 1 else ''}  (Ctrl+Z to undo)")
 
     def _reorder_pages(self, order: list, moved_rows: list):
-        """Apply a drag from the panel as one undoable step.
+        """Apply a drag from either panel as one undoable step.
 
         A drop that doesn't describe a clean permutation is dropped on the floor
-        and the strip is rebuilt from the document, so a confused drag can never
-        leave the two disagreeing.
+        and both panels are rebuilt from the document, so a confused drag can
+        never leave them disagreeing with it. The Organizer needs that rebuild
+        more than the strip does: its cells have already moved themselves by the
+        time this runs.
         """
         if not self._doc.doc:
             return
         if not is_permutation(order, self._doc.page_count()):
             self._refresh_panel_thumbnails(current_page=self._current_page)
+            self._resync_organizer()
             return
         # Where the moved pages end up, so they stay selected after the rebuild.
         self._pending_page_selection = sorted(order.index(r) for r in moved_rows
@@ -1271,9 +1292,38 @@ class DocumentView(QWidget):
         self._pending_page_selection = None
         self._refresh_panel_thumbnails(current_page=self._current_page, select=select)
         self._refresh_current_thumb()
+        self._resync_organizer(select)
         self._update_status()
 
+    def _resync_organizer(self, select: list | None = None):
+        """Rebuild the Organizer grid from the document, when it is the tab in front.
+
+        A page command changes the document under both panels. The strip is
+        rebuilt by the caller above; the grid needs the same treatment, and it
+        needs a fresh markup-baked clone with it, or its thumbnails would go on
+        showing pages that have moved or gone.
+
+        Only when the Organizer is actually the visible tab. A background grid
+        is rebuilt by _on_tab_changed the moment it is brought forward, so doing
+        it here as well would clone the whole document for nobody to look at.
+        """
+        if self._tabs.currentIndex() != 1 or not self._doc.doc:
+            return
+        # pump=False: this runs inside a QUndoCommand's redo/undo, and
+        # processEvents() in there would let a queued keystroke push or undo a
+        # second command in the middle of the first one.
+        self._refresh_organizer(pump=False)
+        # The rows a drag just moved, still highlighted, the same way the strip
+        # keeps them. The rebuild above dropped the grid's own selection.
+        self._organizer.select_rows(select)
+
     def delete_current_page(self):
+        """The menu's "Delete Current Page", through the same undoable command.
+
+        The confirmation stays: this one acts on whatever page happens to be on
+        screen, with no selection to look at first. What it no longer does is
+        delete the page outside the undo stack.
+        """
         if not self._doc.doc or self._doc.page_count() <= 1:
             QMessageBox.warning(self.window(), "Cannot Delete",
                                 "Cannot delete the only page.")
@@ -1285,19 +1335,7 @@ class DocumentView(QWidget):
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
-        self._doc.delete_page(self._current_page)
-        self._mark_dirty()
-        self._canvas.remove_page_annotations(self._current_page)
-        # Page deletion renumbers/removes items the undo stack still references;
-        # clear it so a later undo can't replay against stale page indices.
-        # (Mirrors _on_pages_deleted, the Organizer delete path.)
-        self._canvas.clear_own_history()
-        self._refresh_panel_thumbnails()
-        new_page = min(self._current_page, self._doc.page_count() - 1)
-        self._current_page = new_page
-        self._canvas.set_page(new_page, immediate=True)
-        self._page_panel.set_current_page(new_page)
-        self._update_status()
+        self._delete_pages([self._current_page])
 
     # ------------------------------------------------------------------
     # Editor / Organizer switching, and the markup-baked render clones
@@ -1323,9 +1361,14 @@ class DocumentView(QWidget):
         render.doc = self._doc.clone_with_annotations(dicts_by_page)
         return render
 
-    def _refresh_organizer(self):
+    def _refresh_organizer(self, pump: bool = True):
         """Load the Organizer with current pages, baking unsaved markup into the
         thumbnails via a throwaway clone (so the live document isn't mutated).
+
+        `pump=False` skips the "Loading organizer" message and the processEvents
+        that shows it, for callers that cannot safely run other people's events
+        (a page command mid-undo). Skipping it is never less safe: the pump is
+        the one moment anything else gets to run in here.
 
         KNOWN BUG 6 IS FIXED HERE, and the fix is the ORDER. This method used
         to close the previous clone as its first statement and only build the
@@ -1346,10 +1389,12 @@ class DocumentView(QWidget):
             self._organizer.set_document(self._doc, None)
             self._close_org_render()
             return
-        self.status_message.emit("Loading organizer…")
-        # Safe here: the Organizer is still rendering from the PREVIOUS clone,
-        # which is still open, and stays open until the swap below is done.
-        QApplication.processEvents()
+        if pump:
+            self.status_message.emit("Loading organizer…")
+            # Safe here: the Organizer is still rendering from the PREVIOUS
+            # clone, which is still open, and stays open until the swap below
+            # is done.
+            QApplication.processEvents()
         previous, self._org_render = self._org_render, None
         try:
             self._org_render = self._make_markup_baked_render()
@@ -1416,36 +1461,10 @@ class DocumentView(QWidget):
         self._tabs.setCurrentIndex(0)
         self._on_page_selected(page_num)
 
-    def _on_pages_reordered_perm(self, new_order: list):
-        # Organizer already reordered the live document; mirror it everywhere else.
-        self._mark_dirty()
-        self._canvas.reorder_pages(new_order)
-        # Reorder re-bases every item's page_num; the undo stack's commands still
-        # reference the old numbering, so undo would land items on the wrong page.
-        # Structural page ops are incompatible with the item-level undo stack, so clear it.
-        self._canvas.clear_own_history()
-        self._refresh_panel_thumbnails()
-        self._current_page = self._canvas._current_page
-        self._page_panel.set_current_page(self._current_page)
-        self._refresh_current_thumb()
-        self._update_status()
-
-    def _on_pages_deleted(self, rows: list):
-        if rows:
-            self._mark_dirty()
-        for row in rows:  # already in descending order from organizer
-            self._canvas.remove_page_annotations(row)
-        # Page deletion is structurally irreversible. The undo stack holds references
-        # to items on pages that no longer exist. Clear it to prevent corrupted undos.
-        self._canvas.clear_own_history()
-        self._refresh_panel_thumbnails()
-        if self._doc.doc:
-            new_page = min(self._current_page, self._doc.page_count() - 1)
-            self._current_page = new_page
-            self._canvas.set_page(new_page, immediate=True)
-            self._page_panel.set_current_page(new_page)
-            self._refresh_current_thumb()
-        self._update_status()
+    # There is no _on_pages_deleted / _on_pages_reordered_perm here any more.
+    # Both were the Organizer's own edits being mirrored after the fact, and
+    # both ended in clear_own_history(). The Organizer asks now, and the ask
+    # lands on _delete_pages / _reorder_pages, the strip's own path.
 
     # ------------------------------------------------------------------
     # Internal
@@ -1567,10 +1586,11 @@ class DocumentView(QWidget):
     def _mark_dirty(self):
         """Dirt no command produced and no undo can take back.
 
-        An Organizer merge, an OCR pass, a page delete that had to clear the
-        history: all of them change the document outside the undo stack, so
-        they set a flag that only a save clears. Everything that IS undoable
-        goes through the revision counter instead (see note_revision).
+        An Organizer merge, an OCR pass: both change the document outside the
+        undo stack, so they set a flag that only a save clears. Everything that
+        IS undoable goes through the revision counter instead (see
+        note_revision), and page deletes moved into that group when the
+        Organizer stopped doing its own edits.
         """
         self._forced_dirty = True
         self._sync_dirty()
