@@ -1070,7 +1070,12 @@ class MainWindow(QMainWindow):
             self, "About Rapid PDF",
             f"<b>Rapid PDF {APP_VERSION}</b>"
             "<p>Fast PDF page management and markup.</p>"
-            "<p>Copyright (c) 2026 Lucas Ruiz</p>")
+            "<p>Copyright (C) 2026 Lucas Ruiz</p>"
+            "<p>Free software under the "
+            '<a href="https://www.gnu.org/licenses/agpl-3.0.html">'
+            "GNU AGPL-3.0</a>. Source: "
+            '<a href="https://github.com/lucasrucu/rapid-pdf">'
+            "github.com/lucasrucu/rapid-pdf</a></p>")
 
     def _maybe_save_every_tab(self) -> bool:
         """Put the unsaved-changes question to every open document in turn.
