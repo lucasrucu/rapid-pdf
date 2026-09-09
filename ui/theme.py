@@ -429,8 +429,32 @@ QTabBar::tab:hover:!selected {{ color: {p.text_dim}; }}
    toolbar that has floated to the top. The three caption buttons paint their
    own hover and press states (Windows' metrics, and Windows' close red), so
    nothing here may give them a background. */
+/* THE LINE UNDER THE TABS. It says where the caption stops and the app starts,
+   and because the caption is the part you drag the window by, it also says
+   where there is something to grab. Lucas: "i would also add a line below the
+   tabs, to display where the app actually starts, this also allows a user
+   where to grab the window and move around, right now it s alittle confusing
+   but make sure the link added, will not be touching the square of the tab."
+
+   IT DOES NOT TOUCH A TAB, and that is arithmetic rather than taste. The row
+   is 38px, the bar sits at its own hint inside it and the ::tab rule below
+   insets the painted tab by another 4px top and bottom, so the tab's own
+   bottom edge lands several pixels clear of this border.
+   `TitleBar.tab_separator_gap` is where that clearance is measured and the
+   tests pin it.
+
+   THE COLOUR IS THE PALETTE'S DIVIDER TOKEN, the same one #windowChrome uses
+   below and the same one QFrame dividers use, so the two lines in the chrome
+   are one weight in both themes.
+
+   This reverses a note that used to sit under the tab rules saying the strip
+   carries no bottom border because a second line halfway up the chrome reads
+   as a seam. With a menu row between the two lines it does not: the menu bar
+   reads as its own band, bounded top and bottom, which is what Edge's toolbar
+   does under its tab strip. */
 #windowTitleBar {{
     background-color: {strip_bg};
+    border-bottom: 1px solid {p.border};
 }}
 #windowChrome {{
     background-color: {p.window};
@@ -494,9 +518,10 @@ QMenuBar#windowMenuBar {{ padding: 1px 4px; }}
    `_TabCloseButton` in ui/document_area.py for the horizontal half of that
    problem, which no amount of padding here can reach.
 
-   No bottom border on the strip. #windowChrome draws the one line that closes
-   off the title bar and the menu row together; a second line halfway up the
-   title bar reads as a seam. */
+   The line under the strip is #windowTitleBar's own border-bottom, not
+   anything here: it belongs to the row rather than to the bar, so it runs the
+   full width of the window past the last tab and past the new-tab button. See
+   that rule above for why it came back. */
 #documentTabHeader {{
     background-color: transparent;
 }}

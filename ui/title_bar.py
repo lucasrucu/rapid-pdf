@@ -36,6 +36,14 @@ Everything else is HTCLIENT and reaches Qt normally: the tabs themselves, their
 close buttons, the chevron, the new-tab button, and the minimise and close
 buttons.
 
+AND THERE IS A LINE UNDER ALL OF IT, which is the visible edge of exactly that
+arrangement: above it is caption, below it is the app. Lucas asked for it as an
+answer to "where do I grab this window", and the answer it gives is honest,
+because `is_drag_area` above the line really is what drags the window. The
+stylesheet draws it as this row's bottom border (ui/theme.py, #windowTitleBar);
+`separator_rect` and `tab_separator_gap` are where its position lives, and the
+gap is what keeps it off the bottom edge of a tab.
+
 THE BUTTONS ARE PAINTED, NOT SET IN A FONT. Segoe Fluent Icons is the obvious
 way to draw a minimise glyph and it is one missing font away from a row of empty
 boxes in the corner of the window. The four glyphs are a line, a rectangle, two
@@ -68,6 +76,13 @@ TITLE_BAR_HEIGHT = 38
 #: own at 10 device pixels at 100% and scales from there, and Qt does that
 #: scaling for us as long as the number stays logical.
 GLYPH_BOX = 10
+
+#: The line drawn under the whole row, marking where the caption stops and the
+#: app starts. It is one logical pixel and the STYLESHEET draws it: see the
+#: #windowTitleBar rule in ui/theme.py, which is also where its colour comes
+#: from. What lives here is where it lands, so `separator_rect` and
+#: `tab_separator_gap` below have one number to work from rather than two.
+SEPARATOR_HEIGHT = 1
 
 #: The app icon at the far left, and the room around it.
 APP_ICON_SIZE = 16
@@ -385,6 +400,40 @@ class TitleBar(QWidget):
 
     def tab_strip(self):
         return self._tabs
+
+    def separator_rect(self) -> QRect:
+        """The line under the row, in this widget's own coordinates.
+
+        The stylesheet paints it as this row's bottom border, which puts it in
+        the last logical pixel of the widget. Named here so the tests can ask
+        where it is without parsing a stylesheet, and so anything that needs to
+        stay clear of it has one place to ask.
+        """
+        return QRect(0, self.height() - SEPARATOR_HEIGHT,
+                     self.width(), SEPARATOR_HEIGHT)
+
+    def tab_separator_gap(self) -> int:
+        """Clear pixels between the lowest tab and the line under the row.
+
+        His requirement in full: "make sure the link added, will not be
+        touching the square of the tab." So this is the number that has to stay
+        above zero, and it is measured against the tab RECT rather than against
+        the shape the stylesheet paints inside it, which is the stricter of the
+        two questions: the ::tab rule insets the painted tab by another 4px
+        under its rect.
+
+        Returns a large number when there are no tabs on screen, because then
+        there is nothing for the line to touch.
+        """
+        header = self._tabs
+        if header is None or not header.isVisible():
+            return self.height()
+        bar = header.findChild(QWidget, "documentTabBar")
+        if bar is None or not bar.isVisible() or bar.count() == 0:
+            return self.height()
+        lowest = max(bar.mapTo(self, bar.tabRect(i).bottomLeft()).y()
+                     for i in range(bar.count()))
+        return self.separator_rect().top() - lowest - 1
 
     def controls(self) -> WindowControls:
         return self._controls
