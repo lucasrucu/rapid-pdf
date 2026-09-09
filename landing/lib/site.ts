@@ -22,6 +22,10 @@ export const VERSION = "1.9.0";
 export const LINKS = {
   github: `https://github.com/${REPO}`,
   releasesLatest: `https://github.com/${REPO}/releases/latest`,
+  // The AGPL grants rights to whoever receives the BINARY, so the site that
+  // hands out the binary is where the licence and the source have to be
+  // reachable. The footer links both.
+  license: `https://github.com/${REPO}/blob/main/LICENSE`,
   downloadInstaller:
     `https://github.com/${REPO}/releases/latest/download/` +
     `rapid-pdf-setup-${VERSION}.exe`,

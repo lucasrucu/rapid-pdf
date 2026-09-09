@@ -55,19 +55,26 @@ export function Hero() {
               View on GitHub
             </a>
           </div>
-          {/* THIS LINE SAID "open source" AND MUST NOT SAY IT AGAIN WITHOUT A
-              LICENSE. The repo carries no LICENSE file and the README makes no
-              licensing statement, so default copyright applies and nobody may
-              legally reuse the code. That made the claim misleading, not merely
-              unsupported, so it came off on 2026-09-09. Whether to license the
-              project is still open: docs/licensing-decision.md has the options.
-              What replaced it is true today. The app talks to the network in
-              exactly one place, core/update/feed.py, and only to ask GitHub
-              about its own releases. No document ever leaves the machine, OCR
-              included. */}
+          {/* Every claim on this line has to be checkable, and the "open source"
+              half was not for one day. It came off on the morning of 2026-09-09
+              because the repo carried no LICENSE, which made it misleading
+              rather than merely unsupported, and it went back on the same day
+              once RapidPDF was licensed under AGPL-3.0 (LICENSE at the repo
+              root, a Licence section in the README, the reasoning in
+              docs/licensing-decision.md). It is true again and it stays.
+
+              THE PRIVACY HALF IS THE ONE THAT SELLS, so it keeps the end of the
+              line where the eye stops. The app talks to the network in exactly
+              one place, core/update/feed.py, and only to ask GitHub about its
+              own releases. No document ever leaves the machine, OCR included,
+              because PyMuPDF runs Tesseract locally. "Open source" is what lets
+              a sceptical reader go and CHECK that, which is why the two belong
+              on one line and not on two.
+
+              If the licence ever changes, this line changes with it. */}
           <p className="mt-3 inline-flex items-center gap-1.5 text-xs text-muted-foreground">
             <Monitor className="h-3.5 w-3.5" aria-hidden="true" />
-            Windows 10 / 11 · free · your files never leave your PC
+            Windows 10 / 11 · free and open source · your files never leave your PC
           </p>
           {/* Byline. Near the fold on a phone, so the tool has a name on it
               before anyone scrolls. Jumps to the maker band at the bottom. */}
