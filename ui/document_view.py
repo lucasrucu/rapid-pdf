@@ -797,6 +797,10 @@ class DocumentView(QWidget):
         n = self._canvas.copy_selected()
         if n:
             self._update_status(f"Copied {n} object(s), Ctrl+V to paste")
+        elif self._canvas.has_text_selection():
+            # copy_selected returns 0 for a text copy: the text went to the
+            # system clipboard, not the in-app one Ctrl+V reads.
+            self._update_status("Copied text")
 
     def paste(self):
         """Paste in-app copied annotations if any, else fall back to a clipboard image."""
