@@ -402,6 +402,15 @@ QLabel#UpdateNoticeText {{
         wait would otherwise land _on_check_done or _on_stage_done on a window
         that is halfway through closing, and neither of those has any business
         running then.
+
+        BOTH EXCEPTIONS ARE CAUGHT, and the second one was bought the hard way.
+        A no-argument disconnect() on a worker that has nothing connected does
+        not raise RuntimeError in PySide6, it raises TypeError ("not enough
+        arguments"), because with no connections to drop the call resolves to
+        an overload that wants some. This runs inside closeEvent, so what an
+        escaping exception costs is the app failing to close. Caught here on
+        9 Sept 2026 after it came out of a suite run under load, which is the
+        only condition anything had ever reproduced it in.
         """
         worker, thread = self._worker, self._thread
         if worker is None and thread is None:
@@ -411,6 +420,6 @@ QLabel#UpdateNoticeText {{
                 worker.cancel()
             try:
                 worker.disconnect()
-            except RuntimeError:
+            except (RuntimeError, TypeError):
                 pass          # nothing was connected, or it is already gone
         self._finish_thread(wait_ms=15000)
