@@ -128,32 +128,31 @@ CLOSE_BUTTON_RIGHT_INSET = 10
 # height: it has to read as "between these two tabs" from the corner of the eye,
 # while the thing actually being looked at is the window under the cursor.
 #
-# It was two pixels and that was not enough. Two pixels of accent, on a strip
-# the floating window was sitting on top of, was a signal nobody reported
-# seeing: the drop worked and looked like luck. So the line is wider, and it is
-# no longer alone: `set_drop_active` washes the whole target strip in the accent
-# so the answer to "which window is this going into" is readable without hunting
-# for a hairline. See ui/tab_tear_off.py, where the floating window is also
-# moved down out of the way of both.
+# IT IS NOW THE WHOLE OF THE DRAG FEEDBACK. It used to be drawn on top of an
+# accent wash over the entire target strip, plus a 2px accent outline round it,
+# so that "which window is this going into" could be read without hunting for a
+# hairline. Since the bar hugs its tabs, a strip is barely wider than the tabs
+# on it and that pair reads as a heavy amber box drawn around the tab itself,
+# which is what got reported with a screenshot. Lucas: "if we follow an already
+# pretty advnced UI like edge, no hgihglight exists so lets replciate that."
+#
+# Edge can afford to draw nothing but a slim mark because the tab is already
+# sitting in the strip by the time you see it, and the strip has reflowed
+# around it. This does the same live attach (`TabTearOff._attach_to_strip`), so
+# the same slim mark is enough here too.
 DROP_LINE_WIDTH = 4
 
-# How much of the accent the target strip is washed in while a tear-off is over
-# it. Enough to read as "this one", not so much that the tab labels underneath
-# stop being legible.
-DROP_WASH_ALPHA = 46
+# How far inside the bar's top and bottom edges the line is held. It used to be
+# derived from the outline it was drawn inside; with the outline gone it is a
+# small margin of its own, so a full-height accent bar does not butt into the
+# edge of the strip.
+DROP_LINE_INSET = 3
 
-# The accent outline around the target strip, under the wash.
-DROP_OUTLINE_WIDTH = 2
-
-# Matched to the tab's own corner radius in ui/theme.py. A square frame drawn
-# around a row of rounded tabs reads as a second shape arguing with the first.
-DROP_OUTLINE_RADIUS = 8
-
-# Below this width the strip is not painted with drop feedback at all. A wash
-# and an outline are a way of saying "this whole strip"; on a bar a few pixels
-# wide they say "here is a small gold box", which is what a user actually
-# reported seeing while dragging a tab. One tab at the floor width is the
-# smallest thing that can carry the message, so that is the threshold.
+# Below this width the strip is not painted with drop feedback at all. A 4px
+# line on a bar a few pixels wide is not an insertion mark, it is a small
+# coloured box floating in the caption, which is what a user actually reported
+# seeing while dragging a tab. One tab at the floor width is the smallest thing
+# that can carry the message, so that is the threshold.
 DROP_FEEDBACK_MIN_WIDTH = TAB_MIN_WIDTH
 
 # The mark on a tab that has been ticked for "Move Selected to New Window". A
@@ -419,13 +418,11 @@ class DocumentTabBar(QTabBar):
         self._palette = None
         # Phase 4. Set by DocumentArea, which owns both halves of the move.
         self._tear_off = None
-        # x of the insertion line while a torn-off tab is over this bar, or None.
+        # x of the insertion line while a torn-off tab is over this bar, or
+        # None. The whole of the drag feedback: there was a wash and an outline
+        # over the strip as well, and they are what read as a highlight box
+        # around the tab. See DROP_LINE_WIDTH.
         self._drop_x = None
-        # Whether this window is the drop target at all. Separate from the line
-        # above because the dock zone is now the WHOLE window: the cursor can be
-        # down in the page view with this strip still being the thing that will
-        # receive the document, and the strip has to say so.
-        self._drop_active = False
         # Tabs ticked for "Move Selected to New Window", by index. Pushed down
         # from DocumentArea, which holds the real answer as VIEWS: an index goes
         # stale the moment a tab is dragged along the bar.
@@ -521,39 +518,21 @@ class DocumentTabBar(QTabBar):
         cannot see pixels but can ask the question the pixels answer."""
         return self._drop_x
 
-    def set_drop_active(self, active: bool):
-        """Wash this strip in the accent, or stop.
-
-        The louder half of the drag feedback, and the half that answers the
-        question people actually ask mid-drag: not "between which two tabs" but
-        "is it going into THIS window". It is set whenever the cursor is
-        anywhere over this window, which since the dock zone was widened is most
-        of the screen area a drag crosses.
-        """
-        if active == self._drop_active:
-            return
-        self._drop_active = active
-        self.update()
-
-    def drop_active(self) -> bool:
-        return self._drop_active
-
     def _can_paint_drop_feedback(self) -> bool:
         """Whether this bar is a real strip rather than a few stray pixels.
 
         THIS IS THE BACKSTOP, NOT THE FIX. The reported artifact was "a small
-        gold box floating in the caption": a wash and a 2px outline are a way
-        of saying "this whole strip", and around a bar a few pixels wide they
-        say something else entirely. The width threshold was the first answer
-        and it is kept, with an empty bar refused outright, because a bar with
-        nothing in it has no gap for a tab to land between and so can never
-        legitimately be lit.
+        gold box floating in the caption", and the wash and outline that made
+        it are gone entirely (see DROP_LINE_WIDTH). The width threshold is kept
+        because the line can produce the same artifact in a thinner shape, and
+        an empty bar is refused outright because a bar with nothing in it has no
+        gap for a tab to land between and so can never legitimately be marked.
 
         The condition that actually produced the box is upstream of here and is
-        now handled there: a window holding one empty document hides its whole
+        handled there too: a window holding one empty document hides its whole
         header (`_sync_header_visibility`), and the tear-off used to name that
-        window as a target and light its bar anyway. `_show_drop_feedback` now
-        declines to light a strip that is not on screen, so the state is never
+        window as a target and paint its bar anyway. `_show_drop_feedback` now
+        declines to mark a strip that is not on screen, so the state is never
         set rather than being set and then not drawn.
         """
         return self.count() > 0 and self.width() >= DROP_FEEDBACK_MIN_WIDTH
@@ -765,23 +744,22 @@ class DocumentTabBar(QTabBar):
         return QColor(self._palette.accent) if self._palette is not None \
             else QColor("#3b82f6")
 
-    def _accent_press(self) -> QColor:
-        """The accent's pressed value, used for marks drawn ON the accent."""
-        return QColor(self._palette.accent_press) if self._palette is not None \
-            else QColor("#1d4ed8")
-
     def paintEvent(self, event):
-        """The tabs, then the tick marks, then the drop feedback over the lot.
+        """The tabs, then the tick marks, then the insertion line over the lot.
 
         All three are drawn on top rather than as part of a tab, and for the
         same reason in each case: they belong to somewhere a tab is not. The
         insertion line belongs to the gap BETWEEN two tabs and there is no tab
-        at the end of the bar for it to belong to; the drop wash belongs to the
-        strip; and the tick marks are the only thing here that is per tab, kept
-        with the other two so one QPainter covers all of it.
+        at the end of the bar for it to belong to, and the tick marks are the
+        only thing here that is per tab, kept with it so one QPainter covers
+        both.
+
+        THERE IS NO WASH AND NO OUTLINE ANY MORE. See DROP_LINE_WIDTH: a strip
+        that hugs its tabs, washed in the accent and outlined, is an amber box
+        around the tab rather than a lit strip, and Edge draws neither.
         """
         super().paintEvent(event)
-        if not self._checked and not self._drop_active and self._drop_x is None:
+        if not self._checked and self._drop_x is None:
             return
         painter = QPainter(self)
         accent = self._accent()
@@ -793,57 +771,24 @@ class DocumentTabBar(QTabBar):
                     QRect(rect.left(), rect.top(), rect.width(),
                           CHECK_MARK_HEIGHT), accent)
 
-        # THE LITTLE YELLOW SQUARE, and why the drop feedback is now gated on a
-        # width. The wash and the outline are meant to light up a whole tab
-        # strip so it reads as "this window". They were painted on self.rect()
-        # unconditionally, and a bar with no tabs in it has a rect a few pixels
-        # wide: an alpha wash plus a 2px accent outline around that is not a
-        # highlighted strip, it is a small gold box floating in the caption,
-        # which is exactly what got reported. A window holding one empty
-        # document hides its header (see _sync_header_visibility), and the
-        # tear-off still names that window as the target and still calls
-        # set_drop_active on its bar, so the case is reached routinely rather
-        # than rarely. Since the bar now hugs its tabs it is narrower than it
-        # used to be, which would have made this more common, not less.
-        if self._drop_active and self._can_paint_drop_feedback():
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            wash = QColor(accent)
-            wash.setAlpha(DROP_WASH_ALPHA)
-            inset = DROP_OUTLINE_WIDTH / 2
-            frame = QRectF(self.rect()).adjusted(inset, inset, -inset, -inset)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(wash)
-            # Rounded to the tab's own radius: a square frame around a row of
-            # rounded tabs reads as a second, competing shape.
-            painter.drawRoundedRect(frame, DROP_OUTLINE_RADIUS,
-                                    DROP_OUTLINE_RADIUS)
-            pen = QPen(accent)
-            pen.setWidth(DROP_OUTLINE_WIDTH)
-            painter.setPen(pen)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRoundedRect(frame, DROP_OUTLINE_RADIUS,
-                                    DROP_OUTLINE_RADIUS)
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-
-        # Same gate, same reason: a 4px line on a bar barely wider than 4px is
-        # the same artifact wearing a different shape.
-        #
-        # NOT IN THE ACCENT, AND THAT IS THE POINT. The line used to be the
-        # same colour as the wash and the outline it is drawn on top of, which
-        # is invisible by construction: at index 0 it lands exactly under the
-        # frame's left edge and the two merge into one thick gold border that
-        # says nothing about position. A pressed-accent line reads as a mark ON
-        # the highlighted strip in both themes, darker than the wash in light
-        # and brighter than it in dark. It is also held inside the frame rather
-        # than clamped to the bar, so the first and last positions are as
-        # legible as the ones in the middle.
+        # THE LITTLE YELLOW SQUARE, and why the line is gated on a width. A bar
+        # with no tabs in it has a rect a few pixels wide, and a full-height
+        # accent line on that is not an insertion mark, it is a small coloured
+        # box floating in the caption, which is exactly what got reported. A
+        # window holding one empty document hides its header (see
+        # _sync_header_visibility), so the case is reached routinely rather
+        # than rarely.
         if self._drop_x is not None and self._can_paint_drop_feedback():
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            edge = DROP_OUTLINE_WIDTH + 1
+            edge = DROP_LINE_INSET
             left = max(edge, min(int(self._drop_x) - DROP_LINE_WIDTH // 2,
                                  self.width() - DROP_LINE_WIDTH - edge))
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(self._accent_press())
+            # THE PLAIN ACCENT NOW, not the pressed one. The pressed value was
+            # chosen to read as a mark ON the wash it used to be drawn over;
+            # with the wash gone the line sits on the bare strip and the accent
+            # is the value that carries there, in both themes.
+            painter.setBrush(accent)
             painter.drawRoundedRect(
                 QRectF(left, edge, DROP_LINE_WIDTH,
                        max(1, self.height() - 2 * edge)),

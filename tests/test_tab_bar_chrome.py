@@ -33,6 +33,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from core.settings import Settings, set_settings
 from ui.document_area import (
     CLOSE_BUTTON_RIGHT_INSET, CLOSE_BUTTON_SIZE, DROP_FEEDBACK_MIN_WIDTH,
+    DROP_LINE_WIDTH,
 )
 from ui.main_window import MainWindow
 from ui.theme import DARK, LIGHT, build_qss
@@ -258,27 +259,78 @@ def _pretend_dragging(tear, window, view):
     tear._whole_window = False
 
 
-def test_the_receiving_strip_lights_up(two_windows):
+def test_the_receiving_strip_gets_a_line_and_nothing_else(two_windows):
+    """THE HIGHLIGHT IS GONE, and this is where that is pinned.
+
+    The strip used to be washed in the accent and outlined in it as well, so
+    "which window is this going into" could be read without hunting for a
+    hairline. Since the bar hugs its tabs, a strip is barely wider than the
+    tabs on it, and a wash plus a 2px outline around that reads as a heavy
+    amber box drawn around the tab. Lucas, with a screenshot: "if we follow an
+    already pretty advnced UI like edge, no hgihglight exists so lets
+    replciate that."
+
+    The insertion line survives, because Edge draws one too and because the
+    live attach it marks is otherwise invisible: see
+    `TabTearOff._show_drop_feedback`.
+    """
     a, b = two_windows
+    bar = b.document_area().bar()
     tear = a.document_area().bar()._tear_off
     _pretend_dragging(tear, a, a.document_area().view_at(0))
     tear._show_drop_feedback((b, 1))
-    assert b.document_area().bar().drop_active() is True
-    assert b.document_area().bar().drop_indicator() is not None
-    assert a.document_area().bar().drop_active() is False
+    assert bar.drop_indicator() is not None
+    assert a.document_area().bar().drop_indicator() is None
+    # There is no strip-wide state left to set, so nothing can paint one.
+    assert not hasattr(bar, "drop_active")
+    assert not hasattr(bar, "set_drop_active")
 
 
-def test_only_one_strip_is_lit_at_a_time(two_windows):
-    """Moving from one window to another has to take the paint off the first,
-    or a drag across three windows leaves a trail of highlighted strips."""
+def test_no_box_is_painted_around_the_arriving_tab(two_windows):
+    """The paint itself, as far as offscreen can reach it.
+
+    A wash and an outline both cover the whole bar rect, so the way to ask "is
+    there a box" without a compositor is to paint the bar into a pixmap twice,
+    with the feedback down and then up, and check that everything well away
+    from the insertion line came out identical. The box changed all of it; a
+    slim mark changes only where it is.
+
+    This proves the paint and not merely the state, which is the half
+    tests/test_tab_bar_chrome.py's own docstring says offscreen usually cannot
+    reach. It works here because the question is about one widget painting
+    itself, not about pixels arriving on a screen.
+    """
+    a, b = two_windows
+    bar = b.document_area().bar()
+    tear = a.document_area().bar()._tear_off
+    _pretend_dragging(tear, a, a.document_area().view_at(0))
+
+    clean = bar.grab().toImage()
+    tear._show_drop_feedback((b, 1))
+    line_x = bar.drop_indicator()
+    assert line_x is not None
+    lit = bar.grab().toImage()
+
+    probes = [(x, y)
+              for x in (4, bar.width() // 4, bar.width() - 5)
+              for y in (0, 1, bar.height() // 2, bar.height() - 1)
+              if abs(x - line_x) > DROP_LINE_WIDTH + 4]
+    assert probes, "every probe landed on the line itself"
+    for x, y in probes:
+        assert lit.pixel(x, y) == clean.pixel(x, y), f"painted at ({x}, {y})"
+
+
+def test_only_one_strip_is_marked_at_a_time(two_windows):
+    """Moving from one window to another has to take the mark off the first,
+    or a drag across three windows leaves a trail of insertion lines."""
     a, b = two_windows
     tear = a.document_area().bar()._tear_off
     _pretend_dragging(tear, a, a.document_area().view_at(0))
     tear._show_drop_feedback((b, 0))
-    assert b.document_area().bar().drop_active() is True
+    assert b.document_area().bar().drop_indicator() is not None
     tear._show_drop_feedback((a, 0))
-    assert b.document_area().bar().drop_active() is False
-    assert a.document_area().bar().drop_active() is True
+    assert b.document_area().bar().drop_indicator() is None
+    assert a.document_area().bar().drop_indicator() is not None
 
 
 def test_the_feedback_is_cleared_when_the_drag_ends(two_windows):
@@ -288,7 +340,6 @@ def test_the_feedback_is_cleared_when_the_drag_ends(two_windows):
     tear._show_drop_feedback((b, 1))
     tear._clear_drop_feedback()
     for window in (a, b):
-        assert window.document_area().bar().drop_active() is False
         assert window.document_area().bar().drop_indicator() is None
 
 
@@ -312,10 +363,10 @@ def test_the_line_marks_the_tab_being_carried(two_windows):
     assert bar.drop_indicator() == bar.insertion_x(landed)
 
 
-def test_an_empty_strip_is_never_washed(two_windows):
-    """THE LITTLE GOLD BOX. A wash plus a 2px outline around a bar with nothing
-    in it is not a highlighted strip, it is a small accent box floating in the
-    caption, which is what got reported. The bar refuses to paint it."""
+def test_an_empty_strip_is_never_marked(two_windows):
+    """THE LITTLE GOLD BOX. The wash and the outline that made it are gone, but
+    a full-height 4px line on a bar with nothing in it is the same artifact in
+    a thinner shape, so the gate stays."""
     a, b = two_windows
     bar = b.document_area().bar()
     while b.document_area().count() > 0:
@@ -324,9 +375,9 @@ def test_an_empty_strip_is_never_washed(two_windows):
     assert bar._can_paint_drop_feedback() is False
 
 
-def test_a_hidden_strip_is_never_lit(two_windows):
+def test_a_hidden_strip_is_never_marked(two_windows):
     """The source-level half of the same fix: a window holding one empty
-    document hides its whole header, so there is no strip on screen to light
+    document hides its whole header, so there is no strip on screen to mark
     and the state is not set rather than being set and then not drawn."""
     a, b = two_windows
     bar = b.document_area().bar()
@@ -334,10 +385,10 @@ def test_a_hidden_strip_is_never_lit(two_windows):
     tear = a.document_area().bar()._tear_off
     _pretend_dragging(tear, a, a.document_area().view_at(0))
     tear._show_drop_feedback((b, 0))
-    assert bar.drop_active() is False
+    assert bar.drop_indicator() is None
 
 
-def test_a_narrow_strip_is_never_washed(two_windows):
+def test_a_narrow_strip_is_never_marked(two_windows):
     a, b = two_windows
     bar = b.document_area().bar()
     bar.resize(DROP_FEEDBACK_MIN_WIDTH - 1, bar.height())

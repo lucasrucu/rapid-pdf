@@ -51,9 +51,10 @@ from ui.frameless import (
     HTLEFT, HTMAXBUTTON, HTRIGHT, HTSYSMENU, HTTOP, HTTOPLEFT, HTTOPRIGHT,
     RESIZE_BORDER, hit_test_code, resize_edges_at,
 )
+from ui.theme import DARK, LIGHT, build_qss
 from ui.title_bar import (
     CAPTION_BUTTON_HEIGHT, CAPTION_BUTTON_WIDTH, CLOSE_HOVER, CLOSE_PRESSED,
-    TITLE_BAR_HEIGHT,
+    DRAG_GAP_WIDTH, SEPARATOR_HEIGHT, TITLE_BAR_HEIGHT,
 )
 from ui.window_registry import WindowRegistry
 
@@ -538,3 +539,74 @@ def test_the_caption_buttons_keep_windows_metrics_at_150_percent(tmp_path):
     assert float(ratio) == 1.5
     # And the row is still taller than the buttons standing in it.
     assert int(bar_h) >= int(want_h)
+
+
+# ======================================================================
+# 8. The line under the tabs
+# ======================================================================
+
+def _title_bar_block(palette) -> str:
+    qss = build_qss(palette)
+    start = qss.index("#windowTitleBar {")
+    return qss[start:qss.index("}", start)]
+
+
+@pytest.mark.parametrize("palette", [LIGHT, DARK], ids=["light", "dark"])
+def test_a_line_is_drawn_under_the_tab_row(palette):
+    """Where the caption stops and the app starts.
+
+    His words: "i would also add a line below the tabs, to display where the
+    app actually starts, this also allows a user where to grab the window and
+    move around". It is the ROW's own bottom border rather than anything on the
+    bar, so it runs the full width of the window past the last tab.
+
+    THE COLOUR IS A TOKEN, never a literal. `border` is the palette's divider
+    role, the same one #windowChrome and QFrame dividers take, so every line in
+    the chrome is one weight in both themes.
+    """
+    block = _title_bar_block(palette)
+    assert f"border-bottom: {SEPARATOR_HEIGHT}px solid {palette.border};" in block
+    # And it really did come from this palette: the other theme's divider is a
+    # different value and does not appear.
+    other = DARK if palette is LIGHT else LIGHT
+    assert other.border not in block
+
+
+def test_the_line_sits_at_the_bottom_of_the_row_and_runs_its_width(window):
+    bar = window.title_bar()
+    rect = bar.separator_rect()
+    assert rect.height() == SEPARATOR_HEIGHT
+    assert rect.bottom() == bar.height() - 1
+    assert rect.left() == 0
+    assert rect.width() == bar.width()
+
+
+@pytest.mark.parametrize("palette", [LIGHT, DARK], ids=["light", "dark"])
+def test_the_line_does_not_touch_a_tab(qt_app, window, palette):
+    """His one condition on it: "make sure the link added, will not be touching
+    the square of the tab."
+
+    Measured against the tab RECT, which is the stricter of the two questions:
+    the ::tab rule insets the shape it paints by another 4px inside that rect,
+    so the visible gap is wider than the number asserted here. Run in both
+    themes because the tab metrics come out of the stylesheet.
+    """
+    QApplication.instance().setStyleSheet(build_qss(palette))
+    try:
+        qt_app.processEvents()
+        bar = window.title_bar()
+        assert window.document_area().bar().count() == 2
+        assert bar.tab_separator_gap() > 0, "the line is touching a tab"
+    finally:
+        QApplication.instance().setStyleSheet("")
+
+
+def test_the_strip_above_the_line_is_what_drags_the_window(window):
+    """The other half of why he wanted it. A line that says "grab above here"
+    is only worth drawing if above it really does drag the window, so that is
+    checked rather than assumed."""
+    bar = window.title_bar()
+    just_above = QPoint(bar.width() - DRAG_GAP_WIDTH // 2,
+                        bar.separator_rect().top() - 2)
+    assert bar.is_drag_area(just_above)
+    assert bar.hit_test(just_above) == HTCAPTION
