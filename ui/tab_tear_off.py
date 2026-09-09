@@ -33,13 +33,12 @@ THE SHAPE OF ONE GESTURE.
   threshold DETACH_MARGIN px BEYOND the bar VERTICALLY, plus Qt's own
             `startDragDistance`. Sideways travel never counts, which is also
             what Chromium does. Coming back costs only DOCK_MARGIN, and that
-            asymmetry is the hysteresis that stops the state flapping.
+            asymmetry is the hysteresis that stops the state flapping. ONE TAB
+            SKIPS THE VERTICAL PART ENTIRELY: see `_crossed`.
   crossing  grab the mouse and show a picture of the tab. NOTHING MOVES.
-  approach  the tab JOINS the strip it is near, and that strip lights up: an
-            accent wash and outline saying which window, and a line saying
-            where in it. The attach is the behaviour and the paint is how you
-            can tell it happened. See `_show_drop_feedback` for why both are
-            needed and why one of them was briefly not there.
+  approach  the tab JOINS the strip it is near, and a line in that strip says
+            where. The attach is the behaviour and the line is how you can tell
+            it happened. See `_show_drop_feedback`.
   release   `releaseMouse()` FIRST, always. Then, and only then: adopt into the
             window under the cursor, or create a new one.
   escape    nothing to undo, because nothing left.
@@ -55,6 +54,23 @@ second window. Without that you tear the only document out of a window, close
 the window behind it, and end up with the window you started with, having
 thrown away its size and position on the way. The tab menu's Move to New Window
 is disabled at one tab for the same reason.
+
+AND IT STARTS AT ONCE, IN ANY DIRECTION. A row of one tab has no order, so
+there is nothing for a sideways drag on it to reorder and QTabBar sliding it
+around inside its own bar is a gesture with no outcome. Lucas, looking at two
+one-tab windows: "if i grab the tab and move it around i should be moving the
+window aroun, right now the current action is the tab slides. sliding tab is
+correct animation only if in one window it has 2 or more tabs." So the vertical
+overshoot is required only when there is a row to overshoot OUT of, and one tab
+hands the window to the pointer as soon as Qt calls it a drag at all. Edge and
+Chrome both do exactly this.
+
+Merging that window into another one still works, and it is the target's TAB
+STRIP that accepts it rather than the whole of the target window. See
+`_strip_index`: a tab being carried on its own can land anywhere over a window,
+because the thing following the cursor is tab-sized and aimed; a whole window
+following the cursor covers whatever is under it, and "the windows overlapped"
+must never be enough to swallow one into the other.
 """
 
 from __future__ import annotations
@@ -165,7 +181,14 @@ class _DragGhost(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setWindowOpacity(GHOST_OPACITY)
         self._pixmap = pixmap
-        self.resize(pixmap.size() / max(1.0, pixmap.devicePixelRatio()))
+        # The LOGICAL size, which is what `move()` and the grab offset are both
+        # in. A pixmap carrying a device pixel ratio is drawn at its logical
+        # size by `drawPixmap`, so sizing the widget in raw pixels would make
+        # the ghost a scale factor too big on any display above 100% and put
+        # the point the cursor is pinned to somewhere else on the picture.
+        # `tab_pixmap` is what guarantees the ratio is right to divide by.
+        ratio = max(1.0, pixmap.devicePixelRatio())
+        self.resize(round(pixmap.width() / ratio), round(pixmap.height() / ratio))
 
     def paintEvent(self, event):
         QPainter(self).drawPixmap(0, 0, self._pixmap)
@@ -183,6 +206,31 @@ def insertion_index(bar: QTabBar, local: QPoint) -> int:
         return bar.count()
     rect = bar.tabRect(index)
     return index + 1 if local.x() > rect.center().x() else index
+
+
+def tab_pixmap(bar: QTabBar, rect: QRect):
+    """A picture of one tab, with a device pixel ratio that is actually true.
+
+    THE HOTSPOT DEPENDS ON THIS. The cursor is pinned to the point inside the
+    tab that it took hold of, in logical pixels, and the ghost is positioned by
+    subtracting that offset. All of that is only correct while the ghost is the
+    same logical size as the tab it is a picture of.
+
+    `QWidget.grab` is documented to tag the pixmap with the widget's device
+    pixel ratio, and where it does the arithmetic here is a no-op. Where it
+    does not, a 150% display hands back a pixmap half again as large in raw
+    pixels still tagged 1.0, the ghost is built half again too big, and the
+    grab point lands two thirds of the way along a tab the user took hold of in
+    the middle. That is the classic shape of a drag image that will not stay
+    under the pointer on a scaled screen, so the ratio is MEASURED off the
+    pixmap against the rect that was asked for rather than trusted.
+    """
+    pixmap = bar.grab(rect)
+    if rect.width() > 0 and pixmap.width() > 0:
+        ratio = pixmap.width() / rect.width()
+        if abs(ratio - pixmap.devicePixelRatio()) > 1e-3:
+            pixmap.setDevicePixelRatio(ratio)
+    return pixmap
 
 
 def _device_pixel_ratio(global_pos: QPoint, fallback) -> float:
@@ -320,10 +368,24 @@ class TabTearOff:
     def _crossed(self, local: QPoint, global_pos: QPoint) -> bool:
         """Whether this move is a tear rather than a reorder.
 
-        Vertical overshoot only. Dragging the last tab off the right-hand end
-        of the bar is something people do by accident every time they reorder,
-        and turning that into a second window would be unforgivable.
+        Vertical overshoot only, WHILE THERE IS SOMETHING TO REORDER. Dragging
+        the last tab off the right-hand end of the bar is something people do
+        by accident every time they reorder, and turning that into a second
+        window would be unforgivable.
+
+        ONE TAB HAS NO REORDER, so it has nothing to be protected from and the
+        vertical requirement is dropped: any travel past Qt's own drag distance,
+        in any direction, hands the window to the pointer. What the requirement
+        used to buy in that case was a lone tab sliding uselessly inside its own
+        bar for forty pixels before the window would move, and then a window
+        that moved with the cursor sitting forty pixels below the tab it had
+        been grabbed by. See the module docstring.
         """
+        travelled = (global_pos - self._press_global).manhattanLength()
+        if travelled < QApplication.startDragDistance():
+            return False
+        if self._lone_tab():
+            return True
         rect = self._bar.rect()
         if local.y() < rect.top():
             beyond = rect.top() - local.y()
@@ -331,10 +393,14 @@ class TabTearOff:
             beyond = local.y() - rect.bottom()
         else:
             return False
-        if beyond < DETACH_MARGIN:
+        return beyond >= DETACH_MARGIN
+
+    def _lone_tab(self) -> bool:
+        """Whether this bar's window holds exactly one tab."""
+        try:
+            return self._area.count() == 1
+        except (AttributeError, RuntimeError):   # pragma: no cover - defensive
             return False
-        travelled = (global_pos - self._press_global).manhattanLength()
-        return travelled >= QApplication.startDragDistance()
 
     # ------------------------------------------------------------------
     # Starting
@@ -396,12 +462,24 @@ class TabTearOff:
                 # This is the one case the create-on-drop rule does not apply
                 # to, and it is safe for the same reason: no window is created
                 # or destroyed. An existing one is moved.
-                self._offset = global_pos - source.frameGeometry().topLeft()
+                #
+                # MEASURED FROM THE PRESS, NOT FROM HERE. Taking it from the
+                # cursor's position at the crossing pinned the window to
+                # whatever point the cursor had reached by then, which under the
+                # old vertical threshold was forty pixels BELOW the tab bar: the
+                # window then followed the cursor with the tab floating above it
+                # for the rest of the drag. His words: "the tab should stay at
+                # the curors point... when i grab and pull the curor is displaed
+                # beneath the tab." The press position is the point on the tab
+                # the user actually took hold of, so that is the point the
+                # window hangs from.
+                self._offset = (self._press_global
+                                - source.frameGeometry().topLeft())
             else:
                 # The hotspot is where in the tab the cursor took hold, so the
                 # ghost sits under the pointer exactly where the real tab was.
                 self._offset = QPoint(self._grab_in_tab)
-                self._pixmap = bar.grab(bar.tabRect(index))
+                self._pixmap = tab_pixmap(bar, bar.tabRect(index))
                 self._attached_to = source
                 # It starts life attached to the window it came from, so the
                 # first move out of the strip detaches it exactly as a move out
@@ -441,14 +519,12 @@ class TabTearOff:
             # emptying and closing the very window under the pointer.
             if self._source_window is not None:
                 self._source_window.move(self.ghost_position(global_pos))
-            # The lone tab has nothing to attach, so the feedback is the ONLY
-            # thing telling you the window will merge on release rather than
-            # just sit where you dropped it. Its own strip is never lit: the
-            # target is somewhere to go, and the source is where you already
-            # are.
-            self._show_drop_feedback(
-                target if target is not None
-                and target[0] is not self._source_window else None)
+            # The lone tab has nothing to attach, so the line is the ONLY thing
+            # telling you the window will merge on release rather than just sit
+            # where you dropped it. Its own strip never gets one, and that is
+            # `_hit_test`'s doing rather than a second rule here: a window is
+            # not a target for itself.
+            self._show_drop_feedback(target)
             return
 
         if target is not None:
@@ -600,6 +676,32 @@ class TabTearOff:
                 continue
             if not hasattr(window, "document_area"):
                 continue
+            if self._whole_window:
+                # A WHOLE WINDOW IS BEING CARRIED, so the rules above are the
+                # wrong ones and both halves of that matter.
+                #
+                # The source is not a target at all. It is the thing in flight,
+                # it is on top, and the cursor is pinned to a point inside it
+                # for the whole drag, so leaving it in the walk means it answers
+                # every hit test and nothing underneath is ever reachable.
+                #
+                # And a target's dock zone shrinks to its TAB STRIP. The
+                # body-sized zone below is right for a tab: the thing under the
+                # cursor is tab-sized, aimed, and lands where it is put. It is
+                # wrong for a window, because a window covers whatever it is
+                # over, and two windows overlapping is what moving a window
+                # across a desk looks like. Charging that gesture a merge would
+                # make windows impossible to arrange. Edge draws the same line:
+                # drop on the strip to merge, drop anywhere else to just be
+                # there.
+                if window is self._source_window:
+                    continue
+                if not window.frameGeometry().contains(global_pos):
+                    continue
+                index = self._strip_index(window, global_pos)
+                if index is None:
+                    continue
+                return window, index
             if not window.frameGeometry().contains(global_pos):
                 continue
             area = window.document_area()
@@ -621,6 +723,35 @@ class TabTearOff:
             return window, 0
         return None
 
+    def _strip_index(self, window, global_pos: QPoint):
+        """Where a WHOLE WINDOW dropped at `global_pos` merges into `window`.
+
+        The insertion index, or None when this drop is not a merge at all.
+        Only the tab strip accepts one: see `_hit_test` for why the body-sized
+        dock zone is a tab's rule and not a window's.
+
+        A window holding one empty document hides its strip, and it is still a
+        perfectly good thing to merge into, so its own top row stands in. That
+        is the row you would have aimed at if there had been tabs on it.
+        """
+        try:
+            bar = window.document_area().bar()
+            if bar.isVisible():
+                local = bar.mapFromGlobal(global_pos)
+                band = bar.rect().adjusted(0, -DOCK_MARGIN, 0, DOCK_MARGIN)
+                return (insertion_index(bar, local) if band.contains(local)
+                        else None)
+            title_bar = getattr(window, "title_bar", None)
+            if title_bar is None:
+                return None
+            row = title_bar()
+            top_left = row.mapToGlobal(QPoint(0, 0))
+            band = QRect(top_left, row.size()).adjusted(
+                0, -DOCK_MARGIN, 0, DOCK_MARGIN)
+            return 0 if band.contains(global_pos) else None
+        except (AttributeError, RuntimeError):   # pragma: no cover - defensive
+            return None
+
     def _set_target(self, target):
         """Record where a drop would land. Pure state, and the tests read it.
 
@@ -631,25 +762,28 @@ class TabTearOff:
         self._target = target
 
     def _show_drop_feedback(self, target):
-        """Light up the strip the tab is going into, and where in it.
+        """Mark where in the target strip the tab is going. A LINE, AND NOTHING
+        ELSE.
 
-        WHY THIS CAME BACK. It was removed on purpose, and the reason was
-        sound at the time: the tab now JOINS the target strip on approach
-        rather than being promised to it, so the tab being there is itself the
-        answer to "where will this land". The trouble is that nobody can see it
-        happen. A tab quietly appearing among five others, while the eye is on
-        the cursor and a ghost is following it, is a change with nothing to
-        draw attention to it, and the feature was reported as missing by the
-        person who had asked for it and already had it. Feedback that says
-        "this window, here" is not competing with the live attach; it is what
-        makes the live attach legible.
+        THE BOX IS GONE, and that is the change here. This used to wash the
+        whole target strip in the accent and draw a 2px accent outline round it
+        as well, so that "which window is this going into" could be read
+        without hunting for a hairline. On a strip that is barely wider than
+        its tabs, which is what the bar became when it started hugging them,
+        that reads as a heavy amber box drawn around the tab itself. Lucas,
+        with a screenshot of it: "please remove th ehighlighting of the tabs
+        when it going back into another window... if we follow an already
+        pretty advnced UI like edge, no hgihglight exists so lets replciate
+        that."
 
-        THE OTHER HALF OF THE ORIGINAL REASON IS KEPT. Removing the painting
-        also removed a gold box that appeared over a collapsed, empty bar. That
-        is now fixed where it actually lives, in
-        `DocumentTabBar._can_paint_drop_feedback`, which refuses to paint a bar
-        with no tabs in it instead of relying on a width to stand in for the
-        same question. So the artifact does not come back with the feedback.
+        THE LINE STAYS, AND EDGE IS WHY. Edge has no highlight because it does
+        not need one: the tab is already IN the strip, the strip has already
+        reflowed around it, and a slim insertion mark is the only thing it draws
+        on top. This does the same live attach (see `_attach_to_strip`), so the
+        same slim mark is the whole of the feedback here too. Taking the line
+        out as well would leave a tab quietly appearing among five others while
+        the eye is on the cursor, which is how this feedback got reported as
+        missing by the person who had asked for it and already had it.
 
         THE INDEX IS READ AFTER THE ATTACH, NOT BEFORE, and that is why this is
         not folded into `_set_target`. By the time this runs the tab is already
@@ -681,7 +815,6 @@ class TabTearOff:
                 at = window.document_area().index_of(self._view)
                 if at >= 0:
                     index = at
-            bar.set_drop_active(True)
             bar.set_drop_indicator(bar.insertion_x(index))
             self._lit = window
         except (AttributeError, RuntimeError):   # pragma: no cover - defensive
@@ -704,9 +837,7 @@ class TabTearOff:
         if not _usable(window):
             return
         try:
-            bar = window.document_area().bar()
-            bar.set_drop_indicator(None)
-            bar.set_drop_active(False)
+            window.document_area().bar().set_drop_indicator(None)
         except (AttributeError, RuntimeError):   # pragma: no cover - defensive
             pass
 
@@ -740,8 +871,9 @@ class TabTearOff:
         self._release_input()
         # Before the try, not inside it, and it is safe there because it is
         # guarded end to end itself. Anything that throws below leaves the drop
-        # unfinished, which is recoverable; leaving an accent wash painted on a
-        # strip is a mark on the window that nothing would ever take off again.
+        # unfinished, which is recoverable; leaving the insertion line painted
+        # on a strip is a mark on the window that nothing would ever take off
+        # again.
         self._clear_drop_feedback()
         view = self._view
         source = self._source_window

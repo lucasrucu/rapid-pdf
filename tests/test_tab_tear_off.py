@@ -40,11 +40,11 @@ import pytest
 
 from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
 from PySide6.QtGui import QKeyEvent, QMouseEvent
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox, QTabBar
 
 from core.settings import Settings, set_settings
 from ui.main_window import MainWindow
-from ui.tab_tear_off import DETACH_MARGIN, insertion_index
+from ui.tab_tear_off import DETACH_MARGIN, insertion_index, tab_pixmap
 from ui.window_registry import WindowRegistry
 
 
@@ -717,6 +717,207 @@ def test_dropping_into_an_empty_window_replaces_its_placeholder_tab(
     assert empty.document_area().count() == 1
     assert empty.document_area().view_at(0) is moving
     empty.document_area().check_invariant()
+
+
+def test_a_lone_tab_moves_the_window_sideways_with_no_vertical_overshoot(
+        qt_app, store, registry, tmp_path):
+    """THE COMPLAINT, AS AN ASSERTION. Lucas, with two one-tab windows open:
+    "if i grab the tab and move it around i should be moving the window aroun,
+    right now the current action is the tab slides."
+
+    A row of one tab has no order, so a sideways drag on it had nothing to
+    reorder and nothing to do; DETACH_MARGIN then made you pull forty pixels
+    DOWN before the window would move at all. With one tab the vertical
+    requirement is gone and Qt's own drag distance is the whole threshold, in
+    any direction.
+    """
+    window = _window(registry, tmp_path, ["a.pdf"], at=(100, 100))
+    bar = window.document_area().bar()
+    home = window.frameGeometry().topLeft()
+    start = _tab_point(bar, 0)
+
+    _press(bar, start)
+    _move(bar, start + QPoint(QApplication.startDragDistance() + 4, 0))
+    assert bar.tear_off().is_dragging(), "a sideways drag on a lone tab"
+
+    _move(bar, start + QPoint(300, 0))
+    assert window.frameGeometry().topLeft() == home + QPoint(300, 0)
+    # The window moved. The tab did not: it is still the only tab, still at 0.
+    assert window.document_area().count() == 1
+    assert bar.tabAt(bar.tabRect(0).center()) == 0
+
+    _release(bar, start + QPoint(300, 0))
+    assert registry.count() == 1
+    window.document_area().check_invariant()
+
+
+def test_two_tabs_still_reorder_sideways_and_never_move_the_window(
+        qt_app, store, registry, tmp_path):
+    """The other side of the same rule, and the one that must not regress.
+    "sliding tab is correct animation only if in one window it has 2 or more
+    tabs." So with two tabs a sideways drag is still QTabBar's reorder, the
+    gesture never engages, and the window stays where it is."""
+    window = _window(registry, tmp_path, ["a.pdf", "b.pdf"], at=(100, 100))
+    area = window.document_area()
+    bar = area.bar()
+    first, second = area.view_at(0), area.view_at(1)
+    home = window.frameGeometry().topLeft()
+
+    start = _tab_point(bar, 0)
+    _press(bar, start)
+    for dx in (QApplication.startDragDistance() + 4, 120, 400):
+        _move(bar, start + QPoint(dx, 0))
+        assert not bar.tear_off().is_dragging()
+    _release(bar, start + QPoint(400, 0))
+
+    assert window.frameGeometry().topLeft() == home
+    assert registry.count() == 1
+    assert area.count() == 2
+    assert set(area.views()) == {first, second}
+    area.check_invariant()
+
+
+def test_a_lone_tab_hangs_from_the_point_it_was_grabbed_by(
+        qt_app, store, registry, tmp_path):
+    """FIX 2, FOR THE WINDOW CASE. "the tab should stay at the curors point...
+    when i grab and pull the curor is displaed beneath the tab."
+
+    The offset was taken from wherever the cursor had got to when the gesture
+    engaged, which under the old vertical threshold was forty pixels below the
+    tab bar, so the window then followed the cursor with the tab hanging above
+    it for the rest of the drag. It is taken from the PRESS now, so the point
+    of the window under the cursor never changes.
+    """
+    window = _window(registry, tmp_path, ["a.pdf"], at=(400, 300))
+    bar = window.document_area().bar()
+    start = _tab_point(bar, 0, dx=30, dy=8)
+    grab = start - window.frameGeometry().topLeft()
+
+    _press(bar, start)
+    _move(bar, start + QPoint(20, 0))
+    for step in (QPoint(120, 90), QPoint(600, 40), QPoint(-200, 260)):
+        here = start + step
+        _move(bar, here)
+        assert here - window.frameGeometry().topLeft() == grab
+    _release(bar, start + QPoint(-200, 260))
+
+
+def test_the_ghost_hangs_from_the_point_in_the_tab_it_was_grabbed_by(
+        qt_app, store, registry, tmp_path):
+    """FIX 2, FOR THE TAB CASE. The hotspot is the grab offset and nothing
+    else, so the picture stays pinned under the pointer at the spot it was
+    picked up from rather than merely travelling with it."""
+    window = _window(registry, tmp_path, ["a.pdf", "b.pdf"])
+    bar = window.document_area().bar()
+    tear = bar.tear_off()
+    grab = QPoint(37, 9)
+    start = _tab_point(bar, 0, dx=grab.x(), dy=grab.y())
+
+    _press(bar, start)
+    first = _below_bar(bar, start)
+    _move(bar, first)
+    assert tear.ghost() is not None
+    assert first - tear.ghost_position(first) == grab
+
+    moved = first + QPoint(430, 260)
+    _move(bar, moved)
+    assert moved - tear.ghost_position(moved) == grab
+    _release(bar, moved)
+
+
+@pytest.mark.parametrize("ratio", [1.0, 1.5, 2.0])
+def test_the_ghost_is_tab_sized_at_any_device_pixel_ratio(
+        qt_app, store, registry, tmp_path, monkeypatch, ratio):
+    """THE OTHER HALF OF THE HOTSPOT, and the classic cause of a drag image
+    that will not stay under the pointer on a scaled screen.
+
+    The grab offset is in logical pixels, so it only lands on the right part of
+    the ghost while the ghost is the same LOGICAL size as the tab. On a 150%
+    display `QWidget.grab` hands back a pixmap half again as large in raw
+    pixels, and if it comes back tagged 1.0 the ghost is built half again too
+    big and the grab point slides down it. `tab_pixmap` measures the ratio off
+    the pixmap instead of trusting the tag, which is what this drives: the
+    grab is faked at each ratio, untagged, exactly as the bad case looks.
+
+    Offscreen runs everything at 1.0, so the scaling cannot be asked for and
+    has to be handed in.
+    """
+    window = _window(registry, tmp_path, ["a.pdf", "b.pdf"])
+    bar = window.document_area().bar()
+    tear = bar.tear_off()
+    rect = bar.tabRect(0)
+    real = QTabBar.grab
+
+    def scaled(self, *args, **kwargs):
+        pixmap = real(self, *args, **kwargs)
+        if not args or pixmap.isNull():
+            return pixmap
+        # As an untagged grab on a scaled screen arrives: raw device pixels,
+        # still claiming a ratio of 1.0.
+        return pixmap.scaled(round(pixmap.width() * ratio),
+                             round(pixmap.height() * ratio))
+
+    monkeypatch.setattr(QTabBar, "grab", scaled)
+    pixmap = tab_pixmap(bar, rect)
+    assert abs(pixmap.devicePixelRatio() - ratio) < 1e-3
+    assert round(pixmap.width() / pixmap.devicePixelRatio()) == rect.width()
+
+    grab = QPoint(25, 7)
+    start = _tab_point(bar, 0, dx=grab.x(), dy=grab.y())
+    _press(bar, start)
+    here = _below_bar(bar, start)
+    _move(bar, here)
+    ghost = tear.ghost()
+    assert ghost is not None
+    assert ghost.size() == rect.size()
+    assert here - tear.ghost_position(here) == grab
+    _release(bar, here)
+
+
+def test_a_lone_tab_over_another_window_s_body_does_not_merge(
+        qt_app, store, registry, tmp_path):
+    """THE JUDGEMENT CALL. A tab being carried can land anywhere over a window,
+    because the thing under the cursor is tab-sized and aimed. A whole WINDOW
+    cannot: it covers what it is over, and two windows overlapping is what
+    moving a window across a desk looks like. Charging that a merge would make
+    windows impossible to arrange, so for the lone-tab drag the target's TAB
+    STRIP is the only thing that accepts a drop. That is Edge's line too.
+    """
+    source = _window(registry, tmp_path, ["a.pdf"], at=(100, 100))
+    other = _window(registry, tmp_path, ["x.pdf", "y.pdf"], at=(2000, 100))
+    bar = source.document_area().bar()
+
+    start = _tab_point(bar, 0)
+    _press(bar, start)
+    _move(bar, start + QPoint(40, 0))
+    # Well down inside the other window, nowhere near its strip.
+    body = other.mapToGlobal(QPoint(other.width() // 2, other.height() // 2))
+    _move(bar, body)
+    assert bar.tear_off().drop_target() is None
+    _release(bar, body)
+
+    qt_app.processEvents()
+    assert registry.count() == 2
+    assert source.document_area().count() == 1
+    assert other.document_area().count() == 2
+
+
+def test_a_lone_tab_never_treats_its_own_window_as_a_target(
+        qt_app, store, registry, tmp_path):
+    """It is the thing in flight, it is on top, and the cursor is pinned inside
+    it for the whole drag, so leaving it in the walk would have it answer every
+    hit test and nothing underneath would ever be reachable. That is what the
+    merge below depends on."""
+    window = _window(registry, tmp_path, ["a.pdf"], at=(100, 100))
+    bar = window.document_area().bar()
+    start = _tab_point(bar, 0)
+
+    _press(bar, start)
+    _move(bar, start + QPoint(60, 0))
+    assert bar.tear_off().is_dragging()
+    # The cursor is still on this window's own tab, and it is not a target.
+    assert bar.tear_off().drop_target() is None
+    _release(bar, start + QPoint(60, 0))
 
 
 # ======================================================================
