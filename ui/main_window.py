@@ -146,6 +146,7 @@ from ui.split_dialog import SplitDialog
 from ui.theme import ThemeManager, apply_mica, themed_icon, qtawesome_available, LIGHT
 from ui.undo import WindowUndoStack
 from ui.window_registry import WindowRegistry, same_file
+from ui.worker import shutdown_tasks
 
 
 class MainWindow(QMainWindow):
@@ -1486,6 +1487,14 @@ class MainWindow(QMainWindow):
         if view is None or not view.has_document():
             QMessageBox.warning(self, "No PDF", "Open a PDF first.")
             return
+        # SPLIT STAYS ON THE GUI THREAD, and the rule in ui/worker.py says
+        # why: `PDFDocument.run_split` reads the LIVE document, page by page,
+        # into each new file, while the canvas and the thumbnail panel are
+        # rendering from that same document. A worker may only touch a document
+        # no other thread can reach, and this one is reachable. Making it
+        # asynchronous means splitting from a detached copy, which is a change
+        # inside core/pdf_document.py and a busy state inside ui/split_dialog.py,
+        # neither of which this change owns.
         dlg = SplitDialog(view.document(),
                           selected_pages=view.selected_page_rows(),
                           parent=self)
@@ -1817,6 +1826,12 @@ class MainWindow(QMainWindow):
         # A check thread still running when the window goes is a crash on
         # exit. Bounded wait, see UpdateNotice.shutdown().
         self._update_notice.shutdown()
+        # And the same rule for the background work started since: no worker
+        # outlives its window. Each view has already stopped its own search
+        # thread; this catches anything owned by the WINDOW, which is where a
+        # threaded open's task sits because the progress dialog is the
+        # window's. Cancel and join, never terminate. See ui/worker.py.
+        shutdown_tasks(self)
         settings().flush()   # writes are debounced; the timer may never fire
 
     def _confirm_closing_several_tabs(self, count: int) -> bool:

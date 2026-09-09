@@ -84,7 +84,8 @@ way to remove a page ever turns up, it goes through those two methods too.
 import os
 import uuid
 
-from PySide6.QtCore import QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QHBoxLayout, QMessageBox, QTabWidget, QVBoxLayout,
     QWidget,
@@ -106,10 +107,26 @@ from ui.page_panel import PagePanel
 from ui.search_bar import SearchBar
 from ui.theme import ThemeManager
 from ui.toolbar import ToolBar
+from ui.worker import (
+    DocumentSearcher, report_task_error, run_blocking_with_progress,
+    shutdown_tasks,
+)
 
 # Debounce for search-as-you-type: long enough that fast typing doesn't
 # re-scan the document per keystroke, short enough to feel live.
 SEARCH_DEBOUNCE_MS = 220
+
+#: Files at or above this go through the threaded open; anything smaller is
+#: read inline, exactly as it always was.
+#:
+#: A THRESHOLD RATHER THAN ALWAYS, and it is not timidity. Starting a thread,
+#: raising a window-modal dialog and spinning a local event loop costs more
+#: than parsing a 200 KB certificate, so below the line the threaded path would
+#: make opening SLOWER while adding a flash of dialog to every double click.
+#: The freeze this is here to remove belongs to the A1 drawings and the
+#: 500-page packs, and to a file MuPDF decides to repair, which is where the
+#: size is. Tests that want the threaded path lower this.
+OPEN_ASYNC_MIN_BYTES = 4 * 1024 * 1024
 
 
 def _transfer_note(warnings: dict) -> str:
@@ -131,6 +148,39 @@ def _transfer_note(warnings: dict) -> str:
     if widgets:
         parts.append(f"{widgets} form field{'s' if widgets > 1 else ''} may be renamed")
     return f"  ({', '.join(parts)})" if parts else ""
+
+
+def _read_pdf(path: str):
+    """Build the callable the open worker runs. Module level, and it closes
+    over nothing but the path, so there is no object in it the GUI thread also
+    holds. See ui/worker.py for why that is the whole rule.
+
+    Returns the fitz handle, or None for every case the core should answer:
+    a locked file (which needs the prompt and the retry counters
+    `PDFDocument.open` owns), a damaged one, a missing one. Only a clean open
+    comes back from here, because only a clean open is worth having done twice.
+    """
+    def _open(ctx):
+        import fitz
+
+        ctx.raise_if_cancelled()
+        try:
+            handle = fitz.open(path)
+        except Exception:
+            return None
+        if getattr(handle, "needs_pass", False):
+            _close_pdf_handle(handle)
+            return None
+        return handle
+    return _open
+
+
+def _close_pdf_handle(handle):
+    """Let go of a fitz document nobody wants, without caring why."""
+    try:
+        handle.close()
+    except Exception:
+        pass
 
 
 class DocumentView(QWidget):
@@ -237,6 +287,23 @@ class DocumentView(QWidget):
         self._search_timer.setSingleShot(True)
         self._search_timer.setInterval(SEARCH_DEBOUNCE_MS)
         self._search_timer.timeout.connect(self._run_live_search)
+        # The search thread and its private copy of the document. Built the
+        # first time the find bar is opened, never before: a window of eight
+        # restored tabs would otherwise start eight threads for a search
+        # nobody has asked for. See ui/worker.py.
+        self._searcher = None
+        # Bumped whenever the live document changes, so the search thread knows
+        # the copy it is holding is stale. Any value that changes will do.
+        self._search_source_token = 0
+        self._search_source_sent = None   # the token the searcher was last told
+        # A Next/Previous that arrived while the search was still running, to
+        # be applied to the hits when they land.
+        self._search_pending_step = None
+        # True while a threaded open is inside its local event loop, which is
+        # the one window in which this view can be asked to open a second file.
+        self._opening = False
+        # The last open ended at the Cancel button rather than at an error.
+        self._open_cancelled = False
         self._setup_ui()
 
     # ------------------------------------------------------------------
@@ -629,7 +696,19 @@ class DocumentView(QWidget):
         self._refresh_panel_thumbnails(current_page=self._current_page)
 
     def teardown(self):
-        """Release everything this view owns, on the way out for good."""
+        """Release everything this view owns, on the way out for good.
+
+        THE THREADS GO FIRST, and the order is the point. `self._doc.close()`
+        frees a fitz document; a search thread part way through a page of the
+        copy it made would not care, but a threaded open still holding a handle
+        would, and neither may be left running into a widget that is going
+        away. Both are stopped and JOINED here, so nothing this view started
+        outlives it. See ui/worker.py.
+        """
+        if self._searcher is not None:
+            self._searcher.shutdown()
+            self._searcher = None
+        shutdown_tasks(self)
         self._pending_path = None
         self._pending_view = {}
         self._close_org_render()
@@ -665,7 +744,11 @@ class DocumentView(QWidget):
         """
         if self._doc.doc:
             return False
-        if not self._doc.open(path):
+        if not self._load_document(path):
+            if self._open_cancelled:
+                # The user cancelled the read. Nothing to say and nothing to
+                # clean up: the tab is empty, which is where it started.
+                return False
             if self._doc.needs_password():
                 # The prompt owns every word the user sees for a locked file:
                 # a cancel is silent, and an exhausted retry has already
@@ -686,6 +769,7 @@ class DocumentView(QWidget):
         self._search_hits = []
         self._search_index = -1
         self._search_term = None
+        self._invalidate_search_source()
         # A freshly opened file may carry an editable model to restore.
         self._load_saved_annotations()
         # Always rebuild the panel thumbnails from a markup-baked clone after open.
@@ -696,6 +780,81 @@ class DocumentView(QWidget):
         self._apply_default_fit()
         self._update_status()
         return True
+
+    # ------------------------------------------------------------------
+    # Reading the file, off the GUI thread when it is worth it
+    # ------------------------------------------------------------------
+
+    def _load_document(self, path: str) -> bool:
+        """Get `path` into `self._doc`. Same answer as `PDFDocument.open`.
+
+        WHAT MAKES THIS SAFE TO THREAD, when saving is not. The view is empty
+        when this runs (`open_path` refuses otherwise), so the handle the
+        worker builds is not reachable from the GUI thread until the worker has
+        finished with it and the queued result lands. That is the module rule
+        in ui/worker.py: a worker may only touch a document no other thread can
+        reach. Handing the finished handle over afterwards is fine; two threads
+        in it at once would not be.
+
+        EVERY PATH THAT IS NOT A CLEAN OPEN FALLS BACK TO THE CORE. A locked
+        file, a broken file, an unreadable one: `PDFDocument.open` owns the
+        error text, the locked-handle bookkeeping and the retry counters, and
+        none of that is worth a second copy out here. By the time the fallback
+        runs, MuPDF has already parsed the file once on the worker and the OS
+        cache is warm, so the second read costs almost nothing.
+
+        `adopt` plus the path is exactly a successful `open`: it closes what was
+        there, discards any locked handle, drops the render cache and the scale
+        decision, clears `_structure_changed` and resets the authentication, and
+        the two lines after it put back the only two things `adopt` means to
+        leave off, since this document does have a file behind it.
+        """
+        self._open_cancelled = False
+        if self._opening or not self._should_thread_open(path):
+            return self._doc.open(path)
+
+        self._opening = True
+        try:
+            status, handle, message, details = run_blocking_with_progress(
+                self.window(), _read_pdf(path), "Opening",
+                f"Opening {os.path.basename(path)}…",
+                name="open-pdf", dispose=_close_pdf_handle)
+        finally:
+            self._opening = False
+
+        if status == "ok" and handle is not None:
+            self._doc.adopt(handle)
+            self._doc.path = path
+            self._doc.last_open_error = None
+            return True
+        if status == "failed":
+            # The worker blew up somewhere the core would have reported
+            # cleanly. Say so, with the traceback, rather than letting it
+            # vanish into a build that has no console.
+            report_task_error(self.window(), "Open Error",
+                              f"Could not open:\n{path}\n\n{message}", details)
+            self._doc.last_open_error = f"Could not open the PDF:\n{message}"
+            return False
+        if status == "cancelled":
+            # The user said no. `open_path` reads this and stays quiet, because
+            # a box saying "you cancelled" is the same news twice. The handle,
+            # if the worker got one anyway, is closed by `dispose` when the
+            # thread lands.
+            self._open_cancelled = True
+            self._doc.last_open_error = None
+            return False
+        # A clean run that came back with nothing: locked, damaged or gone.
+        # The core decides which, and says it in its own words. It re-reads a
+        # file MuPDF has just been through, so this costs next to nothing.
+        return self._doc.open(path)
+
+    def _should_thread_open(self, path: str) -> bool:
+        """Whether this file is big enough that a thread pays for itself."""
+        try:
+            return os.path.getsize(path) >= OPEN_ASYNC_MIN_BYTES
+        except OSError:
+            # It is not there, or not readable. Let the core say so.
+            return False
 
     def stage_path(self, path: str, page: int = 0, zoom: float = 0.0,
                    fit_mode: str | None = None,
@@ -813,6 +972,7 @@ class DocumentView(QWidget):
         self._search_hits = []
         self._search_index = -1
         self._search_term = None
+        self._invalidate_search_source()
         self._mark_dirty()
         self._refresh_panel_thumbnails()
         self._apply_default_fit()
@@ -904,6 +1064,7 @@ class DocumentView(QWidget):
         # doc open this empties the grid and disables its buttons.
         self._organizer.set_document(self._doc, None)
         self._current_page = 0
+        self._invalidate_search_source()
         self._update_status()
 
     def _after_successful_save(self, status: str):
@@ -921,6 +1082,9 @@ class DocumentView(QWidget):
         self._forced_dirty = False
         self._saved_rev = self._rev
         self._dirty = False
+        # The file on disk is the document again, so the search thread can go
+        # back to reading it rather than a serialised copy.
+        self._invalidate_search_source()
         self._doc.clear_transfer_ledger()
         self._strip_baked_annotations()
         self._canvas.drop_baked_image_items()  # avoid re-baking images on the next save
@@ -930,14 +1094,63 @@ class DocumentView(QWidget):
         self._page_panel.set_current_page(self._current_page)
         self._update_status(status)
 
+    # SAVE IS THE ONE THAT STAYED ON THE GUI THREAD, AND IT IS NOT AN OVERSIGHT.
+    #
+    # The rule in ui/worker.py is that a worker may only touch a document no
+    # other thread can reach, and a save cannot be made to satisfy it:
+    #
+    #   - A SIGNED OR ENCRYPTED IN-PLACE SAVE writes INCREMENTALLY THROUGH THE
+    #     LIVE HANDLE (see PDFDocument.save_plan). That handle is the one the
+    #     canvas and the thumbnail panel render from, continuously. Writing
+    #     through it from a worker while the GUI thread reads it is exactly the
+    #     two-threads-one-document case that produces an access violation
+    #     rather than an exception. There is no version of this that is safe
+    #     off-thread, and there is no copy to make instead: an incremental
+    #     write is defined against the file it was opened from.
+    #   - A PLAIN REWRITE reads the live document too. It could be done on a
+    #     private copy, but the copy costs a `tobytes` of the whole document on
+    #     THIS thread, which is most of what a save spends. That would move the
+    #     disk write off the GUI thread and leave the serialisation on it: a
+    #     lot of new machinery, a fork in the one code path that must never
+    #     write the wrong bytes, and almost none of the freeze removed.
+    #
+    # So it stays here, with a wait cursor, and the honest answer is in the
+    # report: making this genuinely asynchronous needs a split inside
+    # core/pdf_document.py between "serialise this document" and "write these
+    # bytes there", which is not this change's to make.
+
+    def _begin_saving(self):
+        """Wait cursor and a status line for the length of the write.
+
+        AND NOTHING PUMPS THE EVENT LOOP HERE, which is the interesting part.
+        The obvious way to make a busy cursor visible during synchronous work
+        is a `processEvents` to force the repaint. Measured, that crashes: the
+        Organizer and the page panel rasterise from a queued zero timer against
+        a markup-baked clone, and pumping the loop mid-save runs those against a
+        document the save is part way through replacing. It is known bug 6 in
+        this file's docstring, from the other end. `setOverrideCursor` reaches
+        the platform cursor on its own, so the cursor changes without any of
+        that, and the status line catches up when the save returns.
+        """
+        self.status_message.emit("Saving…")
+        QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
+
+    def _end_saving(self):
+        QApplication.restoreOverrideCursor()
+
     def save_pdf(self) -> bool:
         if not self._doc.doc:
             return False
         # A merged/untitled doc has no source file → force a destination via Save As.
         if self._doc.path is None:
             return self.save_pdf_as()
-        self._flush_annotations()
-        if self._doc.save():
+        self._begin_saving()
+        try:
+            self._flush_annotations()
+            written = self._doc.save()
+        finally:
+            self._end_saving()
+        if written:
             self._after_successful_save("Saved")
             return True
         self._report_failed_save()
@@ -952,8 +1165,14 @@ class DocumentView(QWidget):
         if not path:
             return False
         remember_dialog_dir(path)
-        self._flush_annotations()
-        if self._doc.save(path):  # save() adopts `path` as the new canonical path
+        self._begin_saving()
+        try:
+            self._flush_annotations()
+            # save() adopts `path` as the new canonical path
+            written = self._doc.save(path)
+        finally:
+            self._end_saving()
+        if written:
             self._after_successful_save(f"Saved to {path}")
             return True
         self._report_failed_save()
@@ -1007,6 +1226,7 @@ class DocumentView(QWidget):
         # cached render is stale and the panel/current page must be redrawn
         # from the new (now-searchable) page content.
         self._doc.invalidate_render_cache()
+        self._invalidate_search_source()
         self._canvas.reload_current_page()
         self._refresh_panel_thumbnails()
         self._page_panel.set_current_page(self._current_page)
@@ -1073,6 +1293,97 @@ class DocumentView(QWidget):
         self._tabs.setCurrentIndex(0)   # search lives in the Editor view
         self._search_bar.open_and_focus()
 
+    # THE SEARCH RUNS ON ITS OWN THREAD, OVER ITS OWN COPY OF THE DOCUMENT.
+    #
+    # It used to run `PDFDocument.search_text` on the GUI thread, across the
+    # whole document, on a 220 ms debounce, with no way to stop it. On a
+    # 500-page pack every keystroke froze the window for the length of a full
+    # scan, and the scan could not be abandoned when the next character
+    # arrived, so a fast typist queued up one full scan per letter.
+    #
+    # `DocumentSearcher` (ui/worker.py) fixes both halves. The scan is off the
+    # GUI thread, so the window keeps drawing and the caret keeps up. And a
+    # newer query SUPERSEDES an older one rather than queueing behind it: the
+    # worker checks the generation counter between pages and drops out, and a
+    # result that was already in flight when the newer query arrived is thrown
+    # away when it lands instead of being painted over the newer one.
+    #
+    # THE COPY IS THE PART THAT HAS TO BE RIGHT. PyMuPDF documents are not
+    # thread safe, and the GUI thread renders this one continuously, so the
+    # search thread is given its own: the file itself when the document on disk
+    # is what is being searched, and bytes serialised here when it is not.
+    # `_search_source_token` is what tells the worker its copy has gone stale.
+
+    def _ensure_searcher(self):
+        """The search thread for this view, built the first time it is wanted."""
+        if self._searcher is None:
+            self._searcher = DocumentSearcher(owner=self)
+            self._searcher.progressed.connect(self._on_search_progress)
+            self._searcher.results_ready.connect(self._on_search_results)
+            self._searcher.failed.connect(self._on_search_failed)
+            self._search_source_sent = None
+        self._refresh_search_source()
+        return self._searcher
+
+    def _refresh_search_source(self):
+        """Point the search thread at a private copy of the current document.
+
+        The file itself whenever it can be: a document that is clean, has a
+        path, is not encrypted and is still on disk reads identically from
+        disk, and describing it costs nothing at all. Otherwise the bytes,
+        serialised here on the GUI thread, which is the same trade
+        core/ocr_worker.py makes and for the same reason.
+
+        Done once per source token rather than once per query, because a
+        `tobytes` of a 500-page pack is exactly the freeze this is removing.
+        """
+        searcher = self._searcher
+        if searcher is None:
+            return
+        token = self._search_source_token
+        if token == self._search_source_sent:
+            return
+        if not self._doc.doc:
+            searcher.clear_source()
+            self._search_source_sent = token
+            return
+        path = self._doc.path
+        if (path and not self.is_dirty() and os.path.isfile(path)
+                and not self._doc.is_encrypted()):
+            searcher.set_source("path", path, token)
+        else:
+            searcher.set_source("bytes", self._doc.doc.tobytes(), token)
+        self._search_source_sent = token
+
+    def _invalidate_search_source(self):
+        """The document changed, so the search thread's copy is stale.
+
+        Called from every place that swaps or edits the live document. Bumping
+        the token is enough: the copy is rebuilt on the next search rather than
+        now, so an edit does not pay for a search nobody has asked for.
+        """
+        self._search_source_token += 1
+        if self._searcher is not None:
+            self._searcher.cancel()
+            self._search_pending_step = None
+
+    def _cancel_search(self):
+        """Stop whatever is in flight. Nothing more is delivered for it."""
+        self._search_pending_step = None
+        if self._searcher is not None:
+            self._searcher.cancel()
+
+    def _start_search(self, term: str, step=None):
+        """Ask for `term`, superseding anything already running.
+
+        `step` is a Next or Previous that arrived before there were any hits to
+        step through; it is applied when the results land.
+        """
+        searcher = self._ensure_searcher()
+        self._search_pending_step = step
+        self._search_bar.set_count_text("Searching…")
+        searcher.search(term)
+
     def _on_search_term_changed(self, term: str):
         # Invalidate cached hits on every edit. Search-as-you-type kicks in
         # from the SECOND character (debounced); a single character would
@@ -1083,6 +1394,7 @@ class DocumentView(QWidget):
             self._search_timer.start()   # restart: debounce while typing
             return
         self._search_timer.stop()
+        self._cancel_search()
         self._search_hits = []
         self._search_index = -1
         self._search_bar.set_count_text("")
@@ -1096,21 +1408,47 @@ class DocumentView(QWidget):
         term = self._search_bar.term().strip()
         if len(term) < 2 or term == self._search_term:
             return
-        self._compute_hits(term)
-        if not self._search_hits:
-            return
-        start = next((i for i, (pn, _) in enumerate(self._search_hits)
-                      if pn >= self._current_page), 0)
-        self._search_index = start
-        self._goto_current_hit()
+        self._start_search(term)
 
-    def _compute_hits(self, term: str):
-        self._search_hits = self._doc.search_text(term)
+    def _on_search_progress(self, done: int, total: int):
+        """The busy state, and it is a real one: the window is still live.
+
+        Only shown for a document big enough that the scan is visible at all.
+        """
+        if not self._search_bar.isVisible() or total <= 1:
+            return
+        self._search_bar.set_count_text(f"Searching… page {done + 1} of {total}")
+
+    def _on_search_results(self, term: str, hits: list):
+        """Hits from the search thread, already checked as not stale."""
+        self._search_hits = hits
         self._search_term = term
         self._search_index = -1
-        if not self._search_hits:
+        step = self._search_pending_step
+        self._search_pending_step = None
+        if not self._search_bar.isVisible():
+            return
+        if not hits:
             self._search_bar.set_count_text("No matches")
             self._canvas.clear_search_hits()
+            return
+        n = len(hits)
+        # Land on the first hit at or after the current page, which is the rule
+        # a live search and an Enter have always shared.
+        start = next((i for i, (pn, _) in enumerate(hits)
+                      if pn >= self._current_page), 0)
+        self._search_index = start if (step is None or step >= 0) \
+            else (start - 1) % n
+        self._goto_current_hit()
+
+    def _on_search_failed(self, message: str, details: str):
+        """A search that blew up says so. It used to `print` into a windowed
+        build with no console, which is the same as saying nothing."""
+        self._search_pending_step = None
+        self._search_bar.set_count_text("Search failed")
+        report_task_error(self.window(), "Search Error",
+                          f"The search could not be finished.\n\n{message}",
+                          details)
 
     def _search_step(self, delta: int):
         if not self._doc.doc:
@@ -1120,7 +1458,10 @@ class DocumentView(QWidget):
             return
         self._search_timer.stop()   # Enter beats a pending live search
         if term != self._search_term:
-            self._compute_hits(term)
+            # No hits for this term yet. Ask for them, and remember which way
+            # the user wanted to go when they arrive.
+            self._start_search(term, step=delta)
+            return
         if not self._search_hits:
             return
         n = len(self._search_hits)
@@ -1164,6 +1505,7 @@ class DocumentView(QWidget):
 
     def _on_search_closed(self):
         self._search_timer.stop()
+        self._cancel_search()
         self._search_hits = []
         self._search_index = -1
         self._search_term = None
@@ -1319,6 +1661,7 @@ class DocumentView(QWidget):
         # its redo and its undo, so undoing back to the saved state has to be
         # able to land clean again.
         self._sync_dirty()
+        self._invalidate_search_source()
         self._current_page = self._canvas.current_page()
         select = self._pending_page_selection
         self._pending_page_selection = None
@@ -1626,6 +1969,10 @@ class DocumentView(QWidget):
         """
         self._forced_dirty = True
         self._sync_dirty()
+        # Content changed outside the undo stack, so the search thread's copy
+        # is stale. Cheap: this bumps a counter, and the copy is only rebuilt
+        # when somebody actually searches again.
+        self._invalidate_search_source()
 
     def _mark_untitled(self):
         """A merge produced a derived document with no source file → force Save As."""
