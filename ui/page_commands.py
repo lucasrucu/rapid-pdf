@@ -1,4 +1,4 @@
-"""Undoable page-structure edits (delete, reorder), for BOTH page panels.
+"""Undoable page-structure edits (delete, reorder, rotate), for BOTH page panels.
 
 The canvas already owns a QUndoStack for item-level edits (draw, move, resize,
 restyle). Page delete and reorder used to CLEAR that stack, because the canvas
@@ -25,11 +25,42 @@ PDFDocument.extract_pages) until the command itself is dropped, which is what
 undo reinserts.
 """
 
+from PySide6.QtCore import QLineF, QPointF, QRectF
 from PySide6.QtGui import QUndoCommand
 
 from core.page_ops import (
-    invert_order, page_after_delete, shift_map_after_delete,
-    shift_map_after_insert, shift_map_after_reorder,
+    ROTATE_180, ROTATE_CCW, ROTATE_CW, invert_order, normalize_rotation,
+    page_after_delete, rotate_point, rotate_rect, rotate_rect_upright,
+    rotation_after, shift_map_after_delete, shift_map_after_insert,
+    shift_map_after_reorder,
+)
+from ui.canvas import (
+    ImageAnnotationItem, LineAnnotationItem, TextAnnotationItem,
+    geometry_restore, geometry_snapshot,
+)
+
+# THE ROTATE MENU, DEFINED ONCE. Both page panels build their entries from
+# this, so the strip's right-click menu and the Organizer's cannot drift apart
+# in wording, order or direction. The tab in a label is Qt's separator for the
+# right-hand shortcut column in a QMenu.
+ROTATE_ACTIONS = (
+    ("Rotate Right 90°\tCtrl+R", ROTATE_CW),
+    ("Rotate Left 90°\tCtrl+Shift+R", ROTATE_CCW),
+    ("Rotate 180°", ROTATE_180),
+)
+
+# THE KEYS, AND WHY THESE TWO. Ctrl+R and Ctrl+Shift+R were both free: the
+# whole bound set is Ctrl+O/S/W/T/Q/G/B/D/F/C/V/A/Z/Y, Ctrl+[ and Ctrl+],
+# Ctrl+comma, Ctrl+PgUp/PgDn, Ctrl+Tab, the Organizer's Ctrl+plus/minus/0, the
+# Shift pairs Ctrl+Shift+N/S/T/Tab, Alt+Space, and the five bare tool letters
+# v h r l t. Ctrl+R is what Preview and every scan tool use for "turn it
+# right", and the bare `r` that picks the Rectangle tool is a different
+# sequence, so the two do not collide. There is deliberately no key for 180:
+# it is Ctrl+R twice, and the free combinations left for it (Ctrl+Alt+R) are
+# AltGr on the international layouts this app ships to.
+ROTATE_SHORTCUTS = (
+    ("Ctrl+R", ROTATE_CW),
+    ("Ctrl+Shift+R", ROTATE_CCW),
 )
 
 
@@ -291,3 +322,182 @@ class ReorderPagesCommand(_PageCommand):
     def _revert(self):
         self._doc.reorder(self._inverse)
         self._canvas.restore_page_annotations(self._before_map, self._before_page)
+
+
+# ---------------------------------------------------------------------------
+# Rotation
+# ---------------------------------------------------------------------------
+
+def _rotate_item(item, delta: int, width: float, height: float):
+    """Move one canvas item to where the page turning under it puts its content.
+
+    `width` and `height` are the page's SCENE box before the turn, which is the
+    visible page in points times the document's frozen render scale, because
+    that is the space every annotation item is stored in (see
+    PDFDocument.render_scale).
+
+    Three behaviours, and the split is about what the item is, not what it is
+    called. A highlight or a box or a line is a SHAPE over the content, so it
+    turns with the content: a highlight along a line of text has to come out
+    running down the page. A text label and a pasted image carry their own
+    upright content and neither can draw itself rotated, so they travel by
+    their centre and keep the size and orientation they had.
+    """
+    if isinstance(item, LineAnnotationItem):
+        line = item.line()
+        p1 = item.mapToScene(line.p1())
+        p2 = item.mapToScene(line.p2())
+        ax, ay = rotate_point(p1.x(), p1.y(), delta, width, height)
+        bx, by = rotate_point(p2.x(), p2.y(), delta, width, height)
+        item.setPos(QPointF(0.0, 0.0))
+        item.setLine(QLineF(QPointF(ax, ay), QPointF(bx, by)))
+    elif isinstance(item, TextAnnotationItem):
+        box = item.scene_text_rect()
+        x0, y0, _, _ = rotate_rect_upright(
+            (box.left(), box.top(), box.right(), box.bottom()),
+            delta, width, height)
+        item.setPos(QPointF(x0, y0))
+    else:
+        box = item.scene_rect()
+        turn = (rotate_rect_upright if isinstance(item, ImageAnnotationItem)
+                else rotate_rect)
+        x0, y0, x1, y1 = turn(
+            (box.left(), box.top(), box.right(), box.bottom()),
+            delta, width, height)
+        # Pos back to the origin so the item's own rect IS its scene rect. The
+        # two together are what geometry_snapshot captured, so an undo puts the
+        # pair back and nothing is left leaning on the split.
+        item.setPos(QPointF(0.0, 0.0))
+        item.setRect(QRectF(x0, y0, x1 - x0, y1 - y0))
+    item.update()
+
+
+class RotatePagesCommand(_PageCommand):
+    """Turn a selection of pages by a quarter or a half, reversibly.
+
+    THE EASY HALF is the document. A page's orientation is one number, /Rotate,
+    and PyMuPDF's `set_rotation` writes it. Nothing else in the file moves:
+    measured on 1.27.2.3, an annotation's `rect` and `vertices` come back
+    IDENTICAL after a rotation, because annotation geometry is stored in the
+    page's own unrotated user space and the viewer composes /Rotate on top when
+    it draws. Render the page before and after and the second image is the
+    first one turned, markup and all. So annotations already IN the file need
+    no repair, and that is proved rather than asserted: see
+    tests/test_page_rotation.py, which round-trips a highlight through a save
+    and a plain PyMuPDF reopen and checks it still covers the same content.
+
+    THE HARD HALF is the markup that is not in the file yet. Canvas items live
+    in rendered-pixel space (visible page points times the document's frozen
+    render scale), and "visible" is exactly the thing /Rotate changes. Left
+    alone they would keep their old coordinates while the page turned under
+    them, so a highlight would slide off the line it was drawn on. They are
+    moved here, from the page's box as it stood BEFORE the turn, so a page that
+    arrived already rotated turns from where it is rather than from zero.
+
+    The stored coordinates are not converted, only re-expressed: the save path
+    derotates visible space back to user space through the page's own matrix
+    (PDFDocument.write_annotations), so a mark that is moved by the turn and
+    then derotated by the new rotation lands on exactly the user-space rect it
+    would have had if the page had never been turned.
+    """
+
+    _NAMES = {90: "right", 180: "180°", 270: "left"}
+
+    def __init__(self, window, rows: list, delta):
+        self._delta = normalize_rotation(delta)
+        self._rows = sorted({int(r) for r in rows
+                             if 0 <= int(r) < window._doc.page_count()})
+        count = len(self._rows)
+        noun = "page" if count == 1 else f"{count} pages"
+        super().__init__(window, f"Rotate {noun}")
+        doc = self._doc
+        canvas = self._canvas
+        self._before = {row: normalize_rotation(doc.doc[row].rotation)
+                        for row in self._rows}
+        self._after = {row: rotation_after(self._before[row], self._delta)
+                       for row in self._rows}
+        # The page-to-markup map does NOT change: rotation renumbers nothing.
+        # It is snapshotted anyway because restore_page_annotations is the one
+        # call that re-seats every item and re-renders the page, which is what
+        # makes the turn show up in the editor.
+        self._map = canvas.snapshot_page_annotations()
+        self._page = canvas.current_page()
+        # Scene box per page, BEFORE the turn, and the geometry to put back.
+        scale = doc.render_scale()
+        self._scene_box = {}
+        self._geometry = []
+        for row in self._rows:
+            w_pt, h_pt = doc.get_page_size(row)
+            self._scene_box[row] = (w_pt * scale, h_pt * scale)
+            for item in self._map.get(row, []):
+                self._geometry.append((row, item, geometry_snapshot(item)))
+
+    def rows(self) -> list:
+        return list(self._rows)
+
+    def delta(self) -> int:
+        return self._delta
+
+    def direction(self) -> str:
+        """"right", "left" or "180", for the status line."""
+        return self._NAMES.get(self._delta, "")
+
+    def _set_rotations(self, rotations: dict):
+        doc = self._doc
+        if not doc.doc:
+            return
+        for row, degrees in rotations.items():
+            if 0 <= row < doc.page_count():
+                doc.doc[row].set_rotation(degrees)
+                # The page is drawn differently now, so every cached zoom level
+                # of it is stale. Rotation is the one page edit that changes
+                # what a render looks like without touching page indices, so
+                # the whole-cache drop the other commands use would be waste.
+                doc.invalidate_render_page(row)
+        # A signed document's signature covers the pages as they were, and a
+        # turned page is not the page it signed. Same flag the delete and the
+        # reorder raise, so save_plan warns before it writes.
+        doc._note_structure_change()
+
+    def _apply(self):
+        self._set_rotations(self._after)
+        for row, item, _ in self._geometry:
+            width, height = self._scene_box[row]
+            _rotate_item(item, self._delta, width, height)
+        self._canvas.restore_page_annotations(self._map, self._page)
+
+    def _revert(self):
+        self._set_rotations(self._before)
+        for _, item, snapshot in self._geometry:
+            geometry_restore(item, snapshot)
+        self._canvas.restore_page_annotations(self._map, self._page)
+
+
+def request_rotation(view, rows, delta) -> bool:
+    """Turn `rows` of `view`'s document, as one undoable step. Both panels call it.
+
+    THE SHARED ASK, the way `DocumentView._delete_pages` is the shared ask for
+    a delete. It lives here rather than on the view for one reason: there must
+    be exactly ONE way to rotate a page, and putting it beside the command it
+    pushes is what stops a second one growing in a panel. Neither panel touches
+    the document; they collect a selection and a direction and hand them over.
+    """
+    if view is None:
+        return False
+    doc = getattr(view, "_doc", None)
+    if doc is None or not doc.doc:
+        return False
+    delta = normalize_rotation(delta)
+    rows = sorted({int(r) for r in rows if 0 <= int(r) < doc.page_count()})
+    if not rows or delta == 0:
+        return False
+    command = RotatePagesCommand(view, rows, delta)
+    # Keep the pages that were turned selected once both panels rebuild, the
+    # same way a drag keeps the block it moved.
+    view._pending_page_selection = list(rows)
+    view.undo_stack().push(command)
+    count = len(rows)
+    pages = f"{count} page{'s' if count > 1 else ''}"
+    view._update_status(
+        f"Rotated {pages} {command.direction()}  (Ctrl+Z to undo)")
+    return True
