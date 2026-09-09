@@ -45,6 +45,115 @@ RENDER_CACHE_MAX = 6
 SAVE_MODE_INCREMENTAL = "incremental"
 SAVE_MODE_REWRITE = "rewrite"
 
+# How many times a password may be tried against one encrypted file before the
+# open is given up. THIS IS NOT A SECURITY CONTROL and must not be sold as one:
+# anybody holding the file can retry forever with any tool they like, and
+# nothing here can stop that. It exists so a mistyped password ends in a
+# sentence rather than in a dialog that keeps coming back.
+UNLOCK_ATTEMPT_LIMIT = 3
+
+# What `doc.authenticate()` answers. MuPDF returns a bit field, measured on
+# PyMuPDF 1.27.2.3: 0 for a password that does not fit, 2 when the password
+# given was the USER password (the file opens and its permission restrictions
+# still apply), 4 when it was the OWNER password (the file opens and every
+# permission is granted). A file whose user and owner passwords are the same
+# answers 6.
+AUTH_FAILED = 0
+AUTH_USER = 2
+AUTH_OWNER = 4
+
+# The operations a PDF can withhold, and what to call each one in front of a
+# user. `doc.permissions` is a bit field with every bit SET on a file that
+# restricts nothing (measured: -4, which is every bit but the low two), so a
+# MISSING bit is a restriction. Named by fitz attribute rather than by value
+# because not every PyMuPDF build defines every one of them.
+PERMISSION_LABELS = (
+    ("PDF_PERM_PRINT", "printing"),
+    ("PDF_PERM_MODIFY", "changing the content"),
+    ("PDF_PERM_COPY", "copying text out"),
+    ("PDF_PERM_ANNOTATE", "adding annotations"),
+    ("PDF_PERM_FORM", "filling in form fields"),
+    ("PDF_PERM_ACCESSIBILITY", "extracting text for a screen reader"),
+    ("PDF_PERM_ASSEMBLE", "adding, removing or reordering pages"),
+    ("PDF_PERM_PRINT_HQ", "printing at full quality"),
+)
+
+# The restrictions that stand between the user and an ordinary edit-and-save.
+# Reported on the save path; the rest are only worth saying once on open.
+_EDIT_PERMISSIONS = ("PDF_PERM_MODIFY", "PDF_PERM_ANNOTATE", "PDF_PERM_ASSEMBLE")
+
+# Shown when open() stops on an encrypted file. It is a prompt for the UI to
+# act on rather than an error to display, and `PDFDocument.needs_password()` is
+# what a caller should branch on; the text is here so a caller that only knows
+# about `last_open_error` still says something true.
+PASSWORD_REQUIRED = "This PDF is password protected. A password is needed to open it."
+
+
+def _permission_bit(name: str) -> int:
+    """The fitz constant behind a permission name, or 0 if this build lacks it."""
+    try:
+        return int(getattr(fitz, name))
+    except (AttributeError, TypeError, ValueError):
+        return 0
+
+
+def denied_permissions(doc, only: tuple = PERMISSION_LABELS) -> list[str]:
+    """The things `doc` does not allow, in words. Empty when it allows everything.
+
+    An unencrypted document, and an encrypted one opened with its OWNER
+    password, both report every bit set and so answer [].
+    """
+    try:
+        allowed = int(doc.permissions)
+    except Exception:
+        return []
+    out = []
+    for name, label in only:
+        bit = _permission_bit(name)
+        if bit and not (allowed & bit):
+            out.append(label)
+    return out
+
+
+class EncryptionInfo(NamedTuple):
+    """What protection this document carries, read live rather than remembered.
+
+    NO PASSWORD IS IN HERE, and none is anywhere else either. The password is
+    handed to MuPDF, MuPDF keeps the derived key inside the document handle,
+    and nothing in this process holds the characters the user typed once
+    `unlock()` has returned. See `PDFDocument.unlock`.
+    """
+
+    encrypted: bool               # the file itself is encrypted
+    needed_password: bool         # a password was required to open it at all
+    owner_access: bool            # the owner password was the one that opened it
+    denied: tuple[str, ...]       # operations the file withholds, in words
+
+    @property
+    def restricted(self) -> bool:
+        return bool(self.denied)
+
+    @property
+    def notice(self) -> str | None:
+        """One finished sentence for the status bar, or None when there is
+        nothing worth saying."""
+        if not self.encrypted:
+            return None
+        if not self.denied:
+            return "This PDF is encrypted. It carries no restrictions."
+        return ("This PDF is protected and its owner does not allow "
+                + _join_words(self.denied) + ".")
+
+
+def _join_words(items) -> str:
+    """'a', 'a and b', 'a, b and c'. Used in sentences shown to the user."""
+    items = list(items)
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
 
 class SavePlan(NamedTuple):
     """What the next save is going to do, decided before anything is written.
@@ -52,12 +161,21 @@ class SavePlan(NamedTuple):
     `reason` is a finished sentence fit to put in front of a user, and it is
     set if and only if `breaks_signature` is true. The core never opens a
     dialog; it hands this back and lets the window ask.
+
+    `restriction_note` is separate on purpose. A permission restriction is
+    something to SAY, not something to stop on: the owner of an encrypted file
+    can deny editing, but rapid-pdf is not a rights-management product and
+    refusing the save would only send the user to a tool that ignores the flag
+    anyway. It is set when the document denies an edit this app has just made,
+    and it never blocks (`needs_confirmation` stays about signatures alone).
     """
 
     mode: str                     # SAVE_MODE_INCREMENTAL or SAVE_MODE_REWRITE
     signed: bool                  # the document carries at least one real signature
     breaks_signature: bool        # writing it will make readers reject that signature
     reason: str | None            # what breaks and why, in words, or None
+    keeps_encryption: bool = False    # the written file stays encrypted, as it was
+    restriction_note: str | None = None   # a permission the owner withheld, in words
 
     @property
     def needs_confirmation(self) -> bool:
@@ -196,6 +314,18 @@ class PDFDocument:
         # decided"; see render_scale() for why it is settled once and not
         # recomputed when the setting changes.
         self._render_scale: float | None = None
+        # An encrypted file that open() reached but could not read, held back
+        # from `self.doc` on purpose. `self.doc` means "a document that can be
+        # read", and every is_open/render/save path in the app relies on that,
+        # so a locked handle waits here instead until `unlock()` promotes it.
+        # NO PASSWORD IS EVER STORED BESIDE IT.
+        self._locked: "fitz.Document | None" = None
+        self._locked_path: str | None = None
+        # Failed password attempts against the file in `_locked`, and what
+        # authenticate() said about the one that finally worked (AUTH_USER or
+        # AUTH_OWNER). Counts and bit flags only; see unlock().
+        self.failed_unlock_attempts: int = 0
+        self._authenticated_as: int = 0
 
     # ------------------------------------------------------------------
     # Rendered-page pixmap cache
@@ -245,11 +375,13 @@ class PDFDocument:
         save is forced through Save As; nothing touches disk until then."""
         if self.doc:
             self.doc.close()
+        self._discard_locked()
         self.invalidate_render_cache()
         self._render_scale = None    # different document, different geometry
         self.doc = fitz_doc
         self.path = None
         self._structure_changed = False   # brand new document, nothing to compare to
+        self._authenticated_as = 0        # a merged document carries no protection
 
     def replace_from_bytes(self, payload: bytes) -> bool:
         """Swap this document's CONTENT for `payload`, keeping its identity.
@@ -295,25 +427,48 @@ class PDFDocument:
         hands back a document that reports a real page count and then raises
         "document closed or encrypted" on the first render. The app used to
         accept the file, draw an empty two-page document and blow up as soon as
-        anything asked for a pixmap. Refusing here is the whole fix, and it is
-        also why the page-transfer work does not have to special-case encrypted
-        documents: one can never be open in the first place.
+        anything asked for a pixmap.
+
+        THAT CHECK USED TO BE THE END OF IT: the file was refused with "This PDF
+        is password protected, so it cannot be opened" and there was no way to
+        give it one. Client-issued certificate packages arrive protected, so
+        that refused real work. A locked file now PAUSES the open instead. The
+        handle is kept, unauthenticated, in `self._locked`, `needs_password()`
+        goes true, and the caller prompts and comes back through `unlock()`.
+
+        `self.doc` STAYS NONE WHILE A FILE IS LOCKED, and that is deliberate
+        rather than tidy. `self.doc` means "a document that can be read", and
+        `is_open`, every render, every save and the whole page-transfer path
+        take it at its word. A locked handle answers `len()` honestly and then
+        raises "document closed or encrypted" on the first pixmap, so putting
+        one in `self.doc` would put back exactly the bug this check was added
+        for. Nothing downstream needs to learn about encryption.
+
+        A file with only an OWNER password is not locked at all: it opens, and
+        what it carries is a set of permission restrictions rather than a
+        challenge. It goes through the ordinary path and `encryption_info()`
+        reports what its owner withheld. Measured on PyMuPDF 1.27.2.3: such a
+        file reports `needs_pass` 0 and a `permissions` bit field with the
+        withheld bits clear.
         """
         self.last_open_error = None
+        self._discard_locked()
+        self.failed_unlock_attempts = 0
+        self._authenticated_as = 0
         try:
             if self.doc:
                 self.doc.close()
+            self.doc = None
             self.invalidate_render_cache()   # new document, no stale pixmaps
             self._render_scale = None        # and a fresh scale decision
             self._structure_changed = False  # as it sits on disk, so far
-            self.doc = fitz.open(path)
-            if getattr(self.doc, "needs_pass", False):
-                self.doc.close()
-                self.doc = None
-                self.last_open_error = (
-                    "This PDF is password protected, so it cannot be opened."
-                )
+            candidate = fitz.open(path)
+            if getattr(candidate, "needs_pass", False):
+                self._locked = candidate
+                self._locked_path = path
+                self.last_open_error = PASSWORD_REQUIRED
                 return False
+            self.doc = candidate
             self.path = path
             return True
         except Exception as e:
@@ -322,11 +477,154 @@ class PDFDocument:
             self.last_open_error = f"Could not open the PDF:\n{e}"
             return False
 
+    # ------------------------------------------------------------------
+    # Encrypted files: the password round trip
+    #
+    # NOTHING HERE KEEPS A PASSWORD. `unlock()` hands the characters straight to
+    # MuPDF, which derives the file key inside the document handle and holds
+    # that; the parameter goes out of scope when the call returns and no
+    # attribute, settings key, session record, log line or exception message
+    # ever carries it. That last one matters most: every message built below is
+    # a fixed string, so a password cannot reach a message box or a print()
+    # through `last_open_error`. tests/test_encryption.py asserts it.
+    # ------------------------------------------------------------------
+
+    def _discard_locked(self):
+        """Let go of a locked handle without reading anything out of it."""
+        if self._locked is not None:
+            try:
+                self._locked.close()
+            except Exception:
+                pass
+        self._locked = None
+        self._locked_path = None
+
+    def needs_password(self) -> bool:
+        """True when open() reached an encrypted file and stopped for a password.
+
+        The one thing a caller has to branch on after a False from `open()`.
+        False for every other kind of open failure, so a caller that does not
+        know about encryption keeps showing its error box and nothing changes.
+        """
+        return self._locked is not None
+
+    def locked_path(self) -> str | None:
+        """The file waiting on a password, for a prompt that names it."""
+        return self._locked_path
+
+    def unlock_attempts_left(self) -> int:
+        """How many more passwords may be tried before the open is given up."""
+        if self._locked is None:
+            return 0
+        return max(0, UNLOCK_ATTEMPT_LIMIT - self.failed_unlock_attempts)
+
+    def unlock(self, password: str) -> bool:
+        """Try `password` against the file waiting on one. True finishes the open.
+
+        A False leaves `last_open_error` set to a sentence worth showing, and
+        the caller looks at `needs_password()` again to decide whether to ask
+        once more: it stays true while there are attempts left and goes FALSE
+        when they run out, so a `while pdf.needs_password()` loop terminates by
+        itself and a giving-up user just calls `cancel_unlock()`.
+
+        Either password opens the file. The USER password opens it under
+        whatever restrictions its owner set; the OWNER password opens it with
+        all of them lifted, which is why `opened_as_owner()` is a separate
+        question from `is_open()`.
+        """
+        if self._locked is None:
+            self.last_open_error = "There is no locked PDF waiting for a password."
+            return False
+        try:
+            code = int(self._locked.authenticate(password or ""))
+        except Exception:
+            # A malformed crypt dictionary raises rather than answering 0. It
+            # is a wrong password as far as anyone here can tell, and the
+            # exception text is not repeated: it can carry file internals and
+            # this path is one keystroke away from the password itself.
+            code = AUTH_FAILED
+        if not code:
+            self.failed_unlock_attempts += 1
+            if self.unlock_attempts_left() <= 0:
+                self._discard_locked()
+                self.last_open_error = (
+                    "That password did not open this PDF, and there were no "
+                    f"more tries left after {UNLOCK_ATTEMPT_LIMIT}. Open it "
+                    "again to start over.")
+            else:
+                left = self.unlock_attempts_left()
+                self.last_open_error = (
+                    "That password did not open this PDF. "
+                    + (f"{left} tries left." if left != 1 else "1 try left."))
+            return False
+        self.doc = self._locked
+        self.path = self._locked_path
+        self._locked = None
+        self._locked_path = None
+        self._authenticated_as = code
+        self.failed_unlock_attempts = 0
+        self.last_open_error = None
+        self.invalidate_render_cache()
+        self._render_scale = None
+        self._structure_changed = False
+        return True
+
+    def cancel_unlock(self):
+        """The user gave up on the password. Leave this object empty."""
+        self._discard_locked()
+        self.failed_unlock_attempts = 0
+        self.last_open_error = None
+
+    def opened_as_owner(self) -> bool:
+        """Whether the OWNER password is the one this document was opened with."""
+        return bool(self._authenticated_as & AUTH_OWNER)
+
+    def is_encrypted(self) -> bool:
+        """Whether the FILE carries encryption, whether or not it is unlocked.
+
+        NOT `doc.is_encrypted`, which is the "still locked" flag and goes false
+        the moment a password is accepted, and not `doc.needs_pass` either,
+        which stays 0 on a file protected by an owner password alone. The
+        metadata's `encryption` entry is the one that survives both, measured
+        on PyMuPDF 1.27.2.3: it names the algorithm ("Standard V5 R6 256-bit
+        AES") for every encrypted file and is None for a plain one.
+        """
+        if self._locked is not None:
+            return True
+        if not self.is_open():
+            return False
+        try:
+            return bool((self.doc.metadata or {}).get("encryption"))
+        except Exception:
+            return False
+
+    def denied_operations(self) -> list[str]:
+        """What this document's owner does not allow, in words. [] for most files."""
+        if not self.is_open():
+            return []
+        return denied_permissions(self.doc)
+
+    def encryption_info(self) -> EncryptionInfo:
+        """The whole protection picture in one value. See EncryptionInfo."""
+        if self._locked is not None:
+            return EncryptionInfo(True, True, False, ())
+        if not self.is_open():
+            return EncryptionInfo(False, False, False, ())
+        return EncryptionInfo(
+            self.is_encrypted(),
+            bool(getattr(self.doc, "needs_pass", False)),
+            self.opened_as_owner(),
+            tuple(self.denied_operations()),
+        )
+
     def close(self):
         if self.doc:
             self.doc.close()
         self.doc = None
         self.path = None
+        self._discard_locked()
+        self.failed_unlock_attempts = 0
+        self._authenticated_as = 0
         self.clear_transfer_ledger()
         self.invalidate_render_cache()
         self._render_scale = None
@@ -460,6 +758,42 @@ class PDFDocument:
             return None
         return name
 
+    def _can_append(self, target: str) -> bool:
+        """Whether a new revision can be appended to `target` rather than
+        rewriting it. Both halves of the question in one place: PyMuPDF's own
+        answer, and the filename rule in `_incremental_filename`."""
+        try:
+            if not self.doc.can_save_incrementally():
+                return False
+        except Exception:
+            return False
+        return self._incremental_filename(target) is not None
+
+    def _reopen_after_write(self, target: str):
+        """Take the freshly written file back as the live document.
+
+        The in-place rewrite swaps a new file over the one the handle was on,
+        so the handle has to be replaced. An ENCRYPTED file comes back LOCKED,
+        because on disk it still is and nothing in this process kept the
+        password. It goes to `_locked` rather than to `self.doc`, so the next
+        thing that looks at this document asks for the password instead of
+        raising "document closed or encrypted" out of a render.
+
+        Rare in practice: `save_plan` routes an encrypted in-place save down
+        the incremental path, which never closes the handle. This is the
+        fallback for a file that cannot take an appended revision (one MuPDF
+        had to repair, or one whose content was rebuilt by OCR in this window).
+        """
+        reopened = fitz.open(target)
+        if getattr(reopened, "needs_pass", False):
+            self._locked = reopened
+            self._locked_path = target
+            self.doc = None
+            self.failed_unlock_attempts = 0
+            self._authenticated_as = 0
+        else:
+            self.doc = reopened
+
     def signature_names(self) -> list[str]:
         """Names of the signed signature fields in this document, if any.
 
@@ -526,18 +860,41 @@ class PDFDocument:
         - A signed document whose PAGES have moved breaks the signature even
           though the write itself is still incremental. The bytes survive; the
           signature covers a page tree that is no longer the document.
+
+        ENCRYPTION IS ALWAYS KEPT, on every branch, and `keeps_encryption` says
+        so. `save()` passes `encryption=fitz.PDF_ENCRYPT_KEEP` to every write,
+        so a protected certificate saved from this app comes back protected by
+        the same password. It used to be dropped: a plain `doc.save()` writes
+        an UNENCRYPTED file (measured, PyMuPDF 1.27.2.3), so Ctrl+S on a
+        client's protected package quietly published it in the clear. The flag
+        costs nothing on an unencrypted document, where it is a no-op.
+
+        AN ENCRYPTED DOCUMENT SAVED IN PLACE GOES OUT INCREMENTALLY TOO, signed
+        or not, and that is about keeping it usable rather than about the
+        bytes. The in-place rewrite writes a temp file and swaps it over the
+        original, which means closing the handle and opening the new file, and
+        the new file needs the password again. Nothing here kept it, and
+        nothing here is going to, so a rewrite would leave the user re-typing
+        the password after every Ctrl+S. The incremental path writes through
+        the handle it already has and never closes it, so the document stays
+        open and unlocked. The cost is the compaction, which is the same trade
+        the signed path already makes.
         """
         target = path or self.path
         if not self.is_open() or not target:
             return SavePlan(SAVE_MODE_REWRITE, False, False, None)
 
-        names = self.signature_names()
-        if not names:
-            return SavePlan(SAVE_MODE_REWRITE, False, False, None)
-
-        who = ", ".join(names)
+        keeps = self.is_encrypted()
+        note = self._restriction_note()
         is_same = (self.path is not None
                    and os.path.abspath(target) == os.path.abspath(self.path))
+        names = self.signature_names()
+        if not names:
+            if keeps and is_same and self._can_append(target):
+                return SavePlan(SAVE_MODE_INCREMENTAL, False, False, None, True, note)
+            return SavePlan(SAVE_MODE_REWRITE, False, False, None, keeps, note)
+
+        who = ", ".join(names)
 
         if not is_same:
             if self.path is None:
@@ -550,13 +907,9 @@ class PDFDocument:
                 SAVE_MODE_REWRITE, True, True,
                 f"This PDF is digitally signed ({who}).\n\n{where} The signature "
                 "cannot come with it, and the saved copy will open with the "
-                "signature shown as invalid.\n\nSave anyway?")
+                "signature shown as invalid.\n\nSave anyway?", keeps, note)
 
-        try:
-            can_append = bool(self.doc.can_save_incrementally())
-        except Exception:
-            can_append = False
-        if not can_append or self._incremental_filename(target) is None:
+        if not self._can_append(target):
             return SavePlan(
                 SAVE_MODE_REWRITE, True, True,
                 f"This PDF is digitally signed ({who}), but a new revision cannot "
@@ -564,7 +917,7 @@ class PDFDocument:
                 "it was opened, or its contents have already been rebuilt in this "
                 "window (Enhance for Search does that). Saving rewrites the whole "
                 "file and the signature will be shown as invalid afterwards."
-                "\n\nSave anyway?")
+                "\n\nSave anyway?", keeps, note)
 
         if self._structure_changed:
             return SavePlan(
@@ -572,9 +925,31 @@ class PDFDocument:
                 f"This PDF is digitally signed ({who}), and pages have been added, "
                 "removed or reordered. The edit will be appended rather than "
                 "rewritten, but a signature covers the pages it was applied to, so "
-                "readers will show it as invalid.\n\nSave anyway?")
+                "readers will show it as invalid.\n\nSave anyway?", keeps, note)
 
-        return SavePlan(SAVE_MODE_INCREMENTAL, True, False, None)
+        return SavePlan(SAVE_MODE_INCREMENTAL, True, False, None, keeps, note)
+
+    def _restriction_note(self) -> str | None:
+        """A sentence naming the edits this document's owner withheld, or None.
+
+        Reported rather than enforced, and the difference is a decision. The
+        permission bits in a PDF are a request to the reader, not a lock: the
+        file is already decrypted in memory by the time they can be read, every
+        other tool the user has ignores them, and refusing the save would lose
+        their work while protecting nothing. So the app says what the owner
+        asked for and lets the user decide. Lifted entirely when the file was
+        opened with its owner password, which is what the owner password is
+        for.
+        """
+        if not self.is_encrypted() or self.opened_as_owner():
+            return None
+        blocked = denied_permissions(
+            self.doc, tuple(p for p in PERMISSION_LABELS if p[0] in _EDIT_PERMISSIONS))
+        if not blocked:
+            return None
+        return ("The owner of this PDF does not allow " + _join_words(blocked)
+                + ". Rapid PDF will save your changes anyway; other readers may "
+                "show the file as restricted.")
 
     def save(self, path: str | None = None,
              allow_signature_break: bool = False) -> bool:
@@ -606,6 +981,16 @@ class PDFDocument:
         `allow_signature_break=True`. Passing that flag on an unsigned document
         does nothing at all, so a caller that always passes it has simply
         opted out of the protection.
+
+        AN ENCRYPTED DOCUMENT STAYS ENCRYPTED. Every write here passes
+        `encryption=fitz.PDF_ENCRYPT_KEEP`, so the saved file keeps the
+        protection and the permissions it arrived with, under the same
+        password. A plain `doc.save()` writes the file out UNENCRYPTED, which
+        is what this used to do: opening a client's protected certificate
+        package, moving one annotation and pressing Ctrl+S published it in the
+        clear with nothing said. No password is needed for any of this and none
+        is asked for; MuPDF still holds the key from the open. See save_plan()
+        for why an encrypted in-place save goes out incrementally.
         """
         self.last_save_error = None
         self.last_save_blocked_by_signature = False
@@ -653,7 +1038,8 @@ class PDFDocument:
                     tmp_path = tf.name
                 # If this write raises, the outer except cleans up tmp_path (the
                 # doc is still open and untouched, so the save simply fails safely).
-                self.doc.save(tmp_path, garbage=4, deflate=True)
+                self.doc.save(tmp_path, garbage=4, deflate=True,
+                              encryption=fitz.PDF_ENCRYPT_KEEP)
                 # PyMuPDF can't write over its own open file, so close before the
                 # swap. Drop the handle to None immediately: if anything below
                 # fails, the except must never leave self.doc pointing at a closed
@@ -701,10 +1087,17 @@ class PDFDocument:
                             "still only in this window. Use Save As to put them "
                             "somewhere writable before closing it."
                         ) from move_err
-                # Reopen the freshly written file as the live document.
-                self.doc = fitz.open(target)
+                # Reopen the freshly written file as the live document. An
+                # encrypted file that was unlocked in this session comes back
+                # LOCKED, because the file on disk still is: nothing here holds
+                # the password to open it again, and nothing here is going to
+                # start. The handle goes to `_locked` so the next read asks for
+                # the password rather than raising "document closed or
+                # encrypted" out of a render.
+                self._reopen_after_write(target)
             else:
-                self.doc.save(target, garbage=4, deflate=True)
+                self.doc.save(target, garbage=4, deflate=True,
+                              encryption=fitz.PDF_ENCRYPT_KEEP)
             # Adopt the target as the canonical path so later saves write in place.
             self.path = target
             # Whatever this document owed the other side of a page move is now
