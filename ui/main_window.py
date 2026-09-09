@@ -1011,6 +1011,10 @@ class MainWindow(QMainWindow):
         pm = mb.addMenu("Page")
         self._add_action(pm, "Go to Page…", self._focus_page_jump, "Ctrl+G")
         self._add_action(pm, "Delete Current Page", self.delete_current_page)
+        pm.addSeparator()
+        self._add_action(pm, "Rotate Right 90", lambda: self._rotate(90), "Ctrl+R")
+        self._add_action(pm, "Rotate Left 90", lambda: self._rotate(270), "Ctrl+Shift+R")
+        self._add_action(pm, "Rotate 180", lambda: self._rotate(180))
 
         vm = mb.addMenu("View")
         # Side page panel show/hide, remembered across runs.
@@ -1537,6 +1541,21 @@ class MainWindow(QMainWindow):
 
     def _delete_key(self):
         self.view.delete_key()
+
+    def _rotate(self, delta):
+        """Rotate by whichever panel is in front, the way _delete_key routes.
+
+        The menu owns the shortcut at window level so Ctrl+R works while the
+        canvas has the keyboard, which is the usual case: open a sideways scan
+        and turn it without clicking into a panel first.
+        """
+        view = self.view
+        if view is None:
+            return
+        if view._tabs.currentIndex() == 1:      # Organizer tab
+            view._organizer.rotate_selected(delta)
+        else:
+            view._page_panel.rotate_selection(delta)
 
     def _bring_to_front(self):
         self.view.bring_to_front()
