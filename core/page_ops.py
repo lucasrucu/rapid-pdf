@@ -1,4 +1,5 @@
-"""Pure page-order arithmetic, shared by the page panel and its undo commands.
+"""Pure page-order and page-rotation arithmetic, shared by the page panels and
+their undo commands.
 
 Nothing here touches Qt or PyMuPDF. The point is that the awkward parts of a
 drag-reorder (where does a multi-row selection land once the rows it is made of
@@ -8,7 +9,108 @@ can be tested on their own, without a widget or a PDF.
 Everywhere in here an "order" is a permutation of range(page_count) read the
 same way PDFDocument.reorder reads it: new page i is the page currently at
 order[i].
+
+The rotation half is the same idea for a different edit. A page's /Rotate is
+one of 0, 90, 180, 270 and everything about turning one is arithmetic on that
+number plus arithmetic on the box the page is drawn into. See ROTATE_CW below
+for why the coordinate maths lives here rather than being read off a PyMuPDF
+matrix at the call site.
 """
+
+# The three turns the UI offers, as clockwise degrees. Anticlockwise is 270
+# clockwise: there is one direction in the file format and pretending otherwise
+# doubles every branch below for nothing.
+ROTATE_CW = 90
+ROTATE_CCW = 270
+ROTATE_180 = 180
+
+#: The only values /Rotate is allowed to hold.
+ROTATIONS = (0, 90, 180, 270)
+
+
+def normalize_rotation(degrees) -> int:
+    """Fold any angle onto one of ROTATIONS.
+
+    Worth doing OURSELVES rather than leaving to PyMuPDF, which is quietly
+    lossy about it: measured on 1.27.2.3, `page.set_rotation(91)` leaves the
+    page at 0 rather than raising or rounding. A caller that passed a value
+    that is not a multiple of 90 would get silence and no rotation, so anything
+    that is not a clean quarter turn is snapped to the nearest one here and the
+    document only ever sees a legal value.
+    """
+    try:
+        value = int(round(float(degrees) / 90.0)) * 90
+    except (TypeError, ValueError):
+        return 0
+    return value % 360
+
+
+def rotation_after(current, delta) -> int:
+    """The /Rotate a page carries once `delta` clockwise degrees are added."""
+    return (normalize_rotation(current) + normalize_rotation(delta)) % 360
+
+
+def rotated_size(width: float, height: float, delta) -> tuple:
+    """The visible page box after turning it by `delta`. A quarter turn swaps."""
+    return (height, width) if normalize_rotation(delta) in (90, 270) else (width, height)
+
+
+def rotate_point(x: float, y: float, delta, width: float, height: float) -> tuple:
+    """Where visible point (x, y) lands when the page turns `delta` clockwise.
+
+    `width` and `height` are the page's visible box BEFORE the turn, so a page
+    that arrived already rotated (a 270-degree scan) is measured from where it
+    is rather than from zero. Everything the canvas holds is in this space:
+    markup is stored in rendered-pixel coordinates, which are visible page
+    points times the document's frozen render scale, so the same three lines
+    serve both once the caller has scaled its box to match.
+
+    WHY ARITHMETIC AND NOT `page.derotation_matrix * page.rotation_matrix`.
+    The two are the same number, and that was verified rather than assumed:
+    for every base rotation in ROTATIONS and every delta, this agrees with
+    PyMuPDF's own matrices to within 1e-6 (tests/test_page_rotation.py). What
+    the arithmetic buys is that the transform can be applied to Qt items with
+    no page in hand, in a module that has no PDF library in it, and tested on
+    plain numbers.
+    """
+    delta = normalize_rotation(delta)
+    if delta == 90:
+        return (height - y, x)
+    if delta == 180:
+        return (width - x, height - y)
+    if delta == 270:
+        return (y, width - x)
+    return (x, y)
+
+
+def rotate_rect(rect, delta, width: float, height: float) -> tuple:
+    """`rect` as (x0, y0, x1, y1) after a `delta` turn, normalised.
+
+    An axis-aligned box stays axis-aligned through a quarter turn, so mapping
+    the two opposite corners and re-normalising is exact. A quarter turn swaps
+    the box's own width and height, which is the point: a highlight drawn along
+    a line of text has to end up running down the page with it.
+    """
+    x0, y0, x1, y1 = rect
+    ax, ay = rotate_point(x0, y0, delta, width, height)
+    bx, by = rotate_point(x1, y1, delta, width, height)
+    return (min(ax, bx), min(ay, by), max(ax, bx), max(ay, by))
+
+
+def rotate_rect_upright(rect, delta, width: float, height: float) -> tuple:
+    """`rect` moved with the content but KEEPING its own size and orientation.
+
+    For the two kinds of markup that carry their own upright content rather
+    than a shape: a text label and a pasted image. Turning their box would
+    stand the words on end or squash the picture into the wrong aspect, and
+    neither item can draw itself rotated. So the box travels by its CENTRE and
+    keeps the extents it had, which leaves the label or the stamp sitting on
+    the same spot of the page, still readable.
+    """
+    x0, y0, x1, y1 = rect
+    w, h = abs(x1 - x0), abs(y1 - y0)
+    cx, cy = rotate_point((x0 + x1) / 2.0, (y0 + y1) / 2.0, delta, width, height)
+    return (cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0)
 
 
 def move_rows(count: int, rows, target: int) -> list:

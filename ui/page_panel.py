@@ -4,11 +4,14 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
 )
 from PySide6.QtCore import Signal, Qt, QSize, QTimer, QRect, QEvent, QPoint
-from PySide6.QtGui import QIcon, QPixmap, QColor, QPainter, QPen, QDrag
+from PySide6.QtGui import (
+    QIcon, QPixmap, QColor, QPainter, QPen, QDrag, QKeySequence, QShortcut,
+)
 
 from ui.thumbnails import aspect_ratio_placeholder, draw_thumbnail, fit_size
 from ui.theme import LIGHT
 from ui.scrolling import TrackpadScrollFilter
+from ui.page_commands import ROTATE_ACTIONS, ROTATE_SHORTCUTS, request_rotation
 from ui.page_drag import find_source_view, make_page_mime, read_page_mime
 from core.page_ops import move_rows
 from core.pdf_document import source_is_readable
@@ -469,6 +472,10 @@ class PagePanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._doc = None
+        # The DocumentView this strip belongs to. The drag payload needs it
+        # (see set_view), and so does a rotate, which is asked for through the
+        # shared entry point in ui/page_commands.py.
+        self._view = None
         # Optional doc whose pages already have unsaved markup baked in. When set,
         # thumbnails render from it so they match the page + live overlays exactly
         # (the same trick the Organizer uses). Falls back to _doc when None.
@@ -488,10 +495,14 @@ class PagePanel(QWidget):
     def set_view(self, view):
         """Name the document this panel belongs to.
 
-        Only the drag payload needs it: a page leaving here has to say which
+        The drag payload needs it: a page leaving here has to say which
         document it came out of, and a drop has to tell this document from a
-        foreign one. Passed straight down to the list. See ui/page_drag.py.
+        foreign one, so it is passed straight down to the list too. See
+        ui/page_drag.py. Rotation needs it for a different reason: the strip
+        does not edit pages, it hands the view and a selection to
+        `request_rotation`, which owns the undoable command.
         """
+        self._view = view
         self._list.set_view(view)
 
     def release_render_source(self, render):
@@ -610,6 +621,28 @@ class PagePanel(QWidget):
         # Fill in thumbnails as rows scroll into view.
         self._list.verticalScrollBar().valueChanged.connect(self._render_visible)
         layout.addWidget(self._list)
+        self._install_rotate_shortcuts()
+
+    def _install_rotate_shortcuts(self):
+        """Ctrl+R and Ctrl+Shift+R on the strip's selection.
+
+        WidgetWithChildrenShortcut, the same context the Organizer's zoom keys
+        use, and for the same reason: a window can hold several documents and
+        each one has a strip of its own, so a window-wide binding installed
+        here would be several bindings claiming one key and Qt would route the
+        press to none of them. Scoped to this widget there is exactly one
+        candidate, the one the keyboard is actually in.
+
+        The consequence, and it is a real gap rather than a design: the keys
+        are dead while the canvas has the focus. Closing that needs a Page-menu
+        action at window level, which lives in ui/main_window.py.
+        """
+        self._rotate_shortcuts = []
+        for sequence, delta in ROTATE_SHORTCUTS:
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(lambda d=delta: self.rotate_selection(d))
+            self._rotate_shortcuts.append(shortcut)
 
     def set_document(self, doc, render=None):
         """doc = live document (drives page count + sizes). render = optional doc
@@ -785,6 +818,26 @@ class PagePanel(QWidget):
         if rows:
             self.pages_delete_requested.emit(rows)
 
+    def rotate_rows(self) -> list:
+        """The pages a rotate would turn: the selection, or the current page.
+
+        The strip normally keeps the page you are reading selected, so those
+        are usually the same list. They come apart when a Ctrl+click has taken
+        the current page out of the selection, and after a rebuild that has not
+        re-selected anything yet. Falling back to the current row is what makes
+        "rotate the page I am looking at" work with no selection at all.
+        """
+        rows = self._list.selected_rows()
+        if rows:
+            return rows
+        row = self._list.currentRow()
+        return [row] if row >= 0 else []
+
+    def rotate_selection(self, delta) -> bool:
+        """Turn the selected pages. The strip never touches the document itself:
+        the shared command in ui/page_commands.py does, on the window's stack."""
+        return request_rotation(self._view, self.rotate_rows(), delta)
+
     def _show_context_menu(self, pos: QPoint):
         item = self._list.itemAt(pos)
         # Right-clicking outside the current selection moves the selection there
@@ -805,6 +858,9 @@ class PagePanel(QWidget):
         if not rows:
             return None
         menu = QMenu(self._list)
+        for label, delta in ROTATE_ACTIONS:
+            menu.addAction(label, lambda d=delta: self.rotate_selection(d))
+        menu.addSeparator()
         label = "Delete Page" if len(rows) == 1 else f"Delete {len(rows)} Pages"
         menu.addAction(label, self._request_delete)
         menu.addSeparator()

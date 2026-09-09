@@ -42,7 +42,9 @@ duplicate page behind.
 | `Ctrl+click` | Add or remove a single page from the selection |
 | `Ctrl+A` | Select every page (right-click menu, or with the strip focused) |
 | `Delete` / `Backspace` | Delete the selected page(s) in one step |
-| Right-click | Delete / select-all menu |
+| `Ctrl+R` | Rotate the selected page(s) right 90° |
+| `Ctrl+Shift+R` | Rotate them left 90° |
+| Right-click | Rotate (right / left / 180) / delete / select-all menu |
 | Drag a thumbnail | Move it; the line shows where it will land |
 | Drag a multi-selection | Moves the whole selection together, order kept |
 | Drag into another tab | Moves the page(s) into that document |
@@ -61,6 +63,20 @@ Deleting is not confirmed, because it is undoable. The last page cannot be
 deleted: a document has to keep at least one. The strip carries no delete
 button: select and press `Delete`, or use the right-click menu, or the
 Organizer.
+
+Rotating turns whatever is selected, or the page you are on if nothing is. It
+is one undo step however many pages it covered, and `Ctrl+Z` puts every one of
+them back at the angle it was at, including a scan that arrived at 270. Four
+rights is where you started. Markup goes round with the page: a highlight drawn
+along a line of text comes out running down it, while a text label and a pasted
+image keep their own size and stay the right way up, because neither can be
+read sideways. There is no key for 180; it is `Ctrl+R` twice, and the menu has
+it as one entry.
+
+The two rotate keys work while a page panel has the keyboard, which is the
+strip, the Organizer grid, or the Organizer's own buttons. The Organizer also
+has `Rotate Left` and `Rotate Right` in its top bar, next to Delete Selected.
+The strip has no rotate button, the same reason it has no delete button.
 
 ## Going to a page
 

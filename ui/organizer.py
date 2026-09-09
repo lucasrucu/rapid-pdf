@@ -1,7 +1,7 @@
 import fitz as _fitz
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QListWidget, QListWidgetItem, QLabel, QFileDialog, QMessageBox,
+    QListWidget, QListWidgetItem, QLabel, QFileDialog, QMenu, QMessageBox,
     QStyledItemDelegate, QStyle, QStyleOptionViewItem,
 )
 from PySide6.QtCore import Signal, Qt, QSize, QRect, QTimer, QPoint
@@ -14,6 +14,7 @@ from core.settings import dialog_start_dir, remember_dialog_dir, settings
 from ui.thumbnails import aspect_ratio_placeholder, draw_thumbnail
 from ui.theme import LIGHT
 from ui.scrolling import TrackpadScrollFilter
+from ui.page_commands import ROTATE_ACTIONS, ROTATE_SHORTCUTS, request_rotation
 from ui.page_drag import find_source_view, make_page_mime, read_page_mime
 
 # Reference thumbnail and cell geometry, i.e. the 1.0x rung of the zoom ladder
@@ -558,6 +559,9 @@ class PageOrganizer(QWidget):
         # brings in a file rather than rearranging this one and has never been
         # on the undo stack.
         self._doc = None
+        # The DocumentView this grid belongs to, needed by the drag payload and
+        # by a rotate, which is asked for through ui/page_commands.py.
+        self._view = None
         self._render = None    # optional PDFDocument whose pages have markup baked in
         self._placeholder_color = QColor(LIGHT.surface_raised)  # themed via apply_palette()
         # Current rung of ZOOM_STEPS, restored from the last run, plus the
@@ -588,6 +592,23 @@ class PageOrganizer(QWidget):
         self._del_btn.setToolTip("Remove the selected pages (Del). Ctrl+Z puts them back")
         self._del_btn.clicked.connect(self.delete_selected)
         bar.addWidget(self._del_btn)
+
+        # Rotation gets buttons here and none in the left strip, the same split
+        # Delete already has: the grid is where you go to work on the pages as
+        # pages, the strip is a navigation rail. Right-click has all three
+        # turns in both.
+        self._rotate_btns = {}
+        for text, tip, delta in (
+            ("Rotate Left", "Turn the selected pages left 90° (Ctrl+Shift+R). "
+                            "Ctrl+Z puts them back", ROTATE_SHORTCUTS[1][1]),
+            ("Rotate Right", "Turn the selected pages right 90° (Ctrl+R). "
+                             "Ctrl+Z puts them back", ROTATE_SHORTCUTS[0][1]),
+        ):
+            btn = QPushButton(text)
+            btn.setToolTip(tip)
+            btn.clicked.connect(lambda _=False, d=delta: self.rotate_selected(d))
+            bar.addWidget(btn)
+            self._rotate_btns[delta] = btn
 
         bar.addStretch()
 
@@ -641,9 +662,27 @@ class PageOrganizer(QWidget):
         # Ctrl+wheel passes straight through, so a zoom handler still sees it.
         self._trackpad_scroll = TrackpadScrollFilter(self._list)
         self._list.verticalScrollBar().valueChanged.connect(self._render_visible)
+        self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._list.customContextMenuRequested.connect(self._show_context_menu)
         layout.addWidget(self._list)
         self._placeholder_cache: dict[tuple[int, int], QPixmap] = {}
         self._install_zoom_shortcuts()
+        self._install_rotate_shortcuts()
+
+    def _install_rotate_shortcuts(self):
+        """Ctrl+R and Ctrl+Shift+R on the grid's selection.
+
+        Same context and the same reason as the zoom keys directly below: one
+        window can hold several documents, each with a grid of its own, so the
+        binding is scoped to the widget the keyboard is in rather than to the
+        window.
+        """
+        self._rotate_shortcuts = []
+        for sequence, delta in ROTATE_SHORTCUTS:
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(lambda d=delta: self.rotate_selected(d))
+            self._rotate_shortcuts.append(shortcut)
 
     def _install_zoom_shortcuts(self):
         """Ctrl +, Ctrl - and Ctrl 0 on the thumbnails.
@@ -816,10 +855,13 @@ class PageOrganizer(QWidget):
     def set_view(self, view):
         """Name the document this grid belongs to.
 
-        Only the drag payload needs it: pages leaving here have to say which
+        The drag payload needs it: pages leaving here have to say which
         document they came out of, and a drop has to tell this document from a
-        foreign one. See ui/page_drag.py.
+        foreign one, so it is passed down to the list as well. See
+        ui/page_drag.py. Rotation needs it because the grid asks for the edit
+        rather than making it, the same as delete and reorder.
         """
+        self._view = view
         self._list.set_view(view)
 
     def set_document(self, doc, render=None):
@@ -967,6 +1009,49 @@ class PageOrganizer(QWidget):
         has_doc = bool(self._doc and self._doc.doc)
         self._add_btn.setEnabled(has_doc)
         self._del_btn.setEnabled(has_doc)
+        for btn in self._rotate_btns.values():
+            btn.setEnabled(has_doc)
+
+    # ------------------------------------------------------------------
+    # Rotation
+    # ------------------------------------------------------------------
+
+    def rotate_rows(self) -> list:
+        """The pages a rotate would turn: the selection, or the current cell.
+
+        The grid is often opened with nothing selected, so "rotate what I am
+        pointing at" has to mean something. The current cell is what a click,
+        a Ctrl+G jump or a double-click out to the editor leaves behind.
+        """
+        rows = sorted({self._list.row(i) for i in self._list.selectedItems()})
+        if rows:
+            return rows
+        row = self._list.currentRow()
+        return [row] if row >= 0 else []
+
+    def rotate_selected(self, delta) -> bool:
+        """Ask for the turn. The grid does not touch the document, the same way
+        it no longer deletes or reorders one. See ui/page_commands.py."""
+        if not self._doc or not self._doc.doc:
+            return False
+        return request_rotation(self._view, self.rotate_rows(), delta)
+
+    def _show_context_menu(self, pos: QPoint):
+        item = self._list.itemAt(pos)
+        # Right-clicking outside the selection moves it there first, the way
+        # the left strip's menu does, so the menu always acts on what is lit up.
+        if item is not None and not item.isSelected():
+            self._list.setCurrentItem(item)
+        if not self.rotate_rows():
+            return
+        menu = QMenu(self._list)
+        for label, delta in ROTATE_ACTIONS:
+            menu.addAction(label, lambda d=delta: self.rotate_selected(d))
+        menu.addSeparator()
+        menu.addAction("Delete Selected", self.delete_selected)
+        menu.addSeparator()
+        menu.addAction("Select All Pages", self._list.selectAll)
+        menu.exec(self._list.viewport().mapToGlobal(pos))
 
     def _on_reordered(self, new_order: list, moved_rows: list):
         """Ask the host to apply the drop. The grid does not touch the document.
