@@ -1,11 +1,19 @@
-"""Undoable page-structure edits (delete, reorder) for the left page panel.
+"""Undoable page-structure edits (delete, reorder), for BOTH page panels.
 
 The canvas already owns a QUndoStack for item-level edits (draw, move, resize,
 restyle). Page delete and reorder used to CLEAR that stack, because the canvas
 files its markup by page index and a structural edit renumbers every page out
 from under the commands still sitting in it. Deleting pages was therefore a
-one-way door, which is fine for a deliberate trip through the Organizer and not
-fine at all for a Delete key in the thumbnail strip.
+one-way door.
+
+The left thumbnail strip came through here first and the Organizer did not, so
+for a while the SAME Delete key was reversible in one panel and, in the other,
+took the whole window's history with it (annotation edits included) with nothing
+on screen to say which panel had the keyboard. The Organizer used to apply its
+own edit and tell the view afterwards, which is what made that unfixable at the
+view: by the time it heard, the pages and the page order to put back were gone.
+Both panels now ASK, and the ask lands on the same two commands below. There is
+no second way to delete or reorder a page.
 
 These commands make both edits undoable by pairing the document change with a
 snapshot of the whole page-to-markup map. Undo puts the document AND the map

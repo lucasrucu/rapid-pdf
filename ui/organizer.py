@@ -167,6 +167,12 @@ class _DragList(QListWidget):
     as one merged block wherever the user drops them.
     """
     reordered = Signal(list)       # new order as a list of original page indices
+    # The same drop, plus the rows it moved. The plain `reordered` above cannot
+    # carry them: the Combine dialog reuses this widget and listens on it with a
+    # one-argument slot. The rows are what an undoable reorder needs, both for
+    # its label ("Move page" or "Move pages") and to leave the moved pages
+    # selected afterwards, and they cannot be recovered from the order alone.
+    reordered_rows = Signal(list, list)
     reorder_invalid = Signal()     # drop left the list in an unexpected state
     # (payload, insertion index, copy) - pages dragged in from ANOTHER open
     # document's grid or strip. The host owns the edit. Phase 5.
@@ -494,7 +500,7 @@ class _DragList(QListWidget):
             self.item(target + offset).setSelected(True)
 
         event.acceptProposedAction()
-        self._emit_reorder(n)
+        self._emit_reorder(n, rows)
 
     def _drop_row(self, pos) -> int:
         """Row index (pre-removal) the drop point resolves to: the row of the
@@ -511,7 +517,7 @@ class _DragList(QListWidget):
             row += 1
         return row
 
-    def _emit_reorder(self, expected_n: int):
+    def _emit_reorder(self, expected_n: int, moved_rows: list | None = None):
         """Read the post-drop order from item ids and report it (or flag a bad drop)."""
         if self.count() != expected_n:
             self.reorder_invalid.emit()
@@ -522,14 +528,23 @@ class _DragList(QListWidget):
             return
         if order != list(range(expected_n)):
             self.reordered.emit(order)
+            self.reordered_rows.emit(order, sorted(moved_rows or []))
 
 
 class PageOrganizer(QWidget):
     """Grid view for reviewing and reordering PDF pages."""
 
     page_activated = Signal(int)        # double-click → switch editor to this page
-    pages_reordered_perm = Signal(list)  # new page order (permutation of old indices)
-    pages_deleted = Signal(list)        # list of deleted page indices (descending)
+    # ASKS, not announcements. The grid used to edit the document itself and
+    # tell the host afterwards, which left the host with nothing to undo: by the
+    # time it heard, the pages and the page order it would have had to put back
+    # were already gone. So it clears the whole window history instead, and the
+    # same Delete key that is undoable in the left thumbnail strip cost the user
+    # every annotation edit they had made. Both requests below now land on the
+    # same host methods the strip uses, which push a real undo command. See
+    # ui/page_commands.py.
+    pages_reorder_requested = Signal(list, list)  # (new page order, rows moved)
+    pages_delete_requested = Signal(list)         # rows to delete, ascending
     needs_rebuild = Signal()            # ask the host to rebuild the markup thumbnails
     pages_added = Signal(int)           # pages inserted via "+ Add Pages" (count) → host marks unsaved
     # (payload, insertion index, copy) - pages dragged in from another document.
@@ -537,7 +552,12 @@ class PageOrganizer(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._doc = None       # real document, all structural edits happen here
+        # The real document. Page delete and reorder are asked for, not done
+        # here: the host applies them as one undoable command (see the request
+        # signals above). "+ Add Pages" is still applied here, because a merge
+        # brings in a file rather than rearranging this one and has never been
+        # on the undo stack.
+        self._doc = None
         self._render = None    # optional PDFDocument whose pages have markup baked in
         self._placeholder_color = QColor(LIGHT.surface_raised)  # themed via apply_palette()
         # Current rung of ZOOM_STEPS, restored from the last run, plus the
@@ -565,7 +585,7 @@ class PageOrganizer(QWidget):
         bar.addWidget(self._add_btn)
 
         self._del_btn = QPushButton("Delete Selected")
-        self._del_btn.setToolTip("Permanently remove selected pages from the document (Del)")
+        self._del_btn.setToolTip("Remove the selected pages (Del). Ctrl+Z puts them back")
         self._del_btn.clicked.connect(self.delete_selected)
         bar.addWidget(self._del_btn)
 
@@ -609,7 +629,7 @@ class PageOrganizer(QWidget):
         self._list.setUniformItemSizes(True)
         self._delegate = _ThumbDelegate(self._list)
         self._list.setItemDelegate(self._delegate)
-        self._list.reordered.connect(self._on_reordered)
+        self._list.reordered_rows.connect(self._on_reordered)
         self._list.transfer_requested.connect(self.pages_transfer_requested)
         self._list.reorder_invalid.connect(self.needs_rebuild)
         self._list.zoom_stepped.connect(self._on_zoom_stepped)
@@ -875,8 +895,9 @@ class PageOrganizer(QWidget):
         """Rasterise real thumbnails for any placeholder cells in (or near) view.
 
         Each thumbnail is pulled from its _SRC_ID page in the render doc, NOT its
-        current row: a drag reorders only the live doc, so a cell scrolled into
-        view after a reorder must still render its original clone page."""
+        current row: the cells move as soon as a drag is dropped, while the clone
+        they render from is only rebuilt once the host has applied the edit, so a
+        cell scrolled into view in between must still find its own clone page."""
         # `source_is_readable` rather than `if not src.doc`, which is the line
         # known bug 6 actually raised from: PyMuPDF's Document defines __len__,
         # so truth-testing a CLOSED document raises "document closed" instead
@@ -947,21 +968,37 @@ class PageOrganizer(QWidget):
         self._add_btn.setEnabled(has_doc)
         self._del_btn.setEnabled(has_doc)
 
-    def _retag_identity(self):
-        """After a structural edit the widget order == document order again, so
-        reset each item's stored page id to its row and relabel."""
-        for i in range(self._list.count()):
-            it = self._list.item(i)
-            it.setData(_PAGE_ID, i)
-            it.setText(f"Page {i + 1}")
-            it.setSizeHint(self._cell)
+    def _on_reordered(self, new_order: list, moved_rows: list):
+        """Ask the host to apply the drop. The grid does not touch the document.
 
-    def _on_reordered(self, new_order: list):
+        The cells have already moved, so the drag still feels immediate, but the
+        edit itself goes through the host's undoable reorder and the host rebuilds
+        this grid from the document afterwards (or rebuilds it unchanged, if it
+        refused the drop). That rebuild is what re-tags the cells, so there is no
+        _retag_identity() call here any more.
+        """
         if not self._doc:
             return
-        self._doc.reorder(new_order)
-        self.pages_reordered_perm.emit(new_order)
-        self._retag_identity()
+        self.pages_reorder_requested.emit(list(new_order), list(moved_rows))
+
+    def select_rows(self, rows: list):
+        """Highlight these rows, and scroll the last of them into view.
+
+        The host calls this after it has rebuilt the grid around a page command,
+        so the pages a drag just moved stay selected the way they do in the left
+        strip. Rows that no longer exist are skipped rather than refused: an undo
+        can rebuild a shorter grid than the one the selection was taken from.
+        """
+        if not rows:
+            return
+        self._list.clearSelection()
+        last = None
+        for row in rows:
+            if 0 <= int(row) < self._list.count():
+                last = self._list.item(int(row))
+                last.setSelected(True)
+        if last is not None:
+            self._list.scrollToItem(last)
 
     def _on_item_activated(self, item: QListWidgetItem):
         self.page_activated.emit(self._list.row(item))
@@ -998,27 +1035,35 @@ class PageOrganizer(QWidget):
             QMessageBox.critical(self, "Insert Error", "\n".join(errors))
 
     def delete_selected(self):
+        """Ask the host to delete the selected pages. Undoable, like the strip's.
+
+        The grid no longer deletes anything itself. It used to, and the host
+        could then only clear the window's undo history, so Delete here and
+        Delete in the left thumbnail strip did opposite things to an hour of
+        markup. Now both go through DeletePagesCommand.
+
+        The confirmation stays, reworded. The strip has no delete button on
+        purpose (a button is one mis-click from a page going), the Organizer
+        does have one, and one dialog is the friction that stands in for the
+        button the strip refuses to grow. It is not what makes the delete safe
+        any more, so it no longer says "permanently".
+        """
         if not self._doc or not self._doc.doc:
             return
-        rows = sorted(
-            {self._list.row(i) for i in self._list.selectedItems()},
-            reverse=True,
-        )
+        rows = sorted({self._list.row(i) for i in self._list.selectedItems()})
         if not rows:
             return
-        remaining = self._doc.page_count() - len(rows)
-        if remaining < 1:
+        if self._doc.page_count() - len(rows) < 1:
             QMessageBox.warning(self, "Cannot Delete", "Cannot delete all pages.")
             return
+        pages = "page" if len(rows) == 1 else f"{len(rows)} pages"
         answer = QMessageBox.question(
             self, "Delete Pages",
-            f"Permanently delete {len(rows)} page(s)?",
+            f"Delete {pages}? You can undo this with Ctrl+Z.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        for row in rows:               # descending → indices stay valid
-            self._doc.delete_page(row)
-            self._list.takeItem(row)
-        self.pages_deleted.emit(rows)
-        self._retag_identity()
+        # The host applies the edit and rebuilds this grid from the document,
+        # which is why no items are taken out here.
+        self.pages_delete_requested.emit(rows)
