@@ -99,9 +99,7 @@ from contextlib import contextmanager
 from math import ceil
 
 from PySide6.QtCore import QPoint, QPointF, QRect, QSize, Qt
-from PySide6.QtGui import (
-    QGuiApplication, QMouseEvent, QPainter, QPixmap, QRegion,
-)
+from PySide6.QtGui import QGuiApplication, QMouseEvent, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QTabBar, QWidget
 
 from ui.window_registry import WindowRegistry
@@ -348,14 +346,9 @@ def zone_insertion_index(bar: QTabBar, global_pos: QPoint) -> int:
 # the other, and nothing between the line and the edge. Lucas: "the visual of it
 # seems like the left side is cutoff, the tab look cutoff (the ghost tab)".
 #
-# THE BLEED IS AIR, NOT MORE STRIP, and that is the correction to the first
-# attempt at this. Growing the SOURCE by a pixel on every side does not add air:
-# on a strip whose tabs abut, the pixel outside the tab belongs to the tab next
-# door, and where the strip's scroll buttons start at the tab's right edge it
-# belongs to a scroll button. The picture then ends in somebody else's ink with
-# nothing between it and the edge, which is the same defect over again on the
-# other side. Lucas, second report: "it looks to be cutoff on the right side now
-# instead of the left". So the ring is reserved and never rendered into.
+# IT IS NOW A GUARANTEE RATHER THAN A HOPE, because the tab is DRAWN into this
+# picture instead of being copied out of the strip: the ring is space the
+# renderer is never given, so nothing can reach it. See `tab_pixmap`.
 GHOST_BLEED = 1
 
 
@@ -377,39 +370,58 @@ def ghost_rect(bar: QTabBar, rect: QRect) -> QRect:
 
     GHOST_BLEED IS THE AIR, one pixel of guaranteed nothing on every side, so
     the border has an edge to sit inside rather than an edge to be cut off by.
+
+    BOTH ARE HONOURED BY A CLIP NOW rather than hoped for. `render_tab` is given
+    the tab's rect plus the far border to draw in and is held to it, so a style
+    that paints outside the rect it was handed spends the far-border line and
+    stops there. QCommonStyle does exactly that: it carries a selected tab two
+    rows past the bottom of its rect so it merges into the pane below.
     """
     painted = QRect(rect.topLeft(), rect.size() + QSize(1, 1))
     return painted.adjusted(-GHOST_BLEED, -GHOST_BLEED,
                             GHOST_BLEED, GHOST_BLEED)
 
 
-def _foreign_controls(bar: QTabBar, rect: QRect):
-    """The bar's own child widgets that have nothing to do with tab `rect`.
-
-    The strip's scroll buttons, and every other tab's close button. A picture of
-    one tab may not carry any of them: with `setUsesScrollButtons(True)` a strip
-    that has scrolled parks the current tab with its right edge exactly where
-    the scroll buttons begin, and a picture that reaches one pixel further than
-    the tab comes back with a slice of a button welded to its right-hand side.
-    Measured: 55 of the sweep's tab-count and window-width combinations.
-    """
-    for child in bar.children():
-        if not isinstance(child, QWidget) or not child.isVisible():
-            continue
-        if not child.geometry().intersects(rect):
-            yield child
-
-
-def tab_pixmap(bar: QTabBar, rect: QRect):
+def tab_pixmap(bar: QTabBar, index: int):
     """A picture of one WHOLE tab, with a device pixel ratio that is true.
 
-    THE PICTURE IS OF A TAB, NOT OF A PIECE OF STRIP. What gets rendered is the
-    tab's painted extent and nothing else: the air ring `ghost_rect` reserved is
-    left untouched, and any control of the bar's that is not part of this tab is
-    subtracted from the region. Everything outside the tab is therefore
-    transparent by construction rather than by luck, which is what makes "a
-    border on all four sides with air beside it" true at the end of a scrolled
-    strip and next to a tab that abuts this one.
+    THE TAB IS DRAWN, NOT COPIED OUT OF THE STRIP, and that is the third and
+    last answer to "the ghost is cut off". The first two both accepted the
+    premise that a picture of a tab is a rectangle of the tab bar's pixels and
+    argued about which rectangle: bleed a pixel on every side, then bleed
+    asymmetrically because a QRect does not contain its own far border, then
+    subtract the controls that bleeding had swept up. Each of those fixed a real
+    defect and none of them could fix the next one, because the premise is what
+    is wrong. A shared strip is not a safe place to take a picture from:
+
+      THE TAB IS NOT WHERE `tabRect` SAYS IT IS. That is the defect that
+      survived both passes and it is the one Lucas kept seeing. A tear starts
+      out of a QTabBar reorder, and while a reorder is live QTabBar paints the
+      pressed tab at `tabRect` PLUS a drag offset it keeps to itself and does
+      not report. `_settle_tab_bar` ends the reorder, but the release only
+      starts a 250 ms animation that decays that offset, so the grab a
+      microsecond later still reads a rect the tab has visibly left. Measured on
+      a four-tab strip: slide 30 px right before pulling down and the tab is
+      painted 32 px right of the rect the picture is cut from, so the picture is
+      the tab's left-hand 185 px and 32 px of its neighbour. Slide left and the
+      same thing happens on the other side. Whether it happens at all depends on
+      whether that sideways travel ended in a reorder (which re-bases the offset
+      to nothing) or ran out of strip (which does not), and THAT depends on
+      which index the tab is at and which way it went. His report: "really
+      depeing on the position they were in, once was better or worse than
+      another ... cutff right or left etc".
+
+      AND EVERY NEIGHBOUR IS IN THE FRAME. The tabs abut, so the column beside
+      the tab belongs to the tab next door; a scrolled strip parks the current
+      tab against the scroll buttons; the first and last tab clip on the bar's
+      own edge.
+
+    So the picture is composed instead. The bar is asked to draw this one tab,
+    by itself, at a known place inside a pixmap of our own: same style, same
+    style option, same label and elision, same close button, same tick, and
+    nothing else on the canvas. Everything outside the tab is transparent
+    because nothing was ever drawn there, which no amount of choosing a
+    rectangle can guarantee. `DocumentTabBar.render_tab` is the other half.
 
     THE HOTSPOT DEPENDS ON THIS, and on the caller. The cursor is pinned to the
     point inside the tab that it took hold of, in logical pixels, and the ghost
@@ -422,7 +434,7 @@ def tab_pixmap(bar: QTabBar, rect: QRect):
     its pixmap with the widget's device pixel ratio and does not always manage
     it; a 150% display handing back a pixmap half again as large still tagged
     1.0 builds a ghost half again too big and puts the grab point two thirds of
-    the way along a tab the user took hold of in the middle. Rendering into a
+    the way along a tab the user took hold of in the middle. Painting into a
     pixmap this function made itself removes the question: the ratio is the
     bar's own, stamped on the target before anything is painted into it.
 
@@ -431,28 +443,19 @@ def tab_pixmap(bar: QTabBar, rect: QRect):
     device column of the ghost unpainted for the rest of the drag. Rounding up
     can only ever spend a column of the air ring.
     """
-    whole = ghost_rect(bar, rect)
+    whole = ghost_rect(bar, bar.tabRect(index))
     ratio = max(1.0, float(bar.devicePixelRatioF()))
     pixmap = QPixmap(QSize(ceil(whole.width() * ratio),
                            ceil(whole.height() * ratio)))
     pixmap.setDevicePixelRatio(ratio)
     pixmap.fill(Qt.GlobalColor.transparent)
-
-    painted = whole.adjusted(GHOST_BLEED, GHOST_BLEED,
-                             -GHOST_BLEED, -GHOST_BLEED)
-    region = QRegion(painted.intersected(bar.rect()))
-    for control in _foreign_controls(bar, rect):
-        region -= QRegion(control.geometry())
-    if region.isEmpty():
-        return pixmap                        # nothing on screen to picture
-    # Taken from the region rather than from `painted`, because subtracting a
-    # control can move the region's top-left corner and Qt measures the offset
-    # from wherever the region actually starts.
-    bar.render(pixmap, region.boundingRect().topLeft() - whole.topLeft(),
-               region,
-               QWidget.RenderFlag.DrawWindowBackground
-               | QWidget.RenderFlag.DrawChildren
-               | QWidget.RenderFlag.IgnoreMask)
+    # Inside the air ring, which is the whole of the guarantee: the renderer is
+    # handed an origin one pixel in from every edge and a tab-sized box to work
+    # in, so the ring is space it was never given.
+    render = getattr(bar, "render_tab", None)
+    if render is None:                       # pragma: no cover - defensive
+        return pixmap
+    render(index, pixmap, QPoint(GHOST_BLEED, GHOST_BLEED))
     return pixmap
 
 
@@ -493,6 +496,7 @@ class TabTearOff:
         self._press_local = QPoint()
         self._press_global = QPoint()
         self._press_index = -1
+        self._press_view = None       # the DOCUMENT pressed on; see `press`
         self._grab_in_tab = QPoint()  # where in the tab the cursor took hold
         self._view = None
         self._carried_title = ""      # its tab's label, for the ghost slot
@@ -543,6 +547,16 @@ class TabTearOff:
         what keeps Qt's own tab reordering and its current-tab change working.
         Everything below is a decision made later, on the first move that goes
         far enough.
+
+        THE DOCUMENT IS RECORDED, NOT JUST WHERE IT WAS SITTING, and that is
+        not belt and braces. Between this press and the move that becomes a
+        tear, QTabBar's own reorder can have run: slide a tab past its
+        neighbour and the two swap, so the index pressed on now names the
+        NEIGHBOUR. `_begin` looked the view up by that index, which meant a tab
+        reordered one position and then pulled down tore off the wrong
+        document, with the wrong name on the ghost slot. Measured on a five-tab
+        strip: press tab 4, slide 90 px left, pull down, and the gesture came
+        away holding doc3.
         """
         self._reset()
         if event.button() != Qt.MouseButton.LeftButton:
@@ -555,7 +569,16 @@ class TabTearOff:
         self._press_local = local
         self._press_global = event.globalPosition().toPoint()
         self._press_index = index
+        self._press_view = self._view_at(index)
         self._grab_in_tab = local - self._bar.tabRect(index).topLeft()
+
+    def _view_at(self, index: int):
+        """The document sitting at `index`, or None. Guarded because the tests
+        build bare tab bars with no area behind them."""
+        try:
+            return self._area.view_at(index)
+        except (AttributeError, RuntimeError):   # pragma: no cover - defensive
+            return None
 
     def move(self, event) -> bool:
         """Returns True when this gesture has taken the event.
@@ -664,7 +687,13 @@ class TabTearOff:
         source = bar.window()
         if source is None or not hasattr(source, "move_view_to_new_window"):
             return False
-        view = area.view_at(self._press_index)
+        # The view that was pressed on, not whatever is sitting at that index
+        # now: QTabBar's reorder may have swapped it with a neighbour since.
+        # See `press`. The index is only the fallback, for a caller that had no
+        # area to ask when the button went down.
+        view = self._press_view
+        if view is None or area.index_of(view) < 0:
+            view = area.view_at(self._press_index)
         if view is None:
             return False
 
@@ -731,9 +760,8 @@ class TabTearOff:
                 # to the left of the tab it is a picture of. See `tab_pixmap`.
                 self._offset = (QPoint(self._grab_in_tab)
                                 + QPoint(GHOST_BLEED, GHOST_BLEED))
-                tab_rect = bar.tabRect(index)
-                self._pixmap = tab_pixmap(bar, tab_rect)
-                self._ghost_size = ghost_rect(bar, tab_rect).size()
+                self._pixmap = tab_pixmap(bar, index)
+                self._ghost_size = ghost_rect(bar, bar.tabRect(index)).size()
                 self._attached_to = source
                 # It starts life attached to the window it came from, so the
                 # first move out of the strip detaches it exactly as a move out

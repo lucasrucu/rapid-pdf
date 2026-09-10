@@ -48,7 +48,9 @@ import os
 from PySide6.QtCore import (
     QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal,
 )
-from PySide6.QtGui import QAction, QColor, QFontMetrics, QPainter, QPen
+from PySide6.QtGui import (
+    QAction, QColor, QFontMetrics, QPainter, QPen, QRegion,
+)
 from PySide6.QtWidgets import (
     QAbstractButton, QHBoxLayout, QMenu, QSizePolicy, QStackedWidget, QStyle,
     QStyleOptionTab, QStylePainter, QTabBar, QToolButton, QVBoxLayout,
@@ -902,6 +904,100 @@ class DocumentTabBar(QTabBar):
             painter.restore()
         painter.end()
 
+    def render_tab(self, index: int, device, offset: QPoint):
+        """Draw ONE tab, by itself, onto `device`, with its rect at `offset`.
+
+        THE GHOST IS COMPOSED HERE INSTEAD OF BEING CUT OUT OF THE STRIP, and
+        that is what ends a class of bug rather than another instance of it.
+        See `tab_tear_off.tab_pixmap` for the three instances it ends and the
+        measurement behind each. The short version is that a rectangle of the
+        bar's pixels is never only this tab: the tabs abut, a scrolled strip
+        parks the current tab against the scroll buttons, the end tabs clip on
+        the bar's own edge, and worst of all a tab caught on its way out of a
+        QTabBar reorder is PAINTED somewhere `tabRect` does not report, so the
+        rectangle is cut from the wrong place entirely and which side it loses
+        depends on which way the tab was last slid.
+
+        None of that can reach a picture the tab is drawn into. The canvas is
+        this function's, the tab is the only thing on it, and everything the
+        caller reserved around it stays untouched because nothing is ever drawn
+        there.
+
+        IT IS THE SAME TAB, NOT A REDRAWING OF THE IDEA OF ONE. Everything comes
+        from `initStyleOption`, which is the same call `paintEvent` and
+        `_paint_parted_tabs` make: the style, the stylesheet, the label and the
+        width it has to elide into. The close button and the tick are added the
+        way the strip adds them. Two things are deliberately NOT taken from it,
+        and each is commented where it is overridden: the tab's place in the row,
+        because a ghost has no neighbours to share an edge with, and its selected
+        state, because the tab in your hand is the front one.
+        """
+        if not (0 <= index < self.count()):
+            return
+        rect = self.tabRect(index)
+        if rect.isEmpty():
+            return
+
+        option = QStyleOptionTab()
+        self.initStyleOption(option, index)
+        option.rect = QRect(offset, rect.size())
+        option.position = QStyleOptionTab.TabPosition.OnlyOneTab
+        option.selectedPosition = \
+            QStyleOptionTab.SelectedPosition.NotAdjacent
+        # AND IT IS DRAWN AS THE FRONT TAB. In the app it already is one:
+        # `mousePressEvent` hands the press to QTabBar, which makes the tab
+        # current, well before any move can start a tear, so the tab in the air
+        # is the selected tab every time and this changes nothing about what
+        # ships. What it buys is that the other case cannot fail silently.
+        # Measured: asked for a tab that is NOT selected, the stylesheet finds
+        # nothing drawable (`::tab` is a transparent fill inside a transparent
+        # border), hands the job to the platform style, and the platform style
+        # paints nothing at all onto a pixmap. An invisible ghost is a worse
+        # failure than an over-emphatic one, and the tab in your hand is the
+        # front tab in every browser there is. `_carried_title` is what puts a
+        # name on the gesture in any case.
+        option.state |= QStyle.StateFlag.State_Selected
+        painter = QStylePainter(device, self)
+        # THE BOX IS THE GUARANTEE, so it is enforced rather than trusted. A
+        # style is free to paint outside the rect it is handed and some do:
+        # QCommonStyle carries a selected tab a couple of rows PAST the bottom
+        # of its rect so it merges into the pane below, and a border stroked on
+        # the boundary of a rect lands on the line one past its far edge, which
+        # is the column `ghost_rect` reserves. So the clip is the rect plus that
+        # one line, and the air ring outside it is space no style is given.
+        painter.setClipRect(QRect(offset, rect.size() + QSize(1, 1)))
+        painter.drawControl(QStyle.ControlElement.CE_TabBarTab, option)
+        self._paint_check_mark(painter, index, option.rect)
+        painter.end()
+
+        # The close control is a real child widget rather than something the
+        # style draws, so it is rendered separately and at the offset it holds
+        # from its own tab. Read rather than recomputed: `_place_close_buttons`
+        # owns that number and having it in two places is how the X ends up a
+        # few pixels out in one of them.
+        button = self.tabButton(index, self._button_side())
+        if not isinstance(button, QWidget) or not button.isVisible():
+            return
+        home = self.painted_tab_rect(index).topLeft()
+        button.render(device, offset + button.geometry().topLeft() - home,
+                      QRegion(button.rect()),
+                      QWidget.RenderFlag.DrawWindowBackground
+                      | QWidget.RenderFlag.DrawChildren
+                      | QWidget.RenderFlag.IgnoreMask)
+
+    def _paint_check_mark(self, painter: QPainter, index: int, rect: QRect):
+        """The "ticked for Move Selected" bar along the top of a tab.
+
+        One owner, because it is drawn twice: onto the strip by `paintEvent`,
+        and onto the ghost by `render_tab`. A tab carried out of a window while
+        it is ticked should look ticked in the air.
+        """
+        if index not in self._checked:
+            return
+        painter.fillRect(
+            QRect(rect.left(), rect.top(), rect.width(), CHECK_MARK_HEIGHT),
+            self._accent())
+
     def _can_paint_drop_feedback(self) -> bool:
         """Whether this bar is a real strip rather than a few stray pixels.
 
@@ -1330,10 +1426,7 @@ class DocumentTabBar(QTabBar):
 
         for index in self._checked:
             if 0 <= index < self.count():
-                rect = self.tabRect(index)
-                painter.fillRect(
-                    QRect(rect.left(), rect.top(), rect.width(),
-                          CHECK_MARK_HEIGHT), accent)
+                self._paint_check_mark(painter, index, self.tabRect(index))
 
         # THE LITTLE YELLOW SQUARE, and why the line is gated on a width. A bar
         # with no tabs in it has a rect a few pixels wide, and a full-height

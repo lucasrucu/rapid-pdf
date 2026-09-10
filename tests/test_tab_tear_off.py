@@ -44,8 +44,8 @@ import fitz
 import pytest
 
 from PySide6.QtCore import QEvent, QPoint, QPointF, QSize, Qt
-from PySide6.QtGui import QKeyEvent, QMouseEvent
-from PySide6.QtWidgets import QApplication, QMessageBox, QTabBar
+from PySide6.QtGui import QKeyEvent, QMouseEvent, QPixmap, QRegion
+from PySide6.QtWidgets import QApplication, QMessageBox, QTabBar, QWidget
 
 from core.settings import Settings, set_settings
 from ui.main_window import MainWindow
@@ -886,6 +886,26 @@ def styled(qt_app):
     qt_app.setStyleSheet(previous)
 
 
+def _strip_image(bar):
+    """The whole bar, painted onto transparency.
+
+    NOT `bar.grab()`, which fills the pixmap with the palette's window colour
+    first and so answers "opaque" for every pixel of the strip. The strip's own
+    background is transparent under the app stylesheet, and a comparison that
+    cannot tell the tab from the gap beside it cannot tell a whole tab from a
+    clipped one either.
+    """
+    ratio = max(1.0, float(bar.devicePixelRatioF()))
+    pixmap = QPixmap(QSize(int(bar.width() * ratio), int(bar.height() * ratio)))
+    pixmap.setDevicePixelRatio(ratio)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    bar.render(pixmap, QPoint(0, 0), QRegion(bar.rect()),
+               QWidget.RenderFlag.DrawWindowBackground
+               | QWidget.RenderFlag.DrawChildren
+               | QWidget.RenderFlag.IgnoreMask)
+    return pixmap.toImage()
+
+
 def _opaque_columns(image):
     return [x for x in range(image.width())
             if any((image.pixel(x, y) >> 24) & 0xFF
@@ -905,6 +925,21 @@ def _air(image):
     assert cols and rows, "the picture is empty"
     return (cols[0], image.width() - 1 - cols[-1],
             rows[0], image.height() - 1 - rows[-1])
+
+
+def _content(image):
+    """(left, right, top, bottom) of the picture's ink, in its own pixels.
+
+    WHAT THE AIR MEASURE COULD NOT SEE. Air says there is nothing against the
+    edge; it says nothing about whether the tab in the middle is all there. A
+    picture cut short on one side has MORE air on that side and passes an air
+    assertion happily, which is how a clipped ghost went out twice. Comparing
+    this box between one tab and another is what catches a picture that is a
+    different shape depending on where its tab was sitting.
+    """
+    cols, rows = _opaque_columns(image), _opaque_rows(image)
+    assert cols and rows, "the picture is empty"
+    return (cols[0], cols[-1], rows[0], rows[-1])
 
 
 def _assert_whole_tab(image, ratio, where):
@@ -935,67 +970,120 @@ def _assert_whole_tab(image, ratio, where):
             f"{where}: no horizontal border at y={y}"
 
 
+@pytest.mark.parametrize("count", [2, 3, 4, 5])
 @pytest.mark.parametrize("theme", [False, True])
 def test_the_ghost_carries_the_whole_tab_and_not_a_column_less(
-        qt_app, store, registry, tmp_path, request, theme):
-    """DEFECT, twice over. First: "the visual of it seems like the left side is
-    cutoff, the tab look cutoff (the ghost tab)". Then, after the first fix:
-    "it looks to be cutoff on the right side now instead of the left".
+        qt_app, store, registry, tmp_path, request, theme, count):
+    """DEFECT, three times over. First: "the visual of it seems like the left
+    side is cutoff, the tab look cutoff (the ghost tab)". Then, after the first
+    fix: "it looks to be cutoff on the right side now instead of the left".
+    Then, with four tabs open: "really depeing on the position they were in,
+    once was better or worse than another".
 
-    Both are the same mistake made about a different edge. A QRect of width w at
-    x=L covers columns L..L+w-1, and a border stroked on its boundary lands on
-    the LINES x=L and x=L+w, so the right-hand one is a column the rect does not
-    contain. Growing the rect by one on every side does not fix that, it just
-    moves the problem: the far border then lands on the last column of the
-    picture with nothing beside it, which is what a cut-off tab looks like.
+    The first two were the same mistake made about a different edge of the same
+    rectangle. The third is not about the rectangle at all: it is about the fact
+    that a rectangle of the tab BAR's pixels is never a picture of one tab. The
+    ghost is drawn now (`DocumentTabBar.render_tab`), so what is asserted here
+    is the property that follows from drawing it: ink on all four edges of the
+    tab, and transparent pixels between that ink and every edge of the picture.
 
-    So what is asserted is the property, not an arithmetic identity: ink on all
-    four edges of the tab, and transparent pixels between that ink and every
-    edge of the picture. Run against a bare bar and against the product's
-    stylesheet, because the two paint their tabs in completely different places.
+    EVERY INDEX AT EVERY TAB COUNT, WHICH IS WHAT THE LAST VERSION OF THIS TEST
+    DID NOT DO. It opened two documents and looked at both, and the reported
+    fault only shows up as a difference BETWEEN positions. Run against a bare
+    bar and against the product's stylesheet, because the two paint their tabs
+    in completely different places.
     """
     if theme:
         request.getfixturevalue("styled")
-    window = _window(registry, tmp_path, ["a.pdf", "b.pdf"])
+    window = _window(registry, tmp_path,
+                     [f"doc{i}.pdf" for i in range(count)])
     bar = window.document_area().bar()
-    bar.setCurrentIndex(0)
     qt_app.processEvents()
 
-    for index in range(bar.count()):
-        rect = bar.tabRect(index)
-        image = tab_pixmap(bar, rect).toImage()
-        _assert_whole_tab(image, 1.0, f"theme={theme} tab {index}")
+    for current in range(count):
+        bar.setCurrentIndex(current)
+        qt_app.processEvents()
+        for index in range(bar.count()):
+            image = tab_pixmap(bar, index).toImage()
+            _assert_whole_tab(
+                image, 1.0,
+                f"theme={theme} {count} tabs, tab {index}, current {current}")
+
+
+@pytest.mark.parametrize("count", [2, 3, 4, 5])
+def test_the_ghost_is_the_same_picture_wherever_the_tab_is_sitting(
+        qt_app, store, registry, tmp_path, styled, count):
+    """THE REPORT, AS AN ASSERTION. "if you see really only the 2 tab, when
+    pulled was compelte, the other had some defect, cutff right or left etc".
+
+    A fault that changes with a tab's index is a fault about its NEIGHBOURS or
+    about where in the bar it sits, and both of the earlier fixes reasoned about
+    one tab on its own. Every tab on a strip is the same width, so every tab's
+    picture has to be the same shape: same content box, same air, whichever
+    index it is at and whether or not it is the current one. Anything that
+    varies with position is the bug, whatever its cause.
+    """
+    window = _window(registry, tmp_path,
+                     [f"doc{i}.pdf" for i in range(count)])
+    bar = window.document_area().bar()
+    qt_app.processEvents()
+
+    boxes = {}
+    for current in range(count):
+        bar.setCurrentIndex(current)
+        qt_app.processEvents()
+        for index in range(count):
+            image = tab_pixmap(bar, index).toImage()
+            where = "current" if index == current else "not current"
+            boxes.setdefault(where, {})[index] = (
+                image.size(), _content(image))
+
+    for where, seen in boxes.items():
+        first = seen[min(seen)]
+        for index, box in seen.items():
+            assert box == first, (
+                f"{count} tabs, {where}: tab {index} makes a different picture "
+                f"from tab {min(seen)} ({box} against {first})")
 
 
 def test_the_ghost_matches_the_strip_it_was_taken_from(
-        qt_app, store, registry, tmp_path):
-    """The picture is of THIS tab, in the right place, and not a redraw of one.
+        qt_app, store, registry, tmp_path, styled):
+    """The picture is of THIS tab, and it looks like the tab does.
 
-    Kept from the first fix and re-aimed at the painted extent rather than at
-    the bleed, which is now air by construction and has nothing to compare
-    against.
+    Kept from the first fix, and now the thing that keeps a DRAWN ghost honest:
+    a picture composed from the tab's own style option could drift from what the
+    strip paints, and the point of the ghost is that what leaves the strip looks
+    like what was on it. Compared over the tab's own rect, at the tab the
+    gesture can actually pick up, which is the current one.
+
+    A HANDFUL OF PIXELS OF SLACK, and it is named rather than papered over.
+    Painting the same tab through a painter that is not the widget's own leaves
+    the glyphs in the same places with the same ink coverage and a slightly
+    different antialiased fringe: measured at 363 pixels of a 240x34 tab, all of
+    them inside the label's own bounding box. What must not drift is the SHAPE,
+    so that is what gets no tolerance at all.
     """
     window = _window(registry, tmp_path, ["a.pdf", "b.pdf"])
     bar = window.document_area().bar()
     bar.setCurrentIndex(0)
     qt_app.processEvents()
     rect = bar.tabRect(0)
-    pixmap = tab_pixmap(bar, rect)
 
-    strip = bar.grab().toImage()
-    ghost = pixmap.toImage()
-    ratio = pixmap.devicePixelRatio()
-    step = int(round(ratio))
+    strip = _strip_image(bar)
+    ghost = tab_pixmap(bar, 0).toImage()
     origin = ghost_rect(bar, rect).topLeft()
-    source = rect.intersected(bar.rect())
-    for x in range(source.left(), source.right() + 1):
-        for y in range(source.top(), source.bottom() + 1):
-            for dx in range(step):
-                for dy in range(step):
-                    assert ghost.pixel((x - origin.x()) * step + dx,
-                                       (y - origin.y()) * step + dy) \
-                        == strip.pixel(x * step + dx, y * step + dy), \
-                        f"the ghost differs from the strip at {x},{y}"
+
+    differ = 0
+    for x in range(rect.left(), rect.right() + 1):
+        for y in range(rect.top(), rect.bottom() + 1):
+            here = ghost.pixel(x - origin.x(), y - origin.y())
+            there = strip.pixel(x, y)
+            # The shape: a pixel the strip covers is a pixel the ghost covers.
+            assert bool((here >> 24) & 0xFF) == bool((there >> 24) & 0xFF), \
+                f"the ghost's coverage differs from the strip's at {x},{y}"
+            differ += here != there
+    assert differ < 0.1 * rect.width() * rect.height(), \
+        f"{differ} pixels of the ghost differ from the strip"
 
 
 @pytest.mark.parametrize("ratio", [1.0, 1.25, 1.5, 2.0])
@@ -1030,7 +1118,7 @@ def test_the_ghost_is_tab_sized_at_any_device_pixel_ratio(
     monkeypatch.setattr(bar, "devicePixelRatioF", lambda: ratio)
     whole = ghost_rect(bar, rect)
 
-    pixmap = tab_pixmap(bar, rect)
+    pixmap = tab_pixmap(bar, 0)
     assert abs(pixmap.devicePixelRatio() - ratio) < 1e-3
     assert pixmap.size() == QSize(ceil(whole.width() * ratio),
                                   ceil(whole.height() * ratio))
@@ -1096,6 +1184,9 @@ def test_a_scrolled_strip_puts_no_scroll_button_in_the_ghost(
     back with a slice of a button welded to its right-hand side, hard against
     the edge, which is a cut-off tab by another route. Measured on 55 of the
     window-width and tab-count combinations before this was fixed.
+
+    A SCROLLED STRIP ALSO MOVES EVERY TAB, so the picture has to come out the
+    same shape at every scroll position too, not merely clean at each one.
     """
     window = _window(registry, tmp_path,
                      [f"doc{i}.pdf" for i in range(14)], size=(900, 800))
@@ -1103,19 +1194,114 @@ def test_a_scrolled_strip_puts_no_scroll_button_in_the_ghost(
     qt_app.processEvents()
     assert bar.count() == 14
 
-    checked = 0
+    boxes = []
     for index in range(bar.count()):
         bar.setCurrentIndex(index)
         qt_app.processEvents()
-        rect = bar.tabRect(index)
-        if not bar.rect().contains(rect.center()):
-            continue
-        checked += 1
-        _assert_whole_tab(tab_pixmap(bar, rect).toImage(), 1.0,
-                          f"scrolled tab {index}")
-    assert checked >= 8
+        image = tab_pixmap(bar, index).toImage()
+        _assert_whole_tab(image, 1.0, f"scrolled tab {index}")
+        boxes.append((index, image.size(), _content(image)))
+    assert len(boxes) == 14
+    for index, size, box in boxes:
+        assert (size, box) == (boxes[0][1], boxes[0][2]), (
+            f"scrolled tab {index} makes a different picture from tab 0")
 
 
+def test_a_tab_slid_along_the_bar_still_gives_a_whole_ghost(
+        qt_app, store, registry, tmp_path, styled):
+    """THE DEFECT THIS ROUND, and the one no fixed test had ever looked at.
+
+    A tear starts inside a QTabBar reorder. Press a tab, move sideways at all,
+    and QTabBar paints it at `tabRect` PLUS a drag offset it keeps to itself;
+    `_settle_tab_bar` ends the reorder but the release only starts a 250 ms
+    animation that decays that offset, so a picture cut from `tabRect` a
+    microsecond later is cut from a place the tab has visibly left. Whether it
+    happens depends on whether the sideways travel ended in a reorder, which
+    re-bases the offset to nothing, or ran out of strip, which does not, and
+    THAT depends on which index the tab is at and which way it went. Hence
+    "really depeing on the position they were in ... cutff right or left".
+
+    Measured before the fix, on four tabs: slide 30 px right and the picture was
+    the tab's left-hand 185 px plus 32 px of its neighbour. Slide left and the
+    same on the other side. Slide nothing and it was perfect, which is exactly
+    what every test in this file had been doing.
+
+    EVERY INDEX, EVERY COUNT, BOTH DIRECTIONS, AND THE ANSWER HAS TO BE THE SAME
+    ONE the quiet strip gives. A whole tab is not enough on its own here: the
+    picture must be the same shape it would have been with no reorder in it.
+    """
+    for count in (2, 3, 4, 5):
+        for index in range(count):
+            reference = None
+            for slide in (0, -30, 30, -90, 90):
+                window = _window(registry, tmp_path,
+                                 [f"doc{i}.pdf" for i in range(count)])
+                bar = window.document_area().bar()
+                tear = bar.tear_off()
+                qt_app.processEvents()
+
+                start = _tab_point(bar, index, dx=bar.tabRect(index).width() // 2)
+                _press(bar, start)
+                if slide:
+                    _move(bar, start + QPoint(slide, 0))
+                _move(bar, _below_bar(bar, start + QPoint(slide, 0)))
+
+                ghost = tear.ghost()
+                assert ghost is not None, f"no ghost at slide {slide}"
+                image = ghost.grab().toImage()
+                where = f"{count} tabs, tab {index}, slid {slide}"
+                _assert_whole_tab(image, 1.0, where)
+                box = (image.size(), _content(image))
+                if reference is None:
+                    reference = box
+                assert box == reference, (
+                    f"{where}: a different picture from the same tab with no "
+                    f"reorder in flight ({box} against {reference})")
+
+                _release(bar, _below_bar(bar, start + QPoint(slide, 0)))
+                qt_app.processEvents()
+                for w in list(registry.windows()):
+                    w.close()
+                qt_app.processEvents()
+
+
+def test_the_tab_that_is_torn_off_is_the_one_that_was_pressed(
+        qt_app, store, registry, tmp_path):
+    """DEFECT, found while measuring the one above, and worse than it.
+
+    QTabBar's own reorder runs between the press and the move that becomes a
+    tear, so a tab slid past its neighbour has swapped places with it by the
+    time the gesture starts. `_begin` looked the document up by the index that
+    was pressed on, which by then names the NEIGHBOUR: slide a tab one position
+    and then pull it down, and the window that opens holds the wrong document,
+    with the wrong name in the ghost slot. Measured on five tabs: press tab 4,
+    slide 90 px left, pull down, and the gesture came away holding doc3.
+    """
+    window = _window(registry, tmp_path,
+                     [f"doc{i}.pdf" for i in range(5)])
+    area = window.document_area()
+    bar = area.bar()
+    tear = bar.tear_off()
+    qt_app.processEvents()
+    carried = area.view_at(4)
+
+    start = _tab_point(bar, 4, dx=bar.tabRect(4).width() // 2)
+    _press(bar, start)
+    _move(bar, start + QPoint(-90, 0))
+    assert bar.tabText(3) == "doc4", "the reorder this test needs did not happen"
+
+    here = _below_bar(bar, start + QPoint(-90, 0))
+    _move(bar, here)
+    assert tear.is_dragging()
+    assert tear.carried_title() == "doc4"
+    _release(bar, here)
+    qt_app.processEvents()
+
+    assert registry.count() == 2
+    new = [w for w in registry.windows() if w is not window][0]
+    assert new.document_area().view_at(0) is carried
+    assert area.index_of(carried) < 0
+    area.check_invariant()
 
 
 def test_a_lone_tab_over_another_window_s_body_does_not_merge(
