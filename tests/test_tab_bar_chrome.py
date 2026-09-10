@@ -432,12 +432,15 @@ def test_the_ghost_marks_the_tab_being_carried(two_windows):
     assert bar.ghost_index() == 1
 
 
-def test_a_whole_window_being_carried_still_gets_the_line(two_windows):
-    """The one case the ghost cannot cover, and the reason the line survives.
+def test_a_whole_window_being_carried_gets_an_empty_ghost_slot(two_windows):
+    """THE CASE THAT USED TO GET THE LINE, AND WHY IT DOES NOT ANY MORE.
 
     A lone tab drags its own window and the merge is deferred to the release,
-    so nothing has joined the target strip: there is no tab to ghost and no gap
-    to open. The line is the only feedback available there.
+    so nothing has joined the target strip and there is no tab to ghost. That
+    was taken as a reason to fall back to a four-pixel insertion line, and the
+    line is what Lucas saw every single time he merged two windows: the ghost
+    "never appears". The slot is now held open empty instead, which is the same
+    gap in the same place, minus only the picture of the tab.
     """
     a, b = two_windows
     bar = b.document_area().bar()
@@ -446,8 +449,63 @@ def test_a_whole_window_being_carried_still_gets_the_line(two_windows):
     tear._whole_window = True
 
     tear._show_drop_feedback((b, 1))
-    assert bar.drop_indicator() == bar.insertion_x(1)
-    assert bar.ghost_index() is None
+    assert bar.drop_indicator() is None, "no line, that was the complaint"
+    assert bar.ghost_index() is None, "and no real tab has joined this strip"
+    slot = bar.ghost_slot_rect()
+    assert not slot.isEmpty()
+    assert slot.width() >= bar.tabRect(0).width() - 2 * TAB_SHAPE_MARGIN_X,         "a tab-sized gap, not a hairline"
+    # And it is where the tab would go, not merely somewhere on the strip.
+    assert slot.left() == bar.insertion_x(1) + TAB_SHAPE_MARGIN_X
+
+
+def test_the_empty_slot_makes_the_strip_wider_rather_than_covering_a_tab(
+        two_windows):
+    """The slot is REAL WIDTH. A strip that hugs its tabs has ten pixels of
+    spare room, so a tab-sized gap drawn into it without one would be clipped
+    to a sliver or painted straight over the tab next door."""
+    a, b = two_windows
+    bar = b.document_area().bar()
+    tear = a.document_area().bar()._tear_off
+    _pretend_dragging(tear, a, a.document_area().view_at(0))
+    tear._whole_window = True
+    was = bar.width()
+
+    tear._show_drop_feedback((b, bar.count()))
+    assert bar.width() >= was + bar.ghost_slot_width(), "the strip parted"
+    last = bar.tabRect(bar.count() - 1)
+    assert bar.ghost_slot_rect().left() >= last.right(),         "and the gap is past the last tab rather than on top of it"
+
+    tear._clear_drop_feedback_on(b)
+    assert bar.ghost_slot_rect().isEmpty()
+
+
+def test_a_lone_tab_and_a_carried_tab_get_the_same_kind_of_feedback(two_windows):
+    """Lucas does not make the distinction and should not have to. Both
+    gestures put a tab-shaped gap in the target strip, in the same place, and
+    neither draws a line."""
+    a, b = two_windows
+    bar = b.document_area().bar()
+    tear = a.document_area().bar()._tear_off
+
+    _pretend_dragging(tear, a, a.document_area().view_at(0))
+    tear._whole_window = True
+    tear._show_drop_feedback((b, bar.count()))
+    lone = bar.ghost_slot_rect()
+    tear._clear_drop_feedback_on(b)
+
+    view = a.document_area().view_at(0)
+    _carried_into(tear, a, b, view, b.document_area().count())
+    tear._whole_window = False
+    tear._show_drop_feedback((b, bar.count() - 1))
+    carried = bar.ghost_slot_rect()
+
+    # Both are a tab-shaped gap of the same size, and neither is a line. The
+    # POSITIONS cannot be compared directly: the carried case has really moved
+    # its view into this strip, so the strip it opens a gap in has one more tab
+    # in it than the lone case does.
+    assert not lone.isEmpty() and not carried.isEmpty()
+    assert bar.drop_indicator() is None
+    assert lone.size() == carried.size()
 
 
 def test_an_empty_strip_is_never_marked(two_windows):

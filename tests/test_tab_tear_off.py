@@ -41,15 +41,15 @@ SECTIONS.
 import fitz
 import pytest
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+from PySide6.QtCore import QEvent, QPoint, QPointF, QSize, Qt
 from PySide6.QtGui import QKeyEvent, QMouseEvent
 from PySide6.QtWidgets import QApplication, QMessageBox, QTabBar
 
 from core.settings import Settings, set_settings
 from ui.main_window import MainWindow
 from ui.tab_tear_off import (
-    DETACH_MARGIN, DOCK_MARGIN, INCOMING_SLACK, REDOCK_MARGIN, insertion_index,
-    tab_pixmap,
+    DETACH_MARGIN, DOCK_MARGIN, GHOST_BLEED, INCOMING_SLACK, REDOCK_MARGIN,
+    insertion_index, tab_pixmap,
 )
 from ui.window_registry import WindowRegistry
 
@@ -847,50 +847,96 @@ def test_the_ghost_hangs_from_the_point_in_the_tab_it_was_grabbed_by(
     first = _below_bar(bar, start)
     _move(bar, first)
     assert tear.ghost() is not None
-    assert first - tear.ghost_position(first) == grab
+    # Plus the bleed, because the picture starts one pixel up and to the left
+    # of the tab it is a picture of. The two have to move together or the
+    # ghost sits a pixel off the pointer; see `tab_pixmap`.
+    hotspot = grab + QPoint(GHOST_BLEED, GHOST_BLEED)
+    assert first - tear.ghost_position(first) == hotspot
 
     moved = first + QPoint(430, 260)
     _move(bar, moved)
-    assert moved - tear.ghost_position(moved) == grab
+    assert moved - tear.ghost_position(moved) == hotspot
     _release(bar, moved)
 
 
-@pytest.mark.parametrize("ratio", [1.0, 1.5, 2.0])
+def _painted_tab_source(bar, index):
+    """The part of the strip a WHOLE picture of tab `index` has to contain.
+
+    Its own rect grown by the bleed, clipped to the bar, because a tab paints
+    outside its rect and the bar paints nothing outside itself.
+    """
+    rect = bar.tabRect(index)
+    return rect.adjusted(-GHOST_BLEED, -GHOST_BLEED,
+                         GHOST_BLEED, GHOST_BLEED).intersected(bar.rect())
+
+
+def test_the_ghost_carries_the_whole_tab_and_not_a_column_less(
+        qt_app, store, registry, tmp_path):
+    """DEFECT: "the visual of it seems like the left side is cutoff, the tab
+    look cutoff (the ghost tab)".
+
+    A tab's border is stroked ON the boundary of its rect, so a 1px pen
+    straddles it and half of that pen falls OUTSIDE. Measured on the real
+    strip: a selected tab whose rect is x=0..239 paints its left border at
+    x=0, hard against the edge with no air beside it, and its right border at
+    x=240, which `grab(rect)` never sees. What floats over the page is then a
+    tab with a line down one side and nothing down the other.
+
+    So the picture is compared, pixel for pixel, against the strip it was
+    taken from: every pixel of the grown region has to be in it, in the right
+    place. That is a stronger claim than "the sizes match", and it is the one
+    that fails on the old code.
+    """
+    window = _window(registry, tmp_path, ["a.pdf", "b.pdf"])
+    bar = window.document_area().bar()
+    bar.setCurrentIndex(0)
+    qt_app.processEvents()
+    rect = bar.tabRect(0)
+    pixmap = tab_pixmap(bar, rect)
+
+    ratio = pixmap.devicePixelRatio()
+    assert round(pixmap.width() / ratio) == rect.width() + 2 * GHOST_BLEED
+    assert round(pixmap.height() / ratio) == rect.height() + 2 * GHOST_BLEED
+
+    strip = bar.grab().toImage()
+    ghost = pixmap.toImage()
+    step = int(round(ratio))
+    source = _painted_tab_source(bar, 0)
+    origin = rect.topLeft() - QPoint(GHOST_BLEED, GHOST_BLEED)
+    for x in range(source.left(), source.right() + 1):
+        for y in range(source.top(), source.bottom() + 1):
+            for dx in range(step):
+                for dy in range(step):
+                    assert ghost.pixel((x - origin.x()) * step + dx,
+                                       (y - origin.y()) * step + dy)                         == strip.pixel(x * step + dx, y * step + dy),                         f"the ghost differs from the strip at {x},{y}"
+
+
+@pytest.mark.parametrize("ratio", [1.0, 2.0])
 def test_the_ghost_is_tab_sized_at_any_device_pixel_ratio(
         qt_app, store, registry, tmp_path, monkeypatch, ratio):
     """THE OTHER HALF OF THE HOTSPOT, and the classic cause of a drag image
     that will not stay under the pointer on a scaled screen.
 
-    The grab offset is in logical pixels, so it only lands on the right part of
-    the ghost while the ghost is the same LOGICAL size as the tab. On a 150%
-    display `QWidget.grab` hands back a pixmap half again as large in raw
-    pixels, and if it comes back tagged 1.0 the ghost is built half again too
-    big and the grab point slides down it. `tab_pixmap` measures the ratio off
-    the pixmap instead of trusting the tag, which is what this drives: the
-    grab is faked at each ratio, untagged, exactly as the bad case looks.
+    The grab offset is in logical pixels, so it only lands on the right part
+    of the ghost while the ghost is the same LOGICAL size as the tab. The
+    picture is now rendered into a pixmap this code made itself, with the
+    bar's own ratio stamped on it before anything is painted, so the raw size
+    and the tag can no longer disagree the way an untagged `QWidget.grab` on a
+    150% display makes them disagree.
 
     Offscreen runs everything at 1.0, so the scaling cannot be asked for and
-    has to be handed in.
+    is handed to the bar instead.
     """
     window = _window(registry, tmp_path, ["a.pdf", "b.pdf"])
     bar = window.document_area().bar()
     tear = bar.tear_off()
     rect = bar.tabRect(0)
-    real = QTabBar.grab
+    monkeypatch.setattr(bar, "devicePixelRatioF", lambda: ratio)
 
-    def scaled(self, *args, **kwargs):
-        pixmap = real(self, *args, **kwargs)
-        if not args or pixmap.isNull():
-            return pixmap
-        # As an untagged grab on a scaled screen arrives: raw device pixels,
-        # still claiming a ratio of 1.0.
-        return pixmap.scaled(round(pixmap.width() * ratio),
-                             round(pixmap.height() * ratio))
-
-    monkeypatch.setattr(QTabBar, "grab", scaled)
     pixmap = tab_pixmap(bar, rect)
     assert abs(pixmap.devicePixelRatio() - ratio) < 1e-3
-    assert round(pixmap.width() / pixmap.devicePixelRatio()) == rect.width()
+    assert pixmap.width() == round((rect.width() + 2 * GHOST_BLEED) * ratio)
+    assert round(pixmap.width() / pixmap.devicePixelRatio())         == rect.width() + 2 * GHOST_BLEED
 
     grab = QPoint(25, 7)
     start = _tab_point(bar, 0, dx=grab.x(), dy=grab.y())
@@ -899,8 +945,9 @@ def test_the_ghost_is_tab_sized_at_any_device_pixel_ratio(
     _move(bar, here)
     ghost = tear.ghost()
     assert ghost is not None
-    assert ghost.size() == rect.size()
-    assert here - tear.ghost_position(here) == grab
+    bleed = QSize(2 * GHOST_BLEED, 2 * GHOST_BLEED)
+    assert ghost.size() == rect.size() + bleed
+    assert here - tear.ghost_position(here)         == grab + QPoint(GHOST_BLEED, GHOST_BLEED)
     _release(bar, here)
 
 
@@ -1354,22 +1401,58 @@ def test_leaving_the_tab_area_closes_the_gap(qt_app, store, registry, tmp_path):
     assert moving.window() not in (source, other)
 
 
-def test_a_whole_window_drag_still_only_merges_on_the_strip(
+def test_a_whole_window_merges_on_the_same_zone_a_carried_tab_does(
         qt_app, store, registry, tmp_path):
-    """THE ZONE THAT MUST NOT GROW. A tab under the cursor is tab-sized and
-    aimed; a window under the cursor covers whatever it is over, and sliding
-    one window across another is what arranging a desk looks like. Charging
-    that gesture a merge would make windows impossible to place.
+    """DEFECT 3. Two gestures, one target, because from the other side of the
+    screen they are one gesture.
 
-    So the wide incoming zone is a rule about carrying a TAB. A carried WINDOW
-    still has to be over the target's strip, and the middle assertion is what
-    proves the new zone did not leak into it: a depth that a carried tab would
-    call the tab area is not one a carried window may merge from.
+    A whole window used to be hit-tested against the target BAR plus 18 px,
+    while a carried tab got the window full width. The bar hugs its tabs, so
+    on a 1200 px window holding one document that was a 250 px box: "i even
+    need to over lap the tab in order for it to catch like amagnet". Both now
+    merge on `_tab_zone`, and the assertion that matters is the one where the
+    old rule said no.
+    """
+    source = _window(registry, tmp_path, ["a.pdf"], at=(100, 100))
+    other = _window(registry, tmp_path, ["x.pdf"], at=(2000, 100))
+    bar = source.document_area().bar()
+    other_bar = other.document_area().bar()
+
+    start = _tab_point(bar, 0)
+    _press(bar, start)
+    _move(bar, start + QPoint(QApplication.startDragDistance() + 4, 0))
+    assert bar.tear_off().is_dragging()
+    assert bar.tear_off()._whole_window, "one tab drags its own window"
+
+    # Far to the right of the only tab and below the row: outside the band the
+    # old rule used, and squarely inside the window tab area.
+    over = _in_zone(other, other.width() - 60, 6)
+    old_band = other_bar.rect().adjusted(0, -DOCK_MARGIN, 0, DOCK_MARGIN)
+    assert not old_band.contains(other_bar.mapFromGlobal(over)), \
+        "the point has to be outside the band this replaces"
+    _move(bar, over)
+    target = bar.tear_off().drop_target()
+    assert target is not None and target[0] is other
+
+    _escape(bar)
+    assert source.document_area().count() == 1
+    assert other.document_area().count() == 1
+
+
+def test_a_whole_window_dropped_on_the_page_is_not_a_merge(
+        qt_app, store, registry, tmp_path):
+    """THE ANTI-SWALLOW RULE, NOW MADE OF THE ZONE RATHER THAN THE GESTURE.
+
+    A window under the cursor covers whatever it is over, and sliding one
+    window across another is what arranging a desk looks like. Charging that a
+    merge would make windows impossible to place. The protection used to be
+    "windows may only merge over a strip"; it is now "the zone stops above the
+    page", which costs the gesture nothing and gives it the whole of the
+    chrome. See INCOMING_SLACK for the measurement.
     """
     source = _window(registry, tmp_path, ["a.pdf"], at=(100, 100))
     other = _window(registry, tmp_path, ["x.pdf", "y.pdf"], at=(2000, 100))
     bar = source.document_area().bar()
-    other_bar = other.document_area().bar()
 
     start = _tab_point(bar, 0)
     _press(bar, start)
@@ -1378,18 +1461,134 @@ def test_a_whole_window_drag_still_only_merges_on_the_strip(
 
     body = other.mapToGlobal(QPoint(other.width() // 2, other.height() // 2))
     _move(bar, body)
-    assert bar.tear_off().drop_target() is None, "the body is not a merge"
+    assert bar.tear_off().drop_target() is None, "the page is not a merge"
 
-    between = _in_zone(other, other.width() // 2, DOCK_MARGIN + 8)
-    assert between.y() < _bar_bottom(other) + INCOMING_SLACK, \
-        "the point has to be inside what a carried TAB would call the zone"
-    _move(bar, between)
-    assert bar.tear_off().drop_target() is None, "and neither is the zone"
-
-    over = _tab_point(other_bar, 0, dx=4)
-    _move(bar, over)
-    assert bar.tear_off().drop_target() == (other, 0)
+    _move(bar, _in_zone(other, other.width() // 2, INCOMING_SLACK + 20))
+    assert bar.tear_off().drop_target() is None, "and neither is below the zone"
 
     _escape(bar)
     assert source.document_area().count() == 1
     assert other.document_area().count() == 2
+
+
+def test_a_lone_tabs_window_gets_a_ghost_slot_and_never_a_line(
+        qt_app, store, registry, tmp_path):
+    """DEFECT 3, THE FEEDBACK HALF. What he saw when he merged was the yellow
+    insertion line, every time, because the ghost was reserved for a tab that
+    had already joined the strip. The gap is now held open empty instead."""
+    source = _window(registry, tmp_path, ["a.pdf"], at=(100, 100))
+    other = _window(registry, tmp_path, ["x.pdf"], at=(2000, 100))
+    bar = source.document_area().bar()
+    other_bar = other.document_area().bar()
+
+    start = _tab_point(bar, 0)
+    _press(bar, start)
+    _move(bar, start + QPoint(QApplication.startDragDistance() + 4, 0))
+    _move(bar, _in_zone(other, other.width() - 60, 6))
+
+    assert other_bar.drop_indicator() is None, "no line, that was the defect"
+    slot = other_bar.ghost_slot_rect()
+    assert not slot.isEmpty(), "a tab-shaped gap instead"
+    assert slot.width() > other_bar.tabRect(0).width() // 2, \
+        "and it is a gap, not a hairline"
+    assert slot.left() >= other_bar.tabRect(0).right(), \
+        "past the only tab, which is where this drop lands"
+
+    _escape(bar)
+    assert other_bar.ghost_slot_rect().isEmpty(), "and it closes again"
+    assert other_bar.drop_indicator() is None
+
+
+def test_the_incoming_zone_reaches_the_bottom_of_the_chrome_and_no_further(
+        qt_app, store, registry, tmp_path):
+    """DEFECT 4. "i need to get real close, i even need to over lap the tab in
+    order for it to catch like amagnet, so make that are anot only the copete
+    width of the idow but also the bottom add mroe pixels".
+
+    Just inside and just outside, on the gesture the depth actually gates: a
+    whole window, where outside the zone means no merge at all. A carried tab
+    lands anywhere over a window whatever the depth, so the depth only buys it
+    precision and this is the case that can see the edge.
+    """
+    source = _window(registry, tmp_path, ["a.pdf"], at=(100, 100))
+    other = _window(registry, tmp_path, ["x.pdf"], at=(2000, 100))
+    bar = source.document_area().bar()
+
+    start = _tab_point(bar, 0)
+    _press(bar, start)
+    _move(bar, start + QPoint(QApplication.startDragDistance() + 4, 0))
+
+    _move(bar, _in_zone(other, other.width() // 2, INCOMING_SLACK))
+    assert bar.tear_off().drop_target() is not None, \
+        "the last row of the zone is in the zone"
+
+    _move(bar, _in_zone(other, other.width() // 2, INCOMING_SLACK + 1))
+    assert bar.tear_off().drop_target() is None, "and the next one is not"
+
+    # And it is deeper than it was, which is the actual complaint.
+    assert INCOMING_SLACK > DETACH_MARGIN * 3
+    _escape(bar)
+
+
+def test_the_tab_left_behind_does_not_change_shape_during_a_drag(
+        qt_app, store, registry, tmp_path):
+    """DEFECT 2. "the actual tab, bc it also still displays in the window, has
+    the x too close to the sid eof the tab, when its normal it doesnt change
+    and th position is ok but after when in gohst it changes".
+
+    `DocumentTabBar._place_close_buttons` runs off three hooks and Qt uses more
+    paths than those three: `layoutWidgets` sets every tab button geometry
+    directly and raises no `tabLayoutChange`. Measured, a press on a tab moves
+    the X by two pixels from inside `QTabBar::mousePressEvent`, and the only
+    thing that put it back in that trace was an unrelated `setTabText` several
+    events later. During a drag nothing unrelated happens, so it stays moved.
+
+    The middle assertion is the one with teeth: it does to the button exactly
+    what Qt does, and a bar that has not pinned it fails there.
+    """
+    window = _window(registry, tmp_path, ["a.pdf", "b.pdf", "c.pdf"])
+    bar = window.document_area().bar()
+    bar.setCurrentIndex(0)
+    qt_app.processEvents()
+
+    def shape(index):
+        return bar.tabRect(index), bar.close_button(index).geometry()
+
+    before = shape(1)
+    start = _tab_point(bar, 0, dx=30)
+    _press(bar, start)
+    for dx in (8, 40, 90):
+        _move(bar, start + QPoint(dx, 0))
+    _move(bar, _below_bar(bar, start + QPoint(90, 0)))
+    assert bar.tear_off().is_dragging()
+    assert shape(1) == before, "the tab left behind is untouched by the drag"
+
+    button = bar.close_button(1)
+    button.move(button.geometry().x() + 6, button.geometry().y())
+    assert shape(1) == before, "and Qt cannot move its X out from under it"
+
+    _escape(bar)
+    assert shape(1) == before, "still, after the drag"
+
+
+def test_the_close_button_still_slides_with_a_reordering_tab(
+        qt_app, store, registry, tmp_path):
+    """The other side of the pin, and why it is not simply always on.
+
+    QTabBar slides the pressed tab by a drag offset that `tabRect` does not
+    report, and moves that tab close button with it. Pinning through a reorder
+    would peg the X to the un-slid position and it would sit still while its
+    own tab slid out from under it.
+    """
+    window = _window(registry, tmp_path, ["a.pdf", "b.pdf", "c.pdf"])
+    bar = window.document_area().bar()
+    start = _tab_point(bar, 0, dx=30)
+    _press(bar, start)
+    _move(bar, start + QPoint(120, 0))
+    assert not bar.tear_off().is_dragging(), "still a reorder"
+
+    button = bar.close_button(0)
+    where = button.geometry().x()
+    button.move(where + 40, button.geometry().y())
+    assert button.geometry().x() == where + 40, "nothing pinned it back"
+    _release(bar, start + QPoint(120, 0))
