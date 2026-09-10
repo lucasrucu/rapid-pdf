@@ -38,14 +38,29 @@ recorded off windows the OS actually placed and the restored windows are put
 back at those coordinates. It also checks the thing the whole phase is for:
 that reopening N tabs reads exactly one file per window.
 
-PHASE 4 ADDED THE TEAR-OFF GESTURE STEPS. Those steps are the reason to
-prefer the second command line above. The pytest suite drives the gesture by
-handing synthesised QMouseEvents to the tab bar, which is enough to pin the
-decisions it makes; what it cannot do is grab the mouse, move a real top-level
-window under a cursor, or say whether the geometry the gesture computes lands
-anywhere sensible on a real screen. Run natively and watch: the torn-off window
-should appear under the pointer with the tab where the pointer left it, not
-offset by a title bar.
+PHASE 4 ADDED THE TEAR-OFF GESTURE STEPS, AND THE GHOST REWRITE CHANGED WHAT
+THEY WATCH. Those steps are the reason to prefer the second command line above.
+The pytest suite drives the gesture by handing synthesised QMouseEvents to the
+tab bar, which is enough to pin the decisions it makes; what it cannot do is
+grab the mouse, put a real top-level on screen under a cursor, or say whether
+the geometry the gesture computes lands anywhere sensible on a real screen.
+
+TWO DIFFERENT THINGS FOLLOW THE POINTER, and there is a step for each.
+
+  step 5  A TAB is carried as a GHOST, a tab-sized picture. Nothing moves and
+          no window is created while the button is down; the real window is
+          made on the RELEASE. That reversal is the whole of the rewrite in
+          ui/tab_tear_off.py, so this step pins both halves of it: a ghost that
+          tracks the cursor mid-drag, and no new window until the drop.
+  step 6  A WINDOW HOLDING ONE TAB drags ITSELF, live, because there is no
+          second window to make. No ghost, the real window follows the cursor,
+          the merge into another strip is deferred to the release, and the
+          feedback on the target strip is the insertion LINE rather than a
+          ghost slot.
+
+Run natively and watch: the ghost should sit under the pointer at the point on
+the tab it was grabbed by, not offset by a title bar, and the window should
+appear where the button came up.
 """
 
 import os
@@ -111,6 +126,43 @@ def _move(bar, global_pos):
 def _release(bar, global_pos):
     bar.mouseReleaseEvent(
         _mouse(QMouseEvent.Type.MouseButtonRelease, bar, global_pos))
+
+
+def _vacant_point(registry, start):
+    """A point no window of ours covers, walking down from `start`.
+
+    A DROP HAS TO LAND ON EMPTY DESKTOP TO MAKE A WINDOW, and "empty" is a
+    question about the registry rather than about the screen: `_hit_test` walks
+    exactly the windows the registry knows and returns a target for any point
+    inside one of their frames. Picking a corner and hoping is what makes a
+    tool fail for a reason that has nothing to do with the code under it, so
+    the point is checked against the frames the OS actually gave the windows.
+
+    The FRAME and not the geometry, because a frameless window still carries a
+    resize border and the gap the layout leaves has to clear it.
+    """
+    point = QPoint(start)
+    for _ in range(60):
+        covered = [w.frameGeometry() for w in registry.windows()
+                   if w.isVisible()]
+        if not any(rect.contains(point) for rect in covered):
+            return point
+        point += QPoint(0, 40)
+    return point
+
+
+def settle(app, passes=8):
+    """Let deferred work run before asking what happened.
+
+    `MainWindow.move_view_to_window` puts the close of an emptied window on the
+    NEXT pass of the event loop rather than closing it where it stands, and
+    that `singleShot(0, ...)` is the 0xC000041D fix rather than a detail. The
+    ghost is retired the same way, with `deleteLater`. `run()` is itself a
+    timer callback, so nothing deferred inside it happens until it is pumped
+    and a window that has already lost its last tab is still in the registry.
+    """
+    for _ in range(passes):
+        app.processEvents()
 
 
 def check(label, condition, detail=""):
@@ -284,58 +336,216 @@ def run(app, folder):
     # something left behind when it goes.
     first.open_paths([make_pdf(folder, "delta.pdf", 2)])
     check("three tabs to drag from", area.count() == 3, area.count())
+
+    # THE WINDOWS ARE PLACED BY HAND HERE, AND IT IS NOT TIDINESS.
+    # `move_view_to_new_window` offsets a new window from its parent by
+    # NEW_WINDOW_OFFSET, which is 32, and a strip accepts a carried window
+    # anywhere in a band DOCK_MARGIN (18) px above and below it. So the window
+    # step 2 made sits 32 px down and across from the one it came from, with
+    # its own tabs inside that window's dock band and almost on top of the tabs
+    # these steps have to aim at. `TabTearOff._hit_test` breaks a tie between
+    # two windows under the cursor on ACTIVATION order, so that overlap turns
+    # every target check below into a question about which window was touched
+    # last rather than about where the cursor is.
+    #
+    # A MainWindow will not go below 1100x720 (setMinimumSize in
+    # ui/main_window.py), so on an ordinary screen the two cannot be pulled
+    # fully apart, and they do not have to be. Every point these steps aim at
+    # is in the LEFT half of the LEFT window, so the only thing that has to be
+    # true is that the other one starts to the right of all of them.
+    first.setGeometry(40, 60, 1100, 720)
+    second.setGeometry(760, 60, 1100, 720)
+    settle(app)
+
     torn_view = area.view_at(2)
     torn_canvas = torn_view._canvas
     torn_scene = torn_canvas.scene()
+    windows_before = registry.count()
 
     grab = _tab_point(bar, 2)
     _press(bar, grab)
-    _move(bar, _below_bar(bar, grab))
-    third = bar.tear_off().floating_window()
-    check("crossing the threshold made a window",
+    mid_air = _below_bar(bar, grab)
+    _move(bar, mid_air)
+    tear = bar.tear_off()
+
+    # A GHOST, AND NOT ONE THING ELSE. The window is made on the DROP now, so
+    # while the button is down the document has not moved, the source strip
+    # still holds all three tabs, and the only new object on screen is a
+    # picture of the tab. Deferring the creation is the whole point of the
+    # rewrite: nothing is built while the mouse is captured, so nothing has to
+    # be torn down inside the release handler, which is where the 0xC000041D
+    # came from. Both halves are worth pinning, so both are checked.
+    check("the gesture engaged", tear.is_dragging())
+    ghost = tear.ghost()
+    check("a ghost is carrying the tab", ghost is not None)
+    check("no window was made on the crossing",
+          registry.count() == windows_before, registry.count())
+    check("the document has not moved", torn_view.window() is first)
+    check("the source strip still holds all three", area.count() == 3,
+          area.count())
+    check("floating_window() answers None, as it says it does",
+          tear.floating_window() is None, tear.floating_window())
+    check("the bar has the mouse", QWidget.mouseGrabber() is bar,
+          QWidget.mouseGrabber())
+    area.check_invariant()
+
+    # THE GHOST IS WHAT FOLLOWS THE CURSOR NOW, so the offset between the
+    # pointer and the thing being carried is what has to stay constant, and it
+    # is measured off the ghost rather than off a window. Only a real platform
+    # plugin puts the ghost on screen at coordinates worth measuring, which is
+    # the reason to run this script the second way.
+    if ghost is not None:
+        offset = mid_air - ghost.frameGeometry().topLeft()
+        further = mid_air + QPoint(150, 110)
+        _move(bar, further)
+        carried = tear.ghost()
+        check("the same ghost is still in flight", carried is ghost)
+        moved_to = (carried.frameGeometry().topLeft()
+                    if carried is not None else None)
+        check("the ghost tracked the cursor",
+              moved_to is not None and further - moved_to == offset,
+              f"{offset} -> {None if moved_to is None else further - moved_to}")
+        check("and the OS put it where the gesture computed",
+              moved_to == tear.ghost_position(further),
+              f"{tear.ghost_position(further)} -> {moved_to}")
+        # No downward clearance any more. The old floating window was held 46 px
+        # below the pointer so it would not cover its own drop feedback; a ghost
+        # is tab-sized and the OS hit test passes straight through it.
+        check("no clearance below the pointer",
+              tear.ghost_position(further).y() <= further.y(),
+              f"{tear.ghost_position(further).y()} vs {further.y()}")
+
+    # Out over empty desktop and let go. This is the only place a window is
+    # created, and it happens with the button already up.
+    drop_at = _vacant_point(registry, QPoint(300, 620))
+    _move(bar, drop_at)
+    check("over no window at all", tear.drop_target() is None, tear.drop_target())
+    expected_at = tear.ghost_position(drop_at)
+    _release(bar, drop_at)
+    settle(app)
+
+    check("the drag is over", not bar.tear_off().is_dragging())
+    check("the ghost is gone", bar.tear_off().ghost() is None)
+    third = torn_view.window()
+    check("releasing made a window",
           third is not None and third is not first and third is not second)
-    check("three windows now", registry.count() == 3, registry.count())
-    check("the torn window holds the document",
-          third.document_area().view_at(0) is torn_view)
+    check("one more window than before",
+          registry.count() == windows_before + 1, registry.count())
+    check("the new window holds the document",
+          third.document_area().count() == 1
+          and third.document_area().view_at(0) is torn_view)
     check("the first window kept the rest", area.count() == 2, area.count())
     check("the canvas survived the gesture", torn_canvas.scene() is torn_scene)
     check("no native handle grown on the way",
           torn_canvas.internalWinId() == 0, torn_canvas.internalWinId())
-
-    # The real window follows the cursor: the offset between the pointer and
-    # the window frame is what has to stay constant, and only a real platform
-    # plugin has a frame worth measuring.
-    here = _below_bar(bar, grab)
-    offset = here - third.frameGeometry().topLeft()
-    _move(bar, here + QPoint(260, 180))
-    check("the window tracked the cursor",
-          (here + QPoint(260, 180)) - third.frameGeometry().topLeft() == offset,
-          f"{offset} -> {(here + QPoint(260, 180)) - third.frameGeometry().topLeft()}")
+    # Where the button came up, not at a corner. A few pixels of slack because
+    # a real window manager may nudge a window it is placing; the failure this
+    # is watching for is a whole title bar of offset, not a rounding.
+    landed = third.geometry().topLeft()
+    check("the window appeared where the button came up",
+          abs(landed.x() - expected_at.x()) <= 8
+          and abs(landed.y() - expected_at.y()) <= 8,
+          f"{expected_at} -> {landed}")
+    # The one thing offscreen genuinely cannot check: a leaked grabMouse() is a
+    # frozen application, and only a real platform plugin has a grab to leak.
+    check("the mouse grab was given back",
+          QWidget.mouseGrabber() is None, QWidget.mouseGrabber())
     area.check_invariant()
     third.document_area().check_invariant()
 
-    print("\n6. drop it back onto the first window's bar, at index 0")
+    print("\n6. drag the torn window back onto the first window's strip")
+    # A WINDOW WITH ONE TAB DRAGS ITSELF, so this is the other half of the
+    # gesture rather than step 5 run backwards. There is no second window to
+    # make and nothing to preview, so there is no ghost: the real window
+    # follows the cursor, the merge is deferred to the release, and the
+    # feedback on the target strip is the insertion LINE, because nothing has
+    # joined that strip for it to ghost. See TabTearOff._show_drop_feedback.
+    torn_bar = third.document_area().bar()
+    torn_tear = torn_bar.tear_off()
+    back = _tab_point(torn_bar, 0)
+    _press(torn_bar, back)
+    here = _below_bar(torn_bar, back)
+    _move(torn_bar, here)
+    check("the lone tab took its window with it", torn_tear.is_dragging())
+    check("no ghost for a whole window", torn_tear.ghost() is None,
+          torn_tear.ghost())
+    check("still three windows", registry.count() == windows_before + 1,
+          registry.count())
+
+    # The offset between the pointer and the window frame is what has to stay
+    # constant here, and only a real platform plugin has a frame worth
+    # measuring. This is the check step 5 used to make, in the one case it is
+    # still true of.
+    offset = here - third.frameGeometry().topLeft()
+    there = here + QPoint(120, 80)
+    _move(torn_bar, there)
+    check("the window tracked the cursor",
+          there - third.frameGeometry().topLeft() == offset,
+          f"{offset} -> {there - third.frameGeometry().topLeft()}")
+
     over = _tab_point(bar, 0, dx=6)
-    _move(bar, over)
-    target = bar.tear_off().drop_target()
-    check("the first window is the drop target",
+    _move(torn_bar, over)
+    target = torn_tear.drop_target()
+    check("the first window's strip is the drop target",
           target is not None and target[0] is first and target[1] == 0, target)
-    # A TAB is being carried, so the feedback is the ghost slot and not the
-    # line: the strip has parted and the arriving tab is sitting in the gap,
-    # painted as a ghost until the button comes up. The line is what a whole
-    # WINDOW being carried gets, because nothing has joined the strip for it
-    # to ghost. See TabTearOff._show_drop_feedback.
-    check("the ghost slot is held open", bar.ghost_index() is not None)
-    check("no insertion line for a carried tab", bar.drop_indicator() is None)
-    _release(bar, over)
+    check("the insertion line is up", bar.drop_indicator() is not None,
+          bar.drop_indicator())
+    check("no ghost slot for a carried window", bar.ghost_index() is None,
+          bar.ghost_index())
+    check("and the merge has not happened yet", area.count() == 2, area.count())
+
+    _release(torn_bar, over)
+    settle(app)
     check("the document docked at index 0",
           area.view_at(0) is torn_view, area.index_of(torn_view))
     check("three tabs again", area.count() == 3, area.count())
-    check("the emptied window closed itself", registry.count() == 2,
+    check("the emptied window closed itself", registry.count() == windows_before,
           registry.count())
-    check("the ghost became a real tab", bar.ghost_index() is None)
-    # The one thing offscreen genuinely cannot check: a leaked grabMouse() is a
-    # frozen application, and only a real platform plugin has a grab to leak.
+    check("the line came off the strip", bar.drop_indicator() is None,
+          bar.drop_indicator())
+    check("the mouse grab was given back",
+          QWidget.mouseGrabber() is None, QWidget.mouseGrabber())
+    area.check_invariant()
+
+    print("\n6b. a carried TAB gets the ghost slot, not the line")
+    # The other feedback, and the one a person sees most: the strip parts, the
+    # arriving tab drops into the gap, and it is painted as a ghost until the
+    # button comes up. Driven back onto the source's own strip so it needs no
+    # second window and changes no tab counts, only the order.
+    slot_view = area.view_at(2)
+    slot_grab = _tab_point(bar, 2)
+    _press(bar, slot_grab)
+    _move(bar, _below_bar(bar, slot_grab))
+    tear = bar.tear_off()
+    check("the tear engaged", tear.is_dragging())
+    check("a ghost in mid-air", tear.ghost() is not None)
+
+    onto = _tab_point(bar, 0, dx=6)
+    _move(bar, onto)
+    target = tear.drop_target()
+    check("the strip it came from is a target again",
+          target is not None and target[0] is first and target[1] == 0, target)
+    check("the tab has already joined the strip at index 0",
+          area.index_of(slot_view) == 0, area.index_of(slot_view))
+    check("the ghost slot is held open", bar.ghost_index() == 0,
+          bar.ghost_index())
+    check("no insertion line for a carried tab", bar.drop_indicator() is None,
+          bar.drop_indicator())
+    # The picture gets out of the way over a strip: the gap and the ghosted tab
+    # in it are the feedback, and a second copy of the tab hanging over them is
+    # what hid the thing it was meant to be showing.
+    check("the carried picture is hidden over the strip", tear.ghost() is None,
+          tear.ghost())
+
+    _release(bar, onto)
+    settle(app)
+    check("the document stayed at index 0", area.view_at(0) is slot_view,
+          area.index_of(slot_view))
+    check("still three tabs and still one window each",
+          area.count() == 3 and registry.count() == windows_before,
+          f"{area.count()} tabs, {registry.count()} windows")
+    check("the ghost became a real tab", bar.ghost_index() is None,
+          bar.ghost_index())
     check("the mouse grab was given back",
           QWidget.mouseGrabber() is None, QWidget.mouseGrabber())
     area.check_invariant()
