@@ -1,4 +1,4 @@
-"""Undoable page-structure edits (delete, reorder, rotate), for BOTH page panels.
+"""Undoable page-structure edits (delete, insert, reorder, rotate), for BOTH panels.
 
 The canvas already owns a QUndoStack for item-level edits (draw, move, resize,
 restyle). Page delete and reorder used to CLEAR that stack, because the canvas
@@ -12,8 +12,13 @@ took the whole window's history with it (annotation edits included) with nothing
 on screen to say which panel had the keyboard. The Organizer used to apply its
 own edit and tell the view afterwards, which is what made that unfixable at the
 view: by the time it heard, the pages and the page order to put back were gone.
-Both panels now ASK, and the ask lands on the same two commands below. There is
-no second way to delete or reorder a page.
+Both panels now ASK, and the ask lands on the same commands below. There is no
+second way to delete or reorder a page.
+
+"+ Add Pages" was the last edit still applied in the Organizer, and it had the
+same shape of bug pointing the other way: it rebuilt the GRID and never told
+the Editor's thumbnail strip, so a merged document showed two page counts at
+once. It asks now too. See InsertPagesCommand.
 
 These commands make both edits undoable by pairing the document change with a
 snapshot of the whole page-to-markup map. Undo puts the document AND the map
@@ -24,6 +29,8 @@ A delete keeps the removed pages alive in a stash document (see
 PDFDocument.extract_pages) until the command itself is dropped, which is what
 undo reinserts.
 """
+
+import fitz
 
 from PySide6.QtCore import QLineF, QPointF, QRectF
 from PySide6.QtGui import QUndoCommand
@@ -151,6 +158,97 @@ class DeletePagesCommand(_PageCommand):
     def __del__(self):
         # Dropped from the stack (cleared, or overwritten by a new edit): the
         # stashed pages are no longer reachable, so let PyMuPDF have the memory.
+        try:
+            if self._stash is not None:
+                self._stash.close()
+        except Exception:
+            pass
+
+
+class InsertPagesCommand(_PageCommand):
+    """Merge pages from other PDF files into this document, reversibly.
+
+    The Organizer's "+ Add Pages". It used to insert straight into the live
+    document and then ask the host to rebuild, and the host rebuilt the
+    ORGANIZER and nothing else: the Editor's thumbnail strip kept the item
+    count it had before the merge, so a two page document showed one thumbnail
+    while the status bar underneath it read "page 2 of 2". Coming through here
+    fixes that by construction, because every page command re-syncs BOTH panels
+    through DocumentView.after_page_structure_change.
+
+    It fixes the quieter half too. Markup is filed by page index and an insert
+    renumbers every page from the insertion point down; nothing shifted that
+    map, so adding pages anywhere but the end left the existing markup pointing
+    at the wrong pages.
+
+    THE SOURCE PAGES ARE READ ONCE, at construction, into an in-memory stash,
+    and every redo inserts from that. Same discipline as DeletePagesCommand's
+    stash, for the same reason and one more: re-reading the files on each redo
+    would quietly pick up whatever they say by then.
+
+    A file that will not open is not a reason to lose the ones that will, so
+    the stash takes what it can and the rest come back through `errors()` for
+    the view to report once. If NOTHING opened, the count is zero and the view
+    never pushes the command.
+    """
+
+    def __init__(self, window, paths: list, at: int):
+        super().__init__(window, "Insert pages")
+        self._at = max(0, min(int(at), window.page_count()))
+        self._errors: list[str] = []
+        self._stash = fitz.open()
+        for path in paths:
+            try:
+                src = fitz.open(str(path))
+            except Exception as e:
+                self._errors.append(f"{path}: {e}")
+                continue
+            try:
+                self._stash.insert_pdf(src)
+            except Exception as e:
+                self._errors.append(f"{path}: {e}")
+            finally:
+                src.close()
+        self._count = len(self._stash)
+        self.setText("Insert page" if self._count == 1
+                     else f"Insert {self._count} pages")
+        canvas = self._canvas
+        self._before_map = canvas.snapshot_page_annotations()
+        self._before_page = canvas.current_page()
+        self._after_map = shift_map_after_insert(self._before_map, self._at,
+                                                 self._count)
+        self._after_page = self._at
+        # A merge makes a document that no longer matches the file it came
+        # from, so the path goes and the next save is a Save As. Undoing puts
+        # the document back in step with that file, so the path comes back.
+        self._path_before = self._doc.path
+
+    def page_count(self) -> int:
+        """How many pages actually opened. Zero means don't push this."""
+        return self._count
+
+    def errors(self) -> list:
+        """One line per source file that could not be read, in words."""
+        return list(self._errors)
+
+    def rows(self) -> list:
+        """Where the inserted pages sit once applied."""
+        return list(range(self._at, self._at + self._count))
+
+    def _apply(self):
+        self._doc.insert_document(self._stash, self._at)
+        self._canvas.restore_page_annotations(self._after_map, self._after_page)
+        self._win._mark_untitled()
+        self._win._pending_page_selection = self.rows()
+
+    def _revert(self):
+        self._doc.delete_pages(self.rows())
+        self._canvas.restore_page_annotations(self._before_map, self._before_page)
+        self._doc.path = self._path_before
+
+    def __del__(self):
+        # Dropped from the stack (cleared, or overwritten by a new edit), or
+        # never pushed at all: the stash is unreachable now.
         try:
             if self._stash is not None:
                 self._stash.close()

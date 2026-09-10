@@ -49,7 +49,7 @@ still in place, or markup that was just stripped. So every content mutation in
 | `delete_tagged_annotations` (strip on open) | `invalidate_render_page(page_num)` | one page |
 | `write_annotations` (markup rewrite) | `invalidate_render_page(page_num)` | one page |
 | `save` (bake + in-place reopen) | `invalidate_render_cache()` | whole doc |
-| `reorder` / `move_page` / `delete_page` / `insert_pdf` | `invalidate_render_cache()` | whole doc (indices shift) |
+| `reorder` / `move_page` / `delete_page` / `insert_document` | `invalidate_render_cache()` | whole doc (indices shift) |
 | `open` / `close` | `invalidate_render_cache()` | whole doc |
 
 `render_page_cached` returns the **same** `QPixmap` instance on a hit, so callers

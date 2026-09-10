@@ -27,7 +27,7 @@ The single wrapper over PyMuPDF. Responsibilities:
 
 - **Open / close / save.** `save()` is integrity-first (atomic in-place replace with a `.bak` salvage path on failure). See the Save lifecycle section below.
 - **Rendering** via `render_page`, `render_thumbnail`, and the LRU `render_page_cached` (keyed by page + zoom, bounded to six pages). Detail in [performance.md](performance.md).
-- **Structural ops** `move_page`, `reorder`, `delete_page`, `delete_pages`, `insert_pdf`, each of which invalidates the render cache because page indices shift, plus `extract_pages` / `restore_pages`, the stash-and-put-back pair that makes a delete undoable.
+- **Structural ops** `move_page`, `reorder`, `delete_page`, `delete_pages`, `insert_document`, each of which invalidates the render cache because page indices shift, plus `extract_pages` / `restore_pages`, the stash-and-put-back pair that makes a delete undoable.
 - **The editable annotation model.** `write_annotation_model` / `read_annotation_model` embed and recover a JSON description of the markup so a saved file reopens editable.
 - **Writing markup** `write_annotations` converts the canvas's annotation dicts into real PDF annotation objects (tagged `rapid-pdf` so they can be found and stripped again).
 - **The image-lift primitive** `remove_image_placement`, which deletes one image's content-stream placement without leaving a hole.
@@ -72,7 +72,7 @@ A `QGraphicsView` over a `QGraphicsScene`. This is the largest module. It holds:
   - `LineAnnotationItem` for straight lines.
   - `TextAnnotationItem` for free-floating text labels.
   Each item knows how to draw itself and its selection handles, serialize to an annotation dict (`to_annotation_dict`), and `clone()` itself for copy/paste and Ctrl+drag duplication.
-- **The undo stack.** A `QUndoStack` with one `QUndoCommand` subclass per edit: `AddItemsCommand`, `RemoveItemsCommand`, `MoveCommand`, `NudgeCommand` (consecutive nudges merge into one), `ResizeCommand`, `StyleCommand`. The shared `_Command` base applies the edit live at construction time, so the first `redo()` fired by `push()` is a no-op. Page edits made from the left strip share this stack via `ui/page_commands.py` (see Page structure edits below); the Organizer's own delete/reorder still clear it, because it moves its own rows and reads the new order back out of them.
+- **The undo stack.** A `QUndoStack` with one `QUndoCommand` subclass per edit: `AddItemsCommand`, `RemoveItemsCommand`, `MoveCommand`, `NudgeCommand` (consecutive nudges merge into one), `ResizeCommand`, `StyleCommand`. The shared `_Command` base applies the edit live at construction time, so the first `redo()` fired by `push()` is a no-op. Page edits share this stack via `ui/page_commands.py` (see Page structure edits below), whichever panel they were made in. Neither panel edits the document itself any more: both ask, and the window pushes one command.
 - **Per-page annotation lists** (`_page_annotations`), keyed by page index. Only the current page's items are visible; the rest are hidden but retained, so flipping back to a page restores its markup instantly.
 - **Interaction state** for drawing, dragging, marquee selection, resizing, duplication, and the copy-confirmation flash. Mouse events live at the bottom of the file.
 
@@ -88,7 +88,7 @@ The shell that wires everything together and owns the document lifecycle:
 
 ### `ui/organizer.py`: `PageOrganizer`
 
-A thumbnail grid for page management. Reordering uses Qt's native `InternalMove` drag-and-drop; after a drop it reads the new order back from each cell's stored page id and emits a permutation to the main window, which applies it to the live document and the canvas. It also handles delete-selected and add-pages-from-PDF. Thumbnails render lazily (placeholders first, real renders only for cells near the viewport).
+A thumbnail grid for page management. Reordering uses Qt's native `InternalMove` drag-and-drop; after a drop it reads the new order back from each cell's stored page id and emits a permutation to the main window, which applies it to the live document and the canvas. Delete-selected and add-pages-from-PDF are asks too (`pages_delete_requested`, `pages_insert_requested`), not edits it makes itself: a merge applied here rebuilt this grid and left the Editor's strip showing the old page count. Thumbnails render lazily (placeholders first, real renders only for cells near the viewport).
 
 ### `ui/page_panel.py`: `PagePanel`
 
@@ -100,9 +100,9 @@ The strip never edits pages itself and never moves its own rows. A delete or a d
 
 ### Page structure edits: `ui/page_commands.py` and `core/page_ops.py`
 
-`core/page_ops.py` holds the order arithmetic as pure functions, with no Qt and no PyMuPDF in sight: where a dragged multi-selection lands (`move_rows`), the permutation that undoes a reorder (`invert_order`), and the re-keying a page edit forces on anything filed by page index (`shift_map_after_delete` / `shift_map_after_reorder`).
+`core/page_ops.py` holds the order arithmetic as pure functions, with no Qt and no PyMuPDF in sight: where a dragged multi-selection lands (`move_rows`), the permutation that undoes a reorder (`invert_order`), and the re-keying a page edit forces on anything filed by page index (`shift_map_after_delete` / `shift_map_after_insert` / `shift_map_after_reorder`).
 
-`ui/page_commands.py` wraps those as `QUndoCommand`s on the canvas's existing stack, so Ctrl+Z covers page edits and markup edits alike. The trick that makes that safe is that each command snapshots the whole page-to-markup map, not just the pages it touches: undo restores the document AND the map together, so an item-level command sitting underneath still replays against the numbering it was recorded with. A delete keeps the removed pages in a stash document (`PDFDocument.extract_pages`) for as long as the command lives, and `restore_pages` puts them back at the indices they held, lowest first.
+`ui/page_commands.py` wraps those as `QUndoCommand`s on the canvas's existing stack, so Ctrl+Z covers page edits and markup edits alike. The trick that makes that safe is that each command snapshots the whole page-to-markup map, not just the pages it touches: undo restores the document AND the map together, so an item-level command sitting underneath still replays against the numbering it was recorded with. A delete keeps the removed pages in a stash document (`PDFDocument.extract_pages`) for as long as the command lives, and `restore_pages` puts them back at the indices they held, lowest first. `InsertPagesCommand` keeps a stash for the opposite reason: it reads the source files once at construction so every redo inserts the same pages, rather than whatever those files say by then.
 
 ### `ui/toolbar.py`: `ToolBar` and `ColorToolButton`
 
