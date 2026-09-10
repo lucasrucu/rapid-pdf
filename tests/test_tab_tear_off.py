@@ -38,6 +38,8 @@ SECTIONS.
    says where it will land.
 """
 
+from math import ceil
+
 import fitz
 import pytest
 
@@ -49,7 +51,7 @@ from core.settings import Settings, set_settings
 from ui.main_window import MainWindow
 from ui.tab_tear_off import (
     DETACH_MARGIN, DOCK_MARGIN, GHOST_BLEED, INCOMING_SLACK, REDOCK_MARGIN,
-    insertion_index, tab_pixmap,
+    ghost_rect, insertion_index, tab_pixmap,
 )
 from ui.window_registry import WindowRegistry
 
@@ -518,8 +520,7 @@ def test_the_ghost_cannot_hide_the_landing_spot(
 
     ghost = bar.tear_off().ghost()
     assert ghost is not None
-    assert ghost.height() <= bar.tabRect(0).height() + 2
-    assert ghost.width() <= bar.tabRect(0).width() + 2
+    assert ghost.size() == ghost_rect(bar, bar.tabRect(0)).size()
 
     over = _tab_point(other_bar, 0)
     _move(bar, over)
@@ -859,33 +860,120 @@ def test_the_ghost_hangs_from_the_point_in_the_tab_it_was_grabbed_by(
     _release(bar, moved)
 
 
-def _painted_tab_source(bar, index):
-    """The part of the strip a WHOLE picture of tab `index` has to contain.
+# ----------------------------------------------------------------------
+# The picture of the tab
+#
+# THESE TESTS PUT THE APP'S STYLESHEET ON, and that is the whole reason the
+# previous set of them passed while the ghost was visibly cut off. Everything
+# else in this file asserts geometry and bookkeeping, which the default style
+# answers as well as any other. The ghost is a PICTURE, so what it looks like is
+# the thing under test, and a QTabBar with no stylesheet on it does not look
+# remotely like the strip in the product: ui/theme.py gives `#documentTabBar` a
+# `margin: 4px 2px` and a `border-radius: 8px`, so a real tab paints well inside
+# its own rect with rounded corners, while a bare one paints square, hard on its
+# rect boundary, sharing that boundary with the tab next door. Measuring one and
+# shipping the other is how a clipped right-hand edge went out.
+# ----------------------------------------------------------------------
 
-    Its own rect grown by the bleed, clipped to the bar, because a tab paints
-    outside its rect and the bar paints nothing outside itself.
+@pytest.fixture
+def styled(qt_app):
+    """The application stylesheet the product actually runs with."""
+    from ui.theme import LIGHT, build_qss
+
+    previous = qt_app.styleSheet()
+    qt_app.setStyleSheet(build_qss(LIGHT))
+    yield
+    qt_app.setStyleSheet(previous)
+
+
+def _opaque_columns(image):
+    return [x for x in range(image.width())
+            if any((image.pixel(x, y) >> 24) & 0xFF
+                   for y in range(image.height()))]
+
+
+def _opaque_rows(image):
+    return [y for y in range(image.height())
+            if any((image.pixel(x, y) >> 24) & 0xFF
+                   for x in range(image.width()))]
+
+
+def _air(image):
+    """(left, right, top, bottom): how many wholly transparent pixels the
+    picture keeps between its content and each of its four edges."""
+    cols, rows = _opaque_columns(image), _opaque_rows(image)
+    assert cols and rows, "the picture is empty"
+    return (cols[0], image.width() - 1 - cols[-1],
+            rows[0], image.height() - 1 - rows[-1])
+
+
+def _assert_whole_tab(image, ratio, where):
+    """A picture of a tab has a border all the way round it, and air outside.
+
+    THE AIR IS THE ASSERTION THE OLD TEST DID NOT MAKE. It compared the ghost
+    against the strip over a region clipped to the bar, so any column the
+    picture failed to reach was simply not compared, and it never asked whether
+    there was anything OUTSIDE the tab's border at all. A tab whose right-hand
+    border sits hard on the last column of the picture matches the strip
+    perfectly and still reads as cut off.
     """
-    rect = bar.tabRect(index)
-    return rect.adjusted(-GHOST_BLEED, -GHOST_BLEED,
-                         GHOST_BLEED, GHOST_BLEED).intersected(bar.rect())
+    bleed = max(1, int(GHOST_BLEED * ratio))
+    left, right, top, bottom = _air(image)
+    assert left >= bleed, f"{where}: no air on the left ({left})"
+    assert right >= bleed, f"{where}: no air on the right ({right})"
+    assert top >= bleed, f"{where}: no air on top ({top})"
+    assert bottom >= bleed, f"{where}: no air underneath ({bottom})"
+
+    # And a border on all four sides: the outermost row and column of the
+    # CONTENT has ink in it, on each of the four edges.
+    cols, rows = _opaque_columns(image), _opaque_rows(image)
+    for x in (cols[0], cols[-1]):
+        assert any((image.pixel(x, y) >> 24) & 0xFF for y in rows), \
+            f"{where}: no vertical border at x={x}"
+    for y in (rows[0], rows[-1]):
+        assert any((image.pixel(x, y) >> 24) & 0xFF for x in cols), \
+            f"{where}: no horizontal border at y={y}"
 
 
+@pytest.mark.parametrize("theme", [False, True])
 def test_the_ghost_carries_the_whole_tab_and_not_a_column_less(
+        qt_app, store, registry, tmp_path, request, theme):
+    """DEFECT, twice over. First: "the visual of it seems like the left side is
+    cutoff, the tab look cutoff (the ghost tab)". Then, after the first fix:
+    "it looks to be cutoff on the right side now instead of the left".
+
+    Both are the same mistake made about a different edge. A QRect of width w at
+    x=L covers columns L..L+w-1, and a border stroked on its boundary lands on
+    the LINES x=L and x=L+w, so the right-hand one is a column the rect does not
+    contain. Growing the rect by one on every side does not fix that, it just
+    moves the problem: the far border then lands on the last column of the
+    picture with nothing beside it, which is what a cut-off tab looks like.
+
+    So what is asserted is the property, not an arithmetic identity: ink on all
+    four edges of the tab, and transparent pixels between that ink and every
+    edge of the picture. Run against a bare bar and against the product's
+    stylesheet, because the two paint their tabs in completely different places.
+    """
+    if theme:
+        request.getfixturevalue("styled")
+    window = _window(registry, tmp_path, ["a.pdf", "b.pdf"])
+    bar = window.document_area().bar()
+    bar.setCurrentIndex(0)
+    qt_app.processEvents()
+
+    for index in range(bar.count()):
+        rect = bar.tabRect(index)
+        image = tab_pixmap(bar, rect).toImage()
+        _assert_whole_tab(image, 1.0, f"theme={theme} tab {index}")
+
+
+def test_the_ghost_matches_the_strip_it_was_taken_from(
         qt_app, store, registry, tmp_path):
-    """DEFECT: "the visual of it seems like the left side is cutoff, the tab
-    look cutoff (the ghost tab)".
+    """The picture is of THIS tab, in the right place, and not a redraw of one.
 
-    A tab's border is stroked ON the boundary of its rect, so a 1px pen
-    straddles it and half of that pen falls OUTSIDE. Measured on the real
-    strip: a selected tab whose rect is x=0..239 paints its left border at
-    x=0, hard against the edge with no air beside it, and its right border at
-    x=240, which `grab(rect)` never sees. What floats over the page is then a
-    tab with a line down one side and nothing down the other.
-
-    So the picture is compared, pixel for pixel, against the strip it was
-    taken from: every pixel of the grown region has to be in it, in the right
-    place. That is a stronger claim than "the sizes match", and it is the one
-    that fails on the old code.
+    Kept from the first fix and re-aimed at the painted extent rather than at
+    the bleed, which is now air by construction and has nothing to compare
+    against.
     """
     window = _window(registry, tmp_path, ["a.pdf", "b.pdf"])
     bar = window.document_area().bar()
@@ -894,49 +982,63 @@ def test_the_ghost_carries_the_whole_tab_and_not_a_column_less(
     rect = bar.tabRect(0)
     pixmap = tab_pixmap(bar, rect)
 
-    ratio = pixmap.devicePixelRatio()
-    assert round(pixmap.width() / ratio) == rect.width() + 2 * GHOST_BLEED
-    assert round(pixmap.height() / ratio) == rect.height() + 2 * GHOST_BLEED
-
     strip = bar.grab().toImage()
     ghost = pixmap.toImage()
+    ratio = pixmap.devicePixelRatio()
     step = int(round(ratio))
-    source = _painted_tab_source(bar, 0)
-    origin = rect.topLeft() - QPoint(GHOST_BLEED, GHOST_BLEED)
+    origin = ghost_rect(bar, rect).topLeft()
+    source = rect.intersected(bar.rect())
     for x in range(source.left(), source.right() + 1):
         for y in range(source.top(), source.bottom() + 1):
             for dx in range(step):
                 for dy in range(step):
                     assert ghost.pixel((x - origin.x()) * step + dx,
-                                       (y - origin.y()) * step + dy)                         == strip.pixel(x * step + dx, y * step + dy),                         f"the ghost differs from the strip at {x},{y}"
+                                       (y - origin.y()) * step + dy) \
+                        == strip.pixel(x * step + dx, y * step + dy), \
+                        f"the ghost differs from the strip at {x},{y}"
 
 
-@pytest.mark.parametrize("ratio", [1.0, 2.0])
+@pytest.mark.parametrize("ratio", [1.0, 1.25, 1.5, 2.0])
 def test_the_ghost_is_tab_sized_at_any_device_pixel_ratio(
-        qt_app, store, registry, tmp_path, monkeypatch, ratio):
-    """THE OTHER HALF OF THE HOTSPOT, and the classic cause of a drag image
-    that will not stay under the pointer on a scaled screen.
+        qt_app, store, registry, tmp_path, monkeypatch, styled, ratio):
+    """THE OTHER HALF OF THE HOTSPOT, and the classic cause of a drag image that
+    will not stay under the pointer on a scaled screen.
 
-    The grab offset is in logical pixels, so it only lands on the right part
-    of the ghost while the ghost is the same LOGICAL size as the tab. The
-    picture is now rendered into a pixmap this code made itself, with the
-    bar's own ratio stamped on it before anything is painted, so the raw size
-    and the tag can no longer disagree the way an untagged `QWidget.grab` on a
-    150% display makes them disagree.
+    The grab offset is in logical pixels, so it only lands on the right part of
+    the ghost while the ghost is the same LOGICAL size as the picture. Two
+    things are pinned here and the second is what the right-hand edge came down
+    to.
 
-    Offscreen runs everything at 1.0, so the scaling cannot be asked for and
-    is handed to the bar instead.
+    THE LOGICAL SIZE IS `ghost_rect`'s, exactly, and the widget is told it
+    rather than working it out by dividing the device size back down. At 125%
+    that division has no exact answer and lands a fraction either side, which is
+    a fraction of the tab's border missing for the length of the drag.
+
+    THE DEVICE SIZE ROUNDS UP. 243 logical pixels at 125% is 303.75 device
+    pixels and the window that paints them is 304, so a pixmap of 303 leaves the
+    last device column unpainted. The fractional ratios are here because that is
+    where the rounding bites; 1.0 and 2.0 cannot show it.
+
+    Offscreen runs everything at 1.0, so the scaling cannot be asked for and is
+    handed to the bar instead.
     """
     window = _window(registry, tmp_path, ["a.pdf", "b.pdf"])
     bar = window.document_area().bar()
     tear = bar.tear_off()
+    qt_app.processEvents()
     rect = bar.tabRect(0)
     monkeypatch.setattr(bar, "devicePixelRatioF", lambda: ratio)
+    whole = ghost_rect(bar, rect)
 
     pixmap = tab_pixmap(bar, rect)
     assert abs(pixmap.devicePixelRatio() - ratio) < 1e-3
-    assert pixmap.width() == round((rect.width() + 2 * GHOST_BLEED) * ratio)
-    assert round(pixmap.width() / pixmap.devicePixelRatio())         == rect.width() + 2 * GHOST_BLEED
+    assert pixmap.size() == QSize(ceil(whole.width() * ratio),
+                                  ceil(whole.height() * ratio))
+    # Never SHORT of the window that paints it, which is what the last column
+    # of a 125% ghost was.
+    assert pixmap.width() >= whole.width() * ratio
+    assert pixmap.height() >= whole.height() * ratio
+    _assert_whole_tab(pixmap.toImage(), ratio, f"ratio {ratio}")
 
     grab = QPoint(25, 7)
     start = _tab_point(bar, 0, dx=grab.x(), dy=grab.y())
@@ -945,10 +1047,75 @@ def test_the_ghost_is_tab_sized_at_any_device_pixel_ratio(
     _move(bar, here)
     ghost = tear.ghost()
     assert ghost is not None
-    bleed = QSize(2 * GHOST_BLEED, 2 * GHOST_BLEED)
-    assert ghost.size() == rect.size() + bleed
-    assert here - tear.ghost_position(here)         == grab + QPoint(GHOST_BLEED, GHOST_BLEED)
+    assert ghost.size() == whole.size()
+    assert ghost.size() == rect.size() + QSize(1 + 2 * GHOST_BLEED,
+                                               1 + 2 * GHOST_BLEED)
+    # The hotspot is unmoved by any of this: the cursor still holds the point in
+    # the tab it took hold of.
+    assert here - tear.ghost_position(here) \
+        == grab + QPoint(GHOST_BLEED, GHOST_BLEED)
     _release(bar, here)
+
+
+def test_the_ghost_is_painted_at_the_size_the_widget_was_given(
+        qt_app, store, registry, tmp_path, styled):
+    """What the ghost WIDGET puts on screen, not what the pixmap holds.
+
+    The pixmap being whole is worth nothing if the widget that draws it is a
+    column shorter, so the widget is asked to paint itself and the result is
+    measured the same way.
+    """
+    window = _window(registry, tmp_path, ["a.pdf", "b.pdf"])
+    bar = window.document_area().bar()
+    tear = bar.tear_off()
+    qt_app.processEvents()
+    rect = bar.tabRect(0)
+
+    start = _tab_point(bar, 0)
+    _press(bar, start)
+    here = _below_bar(bar, start)
+    _move(bar, here)
+    ghost = tear.ghost()
+    assert ghost is not None
+    assert ghost.size() == ghost_rect(bar, rect).size()
+
+    painted = ghost.grab().toImage()
+    ratio = painted.devicePixelRatio()
+    assert painted.size() == ghost.size() * ratio
+    _assert_whole_tab(painted, ratio, "the ghost widget")
+    _release(bar, here)
+
+
+def test_a_scrolled_strip_puts_no_scroll_button_in_the_ghost(
+        qt_app, store, registry, tmp_path, styled):
+    """The bar scrolls, and the current tab parks against the scroll buttons.
+
+    `setUsesScrollButtons(True)` means a strip with enough tabs in it scrolls,
+    and Qt keeps the current tab visible by parking its right-hand edge exactly
+    where the buttons begin. A picture that reached one pixel past the tab came
+    back with a slice of a button welded to its right-hand side, hard against
+    the edge, which is a cut-off tab by another route. Measured on 55 of the
+    window-width and tab-count combinations before this was fixed.
+    """
+    window = _window(registry, tmp_path,
+                     [f"doc{i}.pdf" for i in range(14)], size=(900, 800))
+    bar = window.document_area().bar()
+    qt_app.processEvents()
+    assert bar.count() == 14
+
+    checked = 0
+    for index in range(bar.count()):
+        bar.setCurrentIndex(index)
+        qt_app.processEvents()
+        rect = bar.tabRect(index)
+        if not bar.rect().contains(rect.center()):
+            continue
+        checked += 1
+        _assert_whole_tab(tab_pixmap(bar, rect).toImage(), 1.0,
+                          f"scrolled tab {index}")
+    assert checked >= 8
+
+
 
 
 def test_a_lone_tab_over_another_window_s_body_does_not_merge(

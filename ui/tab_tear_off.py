@@ -96,6 +96,7 @@ carried tab gets: see `_show_drop_feedback`.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from math import ceil
 
 from PySide6.QtCore import QPoint, QPointF, QRect, QSize, Qt
 from PySide6.QtGui import (
@@ -265,7 +266,7 @@ class _DragGhost(QWidget):
     cursor-based targeting cannot work at all.
     """
 
-    def __init__(self, pixmap):
+    def __init__(self, pixmap, size: QSize | None = None):
         super().__init__(
             None,
             Qt.WindowType.Tool
@@ -284,9 +285,21 @@ class _DragGhost(QWidget):
         # size by `drawPixmap`, so sizing the widget in raw pixels would make
         # the ghost a scale factor too big on any display above 100% and put
         # the point the cursor is pinned to somewhere else on the picture.
-        # `tab_pixmap` is what guarantees the ratio is right to divide by.
-        ratio = max(1.0, pixmap.devicePixelRatio())
-        self.resize(round(pixmap.width() / ratio), round(pixmap.height() / ratio))
+        #
+        # IT IS PASSED IN RATHER THAN DIVIDED BACK OUT, and that is the right
+        # edge. Deriving it as `round(pixmap.width() / ratio)` asks a question
+        # that has no exact answer at 125%: a 243 px picture is 303.75 device
+        # px, the pixmap holds a whole number of them, and dividing that number
+        # back down lands a fraction either side of 243. Half a pixel out is
+        # half a pixel of the tab's right-hand border missing. `ghost_rect` is
+        # the one place the size is decided, and both the picture and the widget
+        # are told the same answer. The fallback is for a caller that has only
+        # the pixmap; it is exact whenever the ratio divides the size evenly.
+        if size is None:
+            ratio = max(1.0, pixmap.devicePixelRatio())
+            size = QSize(round(pixmap.width() / ratio),
+                         round(pixmap.height() / ratio))
+        self.resize(size)
 
     def paintEvent(self, event):
         QPainter(self).drawPixmap(0, 0, self._pixmap)
@@ -323,33 +336,85 @@ def zone_insertion_index(bar: QTabBar, global_pos: QPoint) -> int:
     return insertion_index(bar, QPoint(local.x(), bar.rect().center().y()))
 
 
-# How far outside a tab's own rect the picture of it has to reach.
+# How much AIR the picture keeps around the tab it is a picture of.
 #
 # ONE PIXEL, AND IT IS THE DIFFERENCE BETWEEN A TAB AND A CUT-OFF TAB. A tab's
-# border is stroked ON the boundary of its rect, so a 1px pen straddles that
-# boundary and half of it falls OUTSIDE. Measured on the real strip, a selected
-# tab whose rect is x=0..239 paints its left border at x=0 and its right border
-# at x=240: `grab(rect)` keeps the left edge hard against the pixmap with no air
-# beside it and drops the right edge entirely. Floating over a page, that is a
-# tab with a line down one side, no line down the other, and nothing between the
-# line and the edge. Lucas: "the visual of it seems like the left side is
-# cutoff, the tab look cutoff (the ghost tab)".
+# border can be stroked ON the boundary of its rect, so a 1px pen straddles that
+# boundary and half of it falls OUTSIDE. Measured on a bar with no stylesheet, a
+# selected tab whose rect is x=0..239 paints its left border at x=0 and its
+# right border at x=240: a picture of the rect alone keeps the left edge hard
+# against the pixmap with no air beside it and drops the right edge entirely.
+# Floating over a page, that is a tab with a line down one side, no line down
+# the other, and nothing between the line and the edge. Lucas: "the visual of it
+# seems like the left side is cutoff, the tab look cutoff (the ghost tab)".
+#
+# THE BLEED IS AIR, NOT MORE STRIP, and that is the correction to the first
+# attempt at this. Growing the SOURCE by a pixel on every side does not add air:
+# on a strip whose tabs abut, the pixel outside the tab belongs to the tab next
+# door, and where the strip's scroll buttons start at the tab's right edge it
+# belongs to a scroll button. The picture then ends in somebody else's ink with
+# nothing between it and the edge, which is the same defect over again on the
+# other side. Lucas, second report: "it looks to be cutoff on the right side now
+# instead of the left". So the ring is reserved and never rendered into.
 GHOST_BLEED = 1
+
+
+def ghost_rect(bar: QTabBar, rect: QRect) -> QRect:
+    """The whole picture of tab `rect`, in the bar's own coordinates.
+
+    THE SIZE IS DECIDED HERE AND NOWHERE ELSE, because two things have to agree
+    about it: the pixmap and the widget that paints the pixmap. See `_DragGhost`
+    for what a disagreement of half a pixel costs.
+
+    Two allowances, and they are different things.
+
+    `+ QSize(1, 1)` IS THE TAB'S OWN FAR BORDER. A QRect of width w at x=L covers
+    the columns L..L+w-1, and a border stroked on its boundary lands on the
+    LINES x=L and x=L+w. The right-hand one is a column the rect does not
+    contain. Nothing about that is symmetric, so a symmetric allowance on the
+    rect cannot cover it: measured, it gives a pixel of air on the left and none
+    at all on the right.
+
+    GHOST_BLEED IS THE AIR, one pixel of guaranteed nothing on every side, so
+    the border has an edge to sit inside rather than an edge to be cut off by.
+    """
+    painted = QRect(rect.topLeft(), rect.size() + QSize(1, 1))
+    return painted.adjusted(-GHOST_BLEED, -GHOST_BLEED,
+                            GHOST_BLEED, GHOST_BLEED)
+
+
+def _foreign_controls(bar: QTabBar, rect: QRect):
+    """The bar's own child widgets that have nothing to do with tab `rect`.
+
+    The strip's scroll buttons, and every other tab's close button. A picture of
+    one tab may not carry any of them: with `setUsesScrollButtons(True)` a strip
+    that has scrolled parks the current tab with its right edge exactly where
+    the scroll buttons begin, and a picture that reaches one pixel further than
+    the tab comes back with a slice of a button welded to its right-hand side.
+    Measured: 55 of the sweep's tab-count and window-width combinations.
+    """
+    for child in bar.children():
+        if not isinstance(child, QWidget) or not child.isVisible():
+            continue
+        if not child.geometry().intersects(rect):
+            yield child
 
 
 def tab_pixmap(bar: QTabBar, rect: QRect):
     """A picture of one WHOLE tab, with a device pixel ratio that is true.
 
-    THE BLEED IS THE POINT. `rect` is the tab's own rect and the tab paints
-    outside it, so the picture is taken of `rect` grown by GHOST_BLEED on every
-    side. Where the bleed falls off the end of the bar there is nothing to
-    render and the pixmap is left transparent there, which is the right answer:
-    that pixel is not part of the tab, it is the strip the tab was sitting on.
+    THE PICTURE IS OF A TAB, NOT OF A PIECE OF STRIP. What gets rendered is the
+    tab's painted extent and nothing else: the air ring `ghost_rect` reserved is
+    left untouched, and any control of the bar's that is not part of this tab is
+    subtracted from the region. Everything outside the tab is therefore
+    transparent by construction rather than by luck, which is what makes "a
+    border on all four sides with air beside it" true at the end of a scrolled
+    strip and next to a tab that abuts this one.
 
     THE HOTSPOT DEPENDS ON THIS, and on the caller. The cursor is pinned to the
     point inside the tab that it took hold of, in logical pixels, and the ghost
-    is positioned by subtracting that offset. The picture now starts one pixel
-    up and to the left of the tab, so `_begin` adds the same bleed back into the
+    is positioned by subtracting that offset. The picture starts GHOST_BLEED up
+    and to the left of the tab, so `_begin` adds the same bleed back into the
     offset. Getting one and not the other moves the ghost a pixel off the
     pointer.
 
@@ -360,17 +425,31 @@ def tab_pixmap(bar: QTabBar, rect: QRect):
     the way along a tab the user took hold of in the middle. Rendering into a
     pixmap this function made itself removes the question: the ratio is the
     bar's own, stamped on the target before anything is painted into it.
+
+    AND IT ROUNDS UP. 243 logical pixels at 125% is 303.75 device pixels; the
+    window that paints them is 304, and a pixmap rounded to 303 leaves the last
+    device column of the ghost unpainted for the rest of the drag. Rounding up
+    can only ever spend a column of the air ring.
     """
-    bleed = rect.adjusted(-GHOST_BLEED, -GHOST_BLEED, GHOST_BLEED, GHOST_BLEED)
-    source = bleed.intersected(bar.rect())
-    if source.isEmpty() or bleed.width() <= 0 or bleed.height() <= 0:
-        return bar.grab(rect)                # nothing on screen to picture
+    whole = ghost_rect(bar, rect)
     ratio = max(1.0, float(bar.devicePixelRatioF()))
-    pixmap = QPixmap(QSize(round(bleed.width() * ratio),
-                           round(bleed.height() * ratio)))
+    pixmap = QPixmap(QSize(ceil(whole.width() * ratio),
+                           ceil(whole.height() * ratio)))
     pixmap.setDevicePixelRatio(ratio)
     pixmap.fill(Qt.GlobalColor.transparent)
-    bar.render(pixmap, source.topLeft() - bleed.topLeft(), QRegion(source),
+
+    painted = whole.adjusted(GHOST_BLEED, GHOST_BLEED,
+                             -GHOST_BLEED, -GHOST_BLEED)
+    region = QRegion(painted.intersected(bar.rect()))
+    for control in _foreign_controls(bar, rect):
+        region -= QRegion(control.geometry())
+    if region.isEmpty():
+        return pixmap                        # nothing on screen to picture
+    # Taken from the region rather than from `painted`, because subtracting a
+    # control can move the region's top-left corner and Qt measures the offset
+    # from wherever the region actually starts.
+    bar.render(pixmap, region.boundingRect().topLeft() - whole.topLeft(),
+               region,
                QWidget.RenderFlag.DrawWindowBackground
                | QWidget.RenderFlag.DrawChildren
                | QWidget.RenderFlag.IgnoreMask)
@@ -418,6 +497,7 @@ class TabTearOff:
         self._view = None
         self._ghost = None            # the picture following the cursor
         self._pixmap = None           # what the ghost draws, grabbed once
+        self._ghost_size = None       # its LOGICAL size; see `ghost_rect`
         self._source_window = None
         self._source_index = -1
         self._source_pos = QPoint()
@@ -636,7 +716,9 @@ class TabTearOff:
                 # to the left of the tab it is a picture of. See `tab_pixmap`.
                 self._offset = (QPoint(self._grab_in_tab)
                                 + QPoint(GHOST_BLEED, GHOST_BLEED))
-                self._pixmap = tab_pixmap(bar, bar.tabRect(index))
+                tab_rect = bar.tabRect(index)
+                self._pixmap = tab_pixmap(bar, tab_rect)
+                self._ghost_size = ghost_rect(bar, tab_rect).size()
                 self._attached_to = source
                 # It starts life attached to the window it came from, so the
                 # first move out of the strip detaches it exactly as a move out
@@ -1254,7 +1336,7 @@ class TabTearOff:
         if self._ghost is not None or self._pixmap is None:
             return
         try:
-            self._ghost = _DragGhost(self._pixmap)
+            self._ghost = _DragGhost(self._pixmap, self._ghost_size)
             self._ghost.move(self.ghost_position(global_pos))
             self._ghost.show()
         except RuntimeError:                     # pragma: no cover - defensive
