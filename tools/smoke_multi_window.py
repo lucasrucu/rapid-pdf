@@ -488,9 +488,13 @@ def run(app, folder):
     target = torn_tear.drop_target()
     check("the first window's strip is the drop target",
           target is not None and target[0] is first and target[1] == 0, target)
-    check("the insertion line is up", bar.drop_indicator() is not None,
-          bar.drop_indicator())
-    check("no ghost slot for a carried window", bar.ghost_index() is None,
+    # A carried WINDOW now parts the strip too, the same as a carried tab.
+    # It used to get the insertion line instead, on the reasoning that nothing
+    # had joined the target yet so there was no tab to ghost. Lucas could not
+    # see the difference between the two gestures and there is no longer one.
+    check("the strip parted for it", not bar.ghost_slot_rect().isEmpty(),
+          bar.ghost_slot_rect())
+    check("no carried-tab ghost, the tab has not joined", bar.ghost_index() is None,
           bar.ghost_index())
     check("and the merge has not happened yet", area.count() == 2, area.count())
 
@@ -501,8 +505,8 @@ def run(app, folder):
     check("three tabs again", area.count() == 3, area.count())
     check("the emptied window closed itself", registry.count() == windows_before,
           registry.count())
-    check("the line came off the strip", bar.drop_indicator() is None,
-          bar.drop_indicator())
+    check("the strip closed up again", bar.ghost_slot_rect().isEmpty(),
+          bar.ghost_slot_rect())
     check("the mouse grab was given back",
           QWidget.mouseGrabber() is None, QWidget.mouseGrabber())
     area.check_invariant()

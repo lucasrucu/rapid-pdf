@@ -166,20 +166,31 @@ def main():
     state = {"mode": ThemeMode.LIGHT, "ok": {}, "phase": 0}
 
     def feedback_of(window):
-        """(ghost slot index, insertion line x) on that window's strip.
+        """(ghost tab index, insertion line x, parted slot rect) for that strip.
 
-        TWO ANSWERS BECAUSE THERE ARE TWO KINDS OF FEEDBACK, and which one is
-        up says what is being carried. A TAB gets the ghost slot: the strip has
-        parted and the arriving tab is sitting in the gap, painted as a ghost
-        until the button comes up. A whole WINDOW being carried gets the line,
-        because nothing has joined the target strip for it to ghost.
+        THE STRIP PARTS FOR BOTH GESTURES NOW, and which field answers says
+        which one is in flight. A carried TAB joins the target strip live, so
+        it is a real tab painted as a ghost and `ghost_index` names it. A
+        carried WINDOW has not joined anything yet, so the strip reserves a
+        tab's width and paints an empty slot, and `ghost_slot_rect` is the one
+        with the answer.
+
+        The line is the third value and nothing sets it during a drag any more.
+        It is kept as a live primitive rather than deleted, and read here, so
+        that a regression which brings it back is photographed rather than
+        passing quietly.
 
         The wash and the outline that used to come back alongside are both
         gone; they read as a highlight box around the tab on a strip that hugs
         its tabs.
         """
         bar = window.document_area().bar()
-        return bar.ghost_index(), bar.drop_indicator()
+        # Three now, not two. A carried TAB sets ghost_index; a carried WINDOW
+        # parts the strip and sets ghost_slot_rect instead, because its tab has
+        # not joined the target yet. drop_indicator stays a live primitive but
+        # nothing sets it during a drag any more, so photographing only the
+        # first two would catch nothing on a whole-window gesture.
+        return bar.ghost_index(), bar.drop_indicator(), bar.ghost_slot_rect()
 
     def run_pass(mode, done):
         """One full drag in one theme, photographed at the moment of truth."""
@@ -252,12 +263,12 @@ def main():
                     for dx in range(5):
                         move_to(spot.x() - (4 - dx) * 8, spot.y())
                 elif kind == "probe":
-                    ghost, line = feedback_of(win_b)
+                    ghost, line, slot = feedback_of(win_b)
                     tear = win_a.document_area().bar()._tear_off
                     say(f"    [{arg}] dragging={tear.is_dragging()} "
                         f"A={win_a.document_area().count()} "
                         f"B={win_b.document_area().count()} "
-                        f"B.ghost_index={ghost} B.drop_indicator={line} "
+                        f"B.ghost_index={ghost} B.drop_indicator={line} B.slot={slot} "
                         f"carrying_ghost={tear.ghost() is not None} "
                         f"cursor={QCursor.pos()}")
                     # A TAB is being carried here, so the ghost slot is the
@@ -272,19 +283,20 @@ def main():
                     tear = win_a.document_area().bar()._tear_off
                     a_now = win_a.document_area().count()
                     b_now = win_b.document_area().count()
-                    ghost, line = feedback_of(win_b)
+                    ghost, line, slot = feedback_of(win_b)
                     _, a_line = feedback_of(win_a)
                     landed = (not tear.is_dragging()
                               and tear.ghost() is None
                               and a_now == counts[0] - 1
                               and b_now == counts[1] + 1
                               and ghost is None and line is None
+                              and slot.isEmpty() and a_slot.isEmpty()
                               and a_line is None
                               and QWidget.mouseGrabber() is None)
                     say(f"    [{arg}] landed: dragging={tear.is_dragging()} "
                         f"A={a_now} (was {counts[0]}) "
                         f"B={b_now} (was {counts[1]}) "
-                        f"B.ghost_index={ghost} B.drop_indicator={line} "
+                        f"B.ghost_index={ghost} B.drop_indicator={line} B.slot={slot} "
                         f"grabber={QWidget.mouseGrabber()}")
                     state["ok"][f"{arg}-landed"] = landed
             except RuntimeError as exc:
