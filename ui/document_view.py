@@ -99,7 +99,8 @@ from ui.canvas import PDFCanvas
 from ui.combine_dialog import CombineDialog
 from ui.organizer import PageOrganizer
 from ui.page_commands import (
-    DeletePagesCommand, ReorderPagesCommand, TransferPagesCommand,
+    DeletePagesCommand, InsertPagesCommand, ReorderPagesCommand,
+    TransferPagesCommand,
 )
 from ui.page_drag import find_source_view
 from ui.password_prompt import ask_for_password
@@ -386,7 +387,7 @@ class DocumentView(QWidget):
         # them", whichever panel asked.
         self._organizer.pages_reorder_requested.connect(self._reorder_pages)
         self._organizer.pages_delete_requested.connect(self._delete_pages)
-        self._organizer.pages_added.connect(self._on_pages_added)
+        self._organizer.pages_insert_requested.connect(self._insert_pages)
         self._organizer.needs_rebuild.connect(self._refresh_organizer)
         self._tabs.addTab(self._organizer, "Organizer")
 
@@ -1562,6 +1563,29 @@ class DocumentView(QWidget):
         self._update_status(
             f"Deleted {count} page{'s' if count > 1 else ''}  (Ctrl+Z to undo)")
 
+    def _insert_pages(self, paths: list, at: int):
+        """Merge other PDFs in at `at`, as one undoable step.
+
+        The Organizer's "+ Add Pages". It used to do this itself and only ask
+        for the GRID to be rebuilt, so the Editor's thumbnail strip went on
+        showing the page count from before the merge while the status bar under
+        it counted the new pages. Every page edit lands on a command now, and a
+        command re-syncs both panels; see ui/page_commands.py.
+        """
+        if not self._doc.doc or not paths:
+            return
+        command = InsertPagesCommand(self, paths, at)
+        count = command.page_count()
+        errors = command.errors()
+        if count:
+            self._pending_page_selection = None   # the command names the rows
+            self.undo_stack().push(command)
+            self._update_status(
+                f"Inserted {count} page{'s' if count > 1 else ''}"
+                "  (Ctrl+Z to undo)")
+        if errors:
+            QMessageBox.critical(self.window(), "Insert Error", "\n".join(errors))
+
     def _reorder_pages(self, order: list, moved_rows: list):
         """Apply a drag from either panel as one undoable step.
 
@@ -1984,13 +2008,13 @@ class DocumentView(QWidget):
         self._invalidate_search_source()
 
     def _mark_untitled(self):
-        """A merge produced a derived document with no source file → force Save As."""
-        self._doc.path = None
+        """A merge produced a derived document with no source file → force Save As.
 
-    def _on_pages_added(self, count: int):
-        # Organizer "+ Add Pages" merged another PDF in → derived, unsaved document.
-        self._mark_untitled()
-        self._mark_dirty()
+        Called by InsertPagesCommand on the way in; the same command puts the
+        path back if the merge is undone, because a document that no longer
+        holds the merged pages does match its file again.
+        """
+        self._doc.path = None
 
     def maybe_save_before_close(self) -> bool:
         """Prompt to save unsaved changes. Returns True if it's safe to proceed."""

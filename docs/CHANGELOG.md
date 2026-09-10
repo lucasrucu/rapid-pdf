@@ -75,6 +75,20 @@ behavioural engine is asking what it does.
 
 ### Fixed
 
+- **The Editor now shows pages added in the Organizer.** "+ Add Pages" inserted
+  straight into the live document and asked only for the Organizer's grid to be
+  rebuilt. The Editor's thumbnail strip was never told, so a document that had
+  genuinely grown to two pages showed one thumbnail in the strip while the
+  status bar under it read "page 2 of 2", and printing produced both pages. The
+  merge is one undoable command now, like every other page edit, so both panels
+  re-sync through the same path.
+- **Ctrl+Z undoes an Add Pages.** It never went on the undo stack at all, and
+  worse, it silently renumbered the pages under the commands that were already
+  on it: an undo after a merge could put a deleted page back at the wrong index.
+- **Markup stays with its page when pages are inserted above it.** Annotations
+  are filed by page index and an insert renumbers everything below the
+  insertion point. Nothing shifted that map, so adding pages anywhere but the
+  end left the existing markup pointing at the wrong pages.
 - **The test suite no longer trips antivirus.** The test that needed a real
   program to launch used a renamed copy of `rundll32.exe`. It now compiles a
   five line stub of its own, and skips with a clear reason on a machine with no

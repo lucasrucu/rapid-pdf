@@ -1919,15 +1919,28 @@ class PDFDocument:
         self.transfers_sent = []
         self.transfers_taken = []
 
-    def insert_pdf(self, src_path: str, from_page: int = 0,
-                   to_page: int = -1, start_at: int = -1):
-        if not self.doc:
-            return
-        src = fitz.open(src_path)
-        self.doc.insert_pdf(src, from_page=from_page, to_page=to_page, start_at=start_at)
-        src.close()
+    def insert_document(self, src, at: int = -1) -> int:
+        """Insert every page of an already-open fitz document at `at`.
+
+        The document half of the Organizer's "+ Add Pages". It takes an OPEN
+        document rather than a path because the caller is an undo command
+        (InsertPagesCommand) that reads the source files once, into a stash it
+        owns, and inserts from that stash on every redo. Re-opening the path
+        each time would quietly pick up whatever the file says by then.
+
+        ONE insert_pdf for the whole block, not one per page, so links between
+        the incoming pages survive. Returns how many pages went in.
+        """
+        if not self.doc or src is None:
+            return 0
+        count = len(src)
+        if count <= 0:
+            return 0
+        at = len(self.doc) if at < 0 else max(0, min(int(at), len(self.doc)))
+        self.doc.insert_pdf(src, start_at=at)
         self.invalidate_render_cache()   # page set/indices changed
         self._note_structure_change()
+        return count
 
     # ------------------------------------------------------------------
     # Editable annotation model (embedded JSON): for save/reopen round-trip

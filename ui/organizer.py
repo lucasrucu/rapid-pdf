@@ -1,4 +1,3 @@
-import fitz as _fitz
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QListWidget, QListWidgetItem, QLabel, QFileDialog, QMenu, QMessageBox,
@@ -546,18 +545,18 @@ class PageOrganizer(QWidget):
     # ui/page_commands.py.
     pages_reorder_requested = Signal(list, list)  # (new page order, rows moved)
     pages_delete_requested = Signal(list)         # rows to delete, ascending
+    # "+ Add Pages": (source paths, insertion row). An ask like the two above,
+    # and for the extra reason that it used to leave the Editor's strip behind.
+    pages_insert_requested = Signal(list, int)
     needs_rebuild = Signal()            # ask the host to rebuild the markup thumbnails
-    pages_added = Signal(int)           # pages inserted via "+ Add Pages" (count) → host marks unsaved
     # (payload, insertion index, copy) - pages dragged in from another document.
     pages_transfer_requested = Signal(dict, int, bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        # The real document. Page delete and reorder are asked for, not done
-        # here: the host applies them as one undoable command (see the request
-        # signals above). "+ Add Pages" is still applied here, because a merge
-        # brings in a file rather than rearranging this one and has never been
-        # on the undo stack.
+        # The real document. Page delete, reorder and "+ Add Pages" are asked
+        # for, not done here: the host applies each one as a single undoable
+        # command (see the request signals above).
         self._doc = None
         # The DocumentView this grid belongs to, needed by the drag payload and
         # by a rotate, which is asked for through ui/page_commands.py.
@@ -1089,6 +1088,15 @@ class PageOrganizer(QWidget):
         self.page_activated.emit(self._list.row(item))
 
     def _add_pages(self):
+        """Ask the host to merge other PDFs in, undoably.
+
+        The grid no longer inserts anything itself. It used to, and it then
+        emitted `needs_rebuild`, which rebuilds THIS grid and nothing else: the
+        Editor's thumbnail strip was never told, so a merge left one panel
+        showing pages the other did not have. The host applies it as one
+        InsertPagesCommand, which re-syncs both panels and puts the merge on
+        the undo stack beside every other page edit.
+        """
         if not self._doc or not self._doc.doc:
             return
         paths, _ = QFileDialog.getOpenFileNames(
@@ -1098,26 +1106,11 @@ class PageOrganizer(QWidget):
         if not paths:
             return
         remember_dialog_dir(paths[0])
-        paths = sorted(paths)
         selected = self._list.selectedItems()
         at = self._list.row(selected[-1]) + 1 if selected else self._doc.page_count()
-        total = 0
-        errors = []
-        for path in paths:
-            try:
-                src = _fitz.open(path)
-                count = len(src)
-                src.close()
-                self._doc.insert_pdf(path, start_at=at)
-                at += count
-                total += count
-            except Exception as e:
-                errors.append(f"{path}: {e}")
-        self.needs_rebuild.emit()  # host rebuilds markup thumbnails + calls set_document
-        if total:
-            self.pages_added.emit(total)  # merge → host marks the doc untitled + unsaved
-        if errors:
-            QMessageBox.critical(self, "Insert Error", "\n".join(errors))
+        # The host rebuilds this grid from the document, which is why no items
+        # are added here.
+        self.pages_insert_requested.emit(sorted(paths), at)
 
     def delete_selected(self):
         """Ask the host to delete the selected pages. Undoable, like the strip's.
