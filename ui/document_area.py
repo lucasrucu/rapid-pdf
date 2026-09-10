@@ -48,10 +48,11 @@ import os
 from PySide6.QtCore import (
     QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal,
 )
-from PySide6.QtGui import QAction, QColor, QPainter, QPen
+from PySide6.QtGui import QAction, QColor, QFontMetrics, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractButton, QHBoxLayout, QMenu, QSizePolicy, QStackedWidget, QStyle,
-    QTabBar, QToolButton, QVBoxLayout, QWidget,
+    QStyleOptionTab, QStylePainter, QTabBar, QToolButton, QVBoxLayout,
+    QWidget,
 )
 
 from ui.page_drag import read_page_mime
@@ -160,6 +161,23 @@ TAB_SHAPE_MARGIN_X = 2
 TAB_SHAPE_MARGIN_Y = 4
 TAB_CORNER_RADIUS = 8
 
+# Where a tab's LABEL sits inside that shape, so a name drawn into an empty
+# ghost slot lands where the arriving tab's own name will. `::tab` carries a
+# 1px border and `padding: 4px 8px 4px 10px`, both measured from the shape
+# above rather than from the tab rect, and Qt takes the close button off the
+# right of the label rect before it elides. Here for the same reason the shape
+# is: QSS geometry is not queryable, and a test pins the pair together.
+TAB_BORDER_WIDTH = 1
+TAB_PADDING_LEFT = 10
+TAB_PADDING_RIGHT = 8
+
+# How solid the name in an empty slot is drawn. A ghosted REAL tab keeps its
+# own title showing at whatever the veil leaves of it, which is a little over a
+# third, and matching that here would be a name too faint to read out of the
+# corner of the eye while the eye is on the cursor. A little over half is
+# plainly dimmer than a live tab's label and still plainly a name.
+GHOST_TITLE_ALPHA = 0.55
+
 # The line drawn where a torn-off tab would land. In the accent, and full
 # height: it has to read as "between these two tabs" from the corner of the eye,
 # while the thing actually being looked at is the window under the cursor.
@@ -169,8 +187,9 @@ TAB_CORNER_RADIUS = 8
 # grounds that a deferred merge has no tab in the strip to ghost. Lucas merges
 # two one-tab windows constantly, so in practice the line was what he saw every
 # time and the ghost was what he never saw: "the ghost never appears". That case
-# now gets an EMPTY ghost slot (`set_ghost_slot`), which is the same gap in the
-# same place. What is kept here is the primitive and its state, because
+# now gets a ghost slot of its own (`set_ghost_slot`), which is the same gap in
+# the same place, with the arriving document's name written into it. What is
+# kept here is the primitive and its state, because
 # tools/shoot_tab_drag.py photographs `drop_indicator()` alongside
 # `ghost_index()` and a bar that could not answer would be a bar that could not
 # be photographed. It should read None for the whole of every drag.
@@ -482,7 +501,13 @@ class DocumentTabBar(QTabBar):
     # `sizeHint` before the constructor has run a single assignment, so any of
     # these read as an instance attribute there would be an AttributeError
     # raised out of a Qt virtual method. The instance rebinds them below.
-    _ghost_slot_x = None
+    # The ghost slot's index is here for exactly that reason: `tabSizeHint`
+    # divides the budget by one more tab while a slot is open (`_tab_share`),
+    # so the first `setTabsClosable` in `__init__` reads it before `__init__`
+    # has assigned anything.
+    _ghost_slot_index = None
+    _ghost_slot_title = ""
+    _ghost_index = None
     _pinned_close_buttons = False
     _placing_close_buttons = False
 
@@ -510,10 +535,14 @@ class DocumentTabBar(QTabBar):
         # this is only what makes it look like a ghost until the button comes
         # up. See GHOST_VEIL_ALPHA.
         self._ghost_index = None
-        # The x of an EMPTY ghost slot, or None. The other half of the same
-        # feedback, for the case where the tab cannot have joined this strip
-        # yet: a whole window being carried. See set_ghost_slot.
-        self._ghost_slot_x = None
+        # Where an EMPTY ghost slot is held open, as the INSERTION INDEX it
+        # sits in front of, and the name of the document that is going to land
+        # in it. The other half of the same feedback, for the case where the
+        # tab cannot have joined this strip yet: a whole window being carried.
+        # An index rather than an x because the strip has to part around the
+        # slot, and only an index says which tabs move. See set_ghost_slot.
+        self._ghost_slot_index = None
+        self._ghost_slot_title = ""
         # Whether Qt is allowed to reposition the close buttons right now.
         # Off during a reorder, where the button must slide with its tab; on
         # for the length of a tear, where it must not move at all. See
@@ -633,8 +662,9 @@ class DocumentTabBar(QTabBar):
         cannot see the veil but can ask what it is drawn over."""
         return self._ghost_index
 
-    def set_ghost_slot(self, x):
-        """Hold an EMPTY ghost slot open at `x`. None clears it.
+    def set_ghost_slot(self, index, title: str = ""):
+        """Hold a ghost slot open in front of tab `index`, named `title`.
+        None clears it.
 
         THE SAME FEEDBACK AS `set_ghost_index`, FOR THE CASE WHERE THERE IS NO
         TAB TO GHOST. A tab carried out of a multi-tab window joins the target
@@ -648,11 +678,30 @@ class DocumentTabBar(QTabBar):
         From his seat the two gestures are the same gesture, so they get the
         same feedback. This reserves a tab's width in `sizeHint`, so the strip
         visibly opens up, and paints a slot in the gap.
+
+        AN INDEX, NOT AN X, AND A TITLE ALONGSIDE IT. Both changed together
+        after a screenshot of the slot sitting on top of somebody else's tab
+        with that tab's name gone. An x cannot say which tabs have to move out
+        of the way, so the reserved width all went to the end of the bar while
+        the slot was drawn in the middle: see `_ghost_shift`. And the slot was
+        drawn with nothing in it, which answers "something is landing here"
+        but not "what". Lucas: "the name of the tab that is going in is not
+        bein displayed, this isnt bad, but it could be better, name shoudl
+        display". The title is the carried tab's own label, handed down by the
+        gesture that is carrying it.
         """
-        if x == self._ghost_slot_x:
+        if index is not None:
+            index = max(0, min(int(index), self.count()))
+        title = title or ""
+        if index == self._ghost_slot_index and title == self._ghost_slot_title:
             return
-        opening = (self._ghost_slot_x is None) != (x is None)
-        self._ghost_slot_x = x
+        opening = (self._ghost_slot_index is None) != (index is None)
+        self._ghost_slot_index = index
+        self._ghost_slot_title = title
+        # The tabs from the slot onward are PAINTED one slot to the right, and
+        # their close buttons are real widgets that do not move with a paint.
+        # Wherever the slot goes, they follow. See `_ghost_shift`.
+        self._place_close_buttons()
         if opening:
             # The slot is real width, not a mark drawn over the tabs, so the
             # bar has to be allowed to grow into it before anything can be
@@ -677,20 +726,37 @@ class DocumentTabBar(QTabBar):
                 layout.activate()
             widget = widget.parentWidget()
 
+    def ghost_slot_index(self):
+        """Which insertion index the empty ghost slot sits in front of, or
+        None. `count()` means past the last tab."""
+        return self._ghost_slot_index
+
+    def ghost_slot_title(self) -> str:
+        """The name of the document that is about to land in the slot, as it
+        was handed over. `ghost_slot_text` is what actually gets drawn."""
+        return self._ghost_slot_title
+
     def ghost_slot_x(self):
-        """Where the empty ghost slot is, or None. For the tests."""
-        return self._ghost_slot_x
+        """Where the empty ghost slot starts, or None. For the tests, and for
+        tools/shoot_tab_drag.py, which photographs it."""
+        if self._ghost_slot_index is None:
+            return None
+        return self.insertion_x(self._ghost_slot_index)
 
     def ghost_slot_width(self) -> int:
         """How wide a slot a tab arriving in this strip needs.
 
-        A tab's width, because that is what is going to land in it. On an
-        empty strip there is no tab to measure, so the share a single tab
-        would get stands in.
+        A tab's width, because that is what is going to land in it: the share
+        `tabSizeHint` hands every tab, taken from the budget rather than read
+        back off `tabRect(0)`.
+
+        IT CANNOT BE READ OFF A TAB ANY MORE, and that is not a tidy-up. The
+        slot parts the strip by shifting the tabs at and after it by this very
+        value (`_ghost_shift`), and `_ghost_shift` is consulted from inside
+        `initStyleOption`, which Qt calls from `tabSizeHint`. Measuring a tab
+        here would be this value asking a layout that is waiting on it.
         """
-        if self.count() > 0:
-            return self.tabRect(0).width()
-        return max(TAB_MIN_WIDTH, min(TAB_MAX_WIDTH, self._share_budget()))
+        return self._tab_share()
 
     def ghost_slot_rect(self) -> QRect:
         """The shape the ghost is painted on, in this bar's coordinates.
@@ -709,17 +775,132 @@ class DocumentTabBar(QTabBar):
             return self.tabRect(index).adjusted(
                 TAB_SHAPE_MARGIN_X, TAB_SHAPE_MARGIN_Y,
                 -TAB_SHAPE_MARGIN_X, -TAB_SHAPE_MARGIN_Y)
-        if self._ghost_slot_x is None:
+        if self._ghost_slot_index is None:
             return QRect()
         width = self.ghost_slot_width()
-        rect = QRect(int(self._ghost_slot_x), self.rect().top(),
-                     width, self.rect().height())
+        rect = QRect(int(self.insertion_x(self._ghost_slot_index)),
+                     self.rect().top(), width, self.rect().height())
         # Held on the strip, because `insertion_x` past the last tab is that
         # tab's right edge and the reserved width may not have been laid out
         # yet. A slot half off the end of the bar would be a mark, not a gap.
         rect.moveLeft(max(0, min(rect.left(), self.width() - width)))
         return rect.adjusted(TAB_SHAPE_MARGIN_X, TAB_SHAPE_MARGIN_Y,
                              -TAB_SHAPE_MARGIN_X, -TAB_SHAPE_MARGIN_Y)
+
+    def ghost_slot_text_rect(self) -> QRect:
+        """The room the slot leaves for the incoming document's name.
+
+        The same room a real tab leaves for its own: in by the border and the
+        `::tab` padding on the left, and by the padding plus the close button
+        on the right, because Qt takes the button off the label rect before it
+        elides and a name that ignored it would run under the X.
+
+        Empty when there is no empty slot, and empty when the slot is too
+        narrow to hold anything, which is the honest answer at the floor width
+        rather than a rect with a negative width in it.
+        """
+        if self._ghost_slot_index is None:
+            return QRect()
+        shape = self.ghost_slot_rect()
+        if shape.isEmpty():
+            return QRect()
+        rect = shape.adjusted(
+            TAB_BORDER_WIDTH + TAB_PADDING_LEFT, 0,
+            -(TAB_BORDER_WIDTH + TAB_PADDING_RIGHT
+              + CLOSE_BUTTON_SIZE + CLOSE_BUTTON_RIGHT_INSET), 0)
+        return rect if rect.width() > 0 else QRect()
+
+    def ghost_slot_text(self) -> str:
+        """The name as it will actually be drawn: elided the way this bar
+        elides its real tabs, to the room a real tab leaves for a label.
+
+        Named for the tests, which cannot read pixels but can read the string
+        that was handed to `drawText`.
+        """
+        rect = self.ghost_slot_text_rect()
+        if not self._ghost_slot_title or rect.isEmpty():
+            return ""
+        return QFontMetrics(self.font()).elidedText(
+            self._ghost_slot_title, self.elideMode(), rect.width())
+
+    def _ghost_shift(self, index: int) -> int:
+        """How far right tab `index` is DRAWN to keep the ghost slot clear.
+
+        THE SLOT HAS TO BE A GAP AND IT WAS A LID. It was drawn at the
+        insertion x, a tab wide, and nothing moved out from under it, so
+        anywhere but the end of the strip it covered the tab already sitting
+        there and that tab's name was gone for the length of the drag. Lucas,
+        with a screenshot: "if i place the tab in a place where another tab was
+        previosuly ... the name dispears".
+
+        The width WAS reserved, in `sizeHint`, which is why this went unnoticed
+        for a pass: reserving it makes the bar wider, and Qt packs tabs from
+        the left with no gaps between them, so every reserved pixel went to the
+        end of the bar while the slot was drawn in the middle. Only the last
+        position ever looked right, and two one-tab windows land on the last
+        position about half the time.
+
+        So this is what actually opens the gap. Every tab from the slot onward
+        is painted one slot to the right, into the room the hint already asked
+        for. THEIR RECTS ARE NOT TOUCHED, deliberately: `tabRect` is what the
+        hit test and the insertion index are made of, and moving those under a
+        cursor that is already inside the strip would have the slot chasing
+        itself from frame to frame.
+        """
+        at = self._ghost_slot_index
+        if at is None or index < at:
+            return 0
+        return self.ghost_slot_width()
+
+    def painted_tab_rect(self, index: int) -> QRect:
+        """Where tab `index` is actually DRAWN, which is not always its rect.
+
+        The two differ only while a ghost slot is open, and only for the tabs
+        at and after it. Everything that has to line up with what is on the
+        screen goes through here (the close buttons, the tests); everything
+        that answers "what is under the cursor" stays on `tabRect`.
+        """
+        return self.tabRect(index).translated(self._ghost_shift(index), 0)
+
+    def _parting(self) -> bool:
+        """Whether any tab has to be drawn out of place this frame.
+
+        False when the slot is past the last tab, which is the common case
+        when two one-tab windows meet, and it is worth keeping cheap: nothing
+        moves, so Qt paints the strip itself.
+        """
+        at = self._ghost_slot_index
+        return at is not None and at < self.count()
+
+    def _paint_parted_tabs(self):
+        """Draw the tabs with a gap in them, by moving the PAINTER.
+
+        AND NOT BY MOVING THE TAB'S RECT, which is the obvious way and does
+        not work. `initStyleOption` is virtual and Qt honours a shifted rect
+        for the tab's SHAPE, so under the app stylesheet a moved tab arrives
+        with its fill and border in the new place and its label still in the
+        old one: measured, on a four-tab strip, with the labels left exactly
+        where an unparted bar puts them. QStyleSheetStyle does not lay the
+        label out from the rect it is handed. A painter translation is immune
+        to that, because it moves whatever the style decides to draw.
+
+        The selected tab goes last, the way QTabBar itself does it: it is the
+        only one with a fill and a border, so it has to sit on top of its
+        neighbours rather than under them.
+        """
+        painter = QStylePainter(self)
+        selected = self.currentIndex()
+        order = [i for i in range(self.count()) if i != selected]
+        if 0 <= selected < self.count():
+            order.append(selected)
+        for index in order:
+            option = QStyleOptionTab()
+            self.initStyleOption(option, index)
+            painter.save()
+            painter.translate(self._ghost_shift(index), 0)
+            painter.drawControl(QStyle.ControlElement.CE_TabBarTab, option)
+            painter.restore()
+        painter.end()
 
     def _can_paint_drop_feedback(self) -> bool:
         """Whether this bar is a real strip rather than a few stray pixels.
@@ -813,10 +994,28 @@ class DocumentTabBar(QTabBar):
         width is downstream of this hint and cannot also be its input.
         """
         hint = super().tabSizeHint(index)
-        count = max(1, self.count())
-        share = self._share_budget() // count
-        hint.setWidth(max(TAB_MIN_WIDTH, min(TAB_MAX_WIDTH, share)))
+        hint.setWidth(self._tab_share())
         return hint
+
+    def _tab_share(self) -> int:
+        """One tab's width: the budget split equally, capped and floored.
+
+        A HELD-OPEN GHOST SLOT COUNTS AS A TAB in the division, because it is
+        one: it is the width of the tab that is about to land here, and the
+        strip it lands on will be sharing the budget out that way a moment
+        later. Leaving it out made the bar ask for a budget's worth of tabs
+        PLUS a whole extra tab, which on a strip with three or four tabs in it
+        is more than the title row has to give, and a bar that cannot have its
+        hint starts scrolling instead of parting.
+
+        It also makes the two gestures agree exactly. A carried tab has really
+        joined this strip, so the strip is dividing by `count()` with the tab
+        included; a carried window has not, and this is what makes the gap it
+        opens the same width as the one the other gesture opens.
+        """
+        count = max(1, self.count() + (self._ghost_slot_index is not None))
+        share = self._share_budget() // count
+        return max(TAB_MIN_WIDTH, min(TAB_MAX_WIDTH, share))
 
     def _share_budget(self) -> int:
         """The width the tabs may divide between them."""
@@ -864,7 +1063,11 @@ class DocumentTabBar(QTabBar):
                 button = self.tabButton(i, side)
                 if not isinstance(button, _TabCloseButton):
                     continue
-                rect = self.tabRect(i)
+                # Shifted with the tab it belongs to while a ghost slot is
+                # holding a gap open in front of it: the tab is painted one
+                # slot over (`_ghost_shift`) and a button left behind would be
+                # an X floating in the gap.
+                rect = self.painted_tab_rect(i)
                 if rect.isEmpty():
                     continue
                 geometry = button.geometry()
@@ -928,10 +1131,16 @@ class DocumentTabBar(QTabBar):
         spare room at all: the slot would be clipped to the ten pixels of
         trailing slack. Reserving it here is what makes the strip part around
         the arriving tab the way it does when the tab has really joined.
+
+        RESERVING IT IS HALF THE JOB AND WAS SHIPPED AS THE WHOLE OF IT. The
+        room arrives at the END of the bar, because that is where Qt leaves
+        anything it has not packed a tab into, so a slot held open in the
+        middle still landed on top of a real tab. `_ghost_shift` is the other
+        half: it walks the tabs from the slot onward into this room.
         """
         hint = super().sizeHint()
         extra = TRAILING_SLACK
-        if self._ghost_slot_x is not None:
+        if self._ghost_slot_index is not None:
             extra += self.ghost_slot_width()
         hint.setWidth(hint.width() + extra)
         return hint
@@ -1046,9 +1255,45 @@ class DocumentTabBar(QTabBar):
         painter.drawRoundedRect(
             shape.adjusted(inset, inset, -inset, -inset),
             TAB_CORNER_RADIUS, TAB_CORNER_RADIUS)
+        self._paint_ghost_title(painter)
+
+    def _paint_ghost_title(self, painter: QPainter):
+        """The incoming document's name, inside the empty slot.
+
+        ONLY FOR THE EMPTY KIND. A carried tab is a real tab with a real
+        label, drawn by Qt under the veil, and drawing a second copy of it
+        here would be a name printed over a name.
+
+        Lucas asked for this after watching a nameless gap open in the strip:
+        "the name of the tab that is going in is not bein displayed, this isnt
+        bad, but it could be better, name shoudl display". It is what turns
+        the slot from "something lands here" into "this document lands here",
+        which is the question worth answering when two windows both say
+        Untitled.
+        """
+        text = self.ghost_slot_text()
+        if not text:
+            return
+        rect = self.ghost_slot_text_rect()
+        colour = QColor(self._palette.text) if self._palette is not None \
+            else QColor(Qt.GlobalColor.black)
+        colour.setAlphaF(GHOST_TITLE_ALPHA)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(colour))
+        painter.setFont(self.font())
+        painter.drawText(
+            rect,
+            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+            text)
 
     def paintEvent(self, event):
         """The tabs, then the ghost slot, then the tick marks, then the line.
+
+        THE TABS ARE NOT ALWAYS QT'S TO DRAW. While a ghost slot is holding a
+        gap open somewhere other than the end of the strip, the tabs from the
+        slot onward have to be drawn one slot over and Qt has no idea about
+        it, so `_paint_parted_tabs` does that pass instead. Every other frame
+        in the app's life goes through `super()`.
 
         THE GHOST GOES FIRST of the three overlays, because it is the only one
         that is meant to take something AWAY. It fades a tab toward the strip,
@@ -1067,16 +1312,20 @@ class DocumentTabBar(QTabBar):
         that hugs its tabs, washed in the accent and outlined, is an amber box
         around the tab rather than a lit strip, and Edge draws neither.
         """
-        super().paintEvent(event)
+        if self._parting():
+            self._paint_parted_tabs()
+        else:
+            super().paintEvent(event)
         if not self._checked and self._drop_x is None \
-                and self._ghost_index is None and self._ghost_slot_x is None:
+                and self._ghost_index is None \
+                and self._ghost_slot_index is None:
             return
         painter = QPainter(self)
         accent = self._accent()
 
         # Before the tick marks and before the line, so anything else that
         # belongs to this tab is drawn ON the ghost rather than under it.
-        if self._ghost_index is not None or self._ghost_slot_x is not None:
+        if self._ghost_index is not None or self._ghost_slot_index is not None:
             self._paint_ghost_slot(painter)
 
         for index in self._checked:
