@@ -124,9 +124,50 @@ CLOSE_GLYPH_SPAN = 6.0
 # `DocumentTabBar._place_close_buttons`.
 CLOSE_BUTTON_RIGHT_INSET = 10
 
+# THE GHOST SLOT. The tab being carried has already joined this strip and the
+# tabs either side have already parted around it; these are what paint it as a
+# ghost rather than as a tab, so the gap reads as "this is where it lands"
+# instead of as "this already landed".
+#
+# WHY A GHOST AND NOT THE LINE. The line came in when the wash and the outline
+# came out, and it turned out to be a 4px hairline that the picture of the tab
+# under the cursor sat half on top of: "it almost even blocks the view of the
+# highlithed bar and where it will fall." Chrome does not draw a line at all.
+# It parts the tabs and puts a ghost in the gap, which is a tab-sized piece of
+# feedback rather than a hairline one, and it is under the cursor by
+# construction so it cannot be missed. See `TabTearOff._show_drop_feedback`.
+#
+# THE VEIL IS THE STRIP'S OWN BACKGROUND, not grey and not the accent. Painted
+# over the tab at this alpha it fades the tab toward the strip behind it, which
+# is what "ghost" has to mean if the tab's own title is still to be readable
+# through it. A little over half, because the two things it has to stay clear of
+# pull in opposite directions: too solid and it is just a tab, too thin and the
+# selected tab's own fill reads as a normal current tab.
+GHOST_VEIL_ALPHA = 0.62
+
+# The outline round the slot, in the accent. Faint, and it is the only thing
+# here that is a mark rather than a fade: without it a ghosted tab at the end of
+# a strip is hard to tell from a tab that is merely inactive.
+GHOST_OUTLINE_ALPHA = 0.55
+GHOST_OUTLINE_WIDTH = 1.5
+
+# The shape the stylesheet actually paints inside a tab's rect: `::tab` carries
+# `margin: 4px 2px` and `border-radius: 8px` (ui/theme.py). The ghost slot has
+# to land on the same shape or it is a rectangle drawn a few pixels proud of the
+# tab it is supposed to be a ghost of. Kept here rather than read back out of
+# the stylesheet because QSS geometry is not queryable, and pinned by a test.
+TAB_SHAPE_MARGIN_X = 2
+TAB_SHAPE_MARGIN_Y = 4
+TAB_CORNER_RADIUS = 8
+
 # The line drawn where a torn-off tab would land. In the accent, and full
 # height: it has to read as "between these two tabs" from the corner of the eye,
 # while the thing actually being looked at is the window under the cursor.
+#
+# IT IS NOW THE WHOLE-WINDOW CASE ONLY. A tab being carried gets the ghost slot
+# above instead. A lone tab drags its own window and the merge is deferred to
+# the release, so nothing has joined the target strip, so there is no tab to
+# ghost: the line is the only feedback available there and it is still right.
 #
 # IT IS NOW THE WHOLE OF THE DRAG FEEDBACK. It used to be drawn on top of an
 # accent wash over the entire target strip, plus a 2px accent outline round it,
@@ -423,6 +464,11 @@ class DocumentTabBar(QTabBar):
         # over the strip as well, and they are what read as a highlight box
         # around the tab. See DROP_LINE_WIDTH.
         self._drop_x = None
+        # The index of the tab that is being CARRIED over this bar, or None.
+        # It is a real tab in a real strip, already sitting where it will land;
+        # this is only what makes it look like a ghost until the button comes
+        # up. See GHOST_VEIL_ALPHA.
+        self._ghost_index = None
         # Tabs ticked for "Move Selected to New Window", by index. Pushed down
         # from DocumentArea, which holds the real answer as VIEWS: an index goes
         # stale the moment a tab is dragged along the bar.
@@ -517,6 +563,38 @@ class DocumentTabBar(QTabBar):
         """Where the insertion line is, or None. Named for the tests, which
         cannot see pixels but can ask the question the pixels answer."""
         return self._drop_x
+
+    def set_ghost_index(self, index):
+        """Paint (or stop painting) tab `index` as the slot a carried tab will
+        land in. None clears it.
+
+        Nothing is inserted or removed here. The tab is already in this bar and
+        the strip has already parted around it; this is the difference between
+        a tab that has landed and one that is still in the air.
+        """
+        if index == self._ghost_index:
+            return
+        self._ghost_index = index
+        self.update()
+
+    def ghost_index(self):
+        """Which tab is being painted as a ghost, or None. For the tests, which
+        cannot see the veil but can ask what it is drawn over."""
+        return self._ghost_index
+
+    def ghost_slot_rect(self) -> QRect:
+        """The shape the ghost is painted on, in this bar's coordinates.
+
+        Empty when there is no ghost. It is the tab's rect brought in to the
+        shape the stylesheet actually paints (see TAB_SHAPE_MARGIN_X), so a test
+        can pin the two together without reading pixels.
+        """
+        index = self._ghost_index
+        if index is None or not 0 <= index < self.count():
+            return QRect()
+        return self.tabRect(index).adjusted(
+            TAB_SHAPE_MARGIN_X, TAB_SHAPE_MARGIN_Y,
+            -TAB_SHAPE_MARGIN_X, -TAB_SHAPE_MARGIN_Y)
 
     def _can_paint_drop_feedback(self) -> bool:
         """Whether this bar is a real strip rather than a few stray pixels.
@@ -744,10 +822,60 @@ class DocumentTabBar(QTabBar):
         return QColor(self._palette.accent) if self._palette is not None \
             else QColor("#3b82f6")
 
-    def paintEvent(self, event):
-        """The tabs, then the tick marks, then the insertion line over the lot.
+    def _strip_background(self) -> QColor:
+        """What the caption behind the tabs is filled with.
 
-        All three are drawn on top rather than as part of a tab, and for the
+        The same expression ui/theme.py uses for `strip_bg` in the
+        #windowTitleBar rule, because the ghost veil has to fade a tab toward
+        the exact colour it is sitting on. Taking `p.window` in both themes
+        would be right in dark and a value too deep in light.
+        """
+        p = self._palette
+        if p is None:
+            return QColor("#f3f4f6")
+        return QColor(p.window if p.is_dark else p.surface_raised)
+
+    def _paint_ghost_slot(self, painter: QPainter):
+        """Fade one tab toward the strip and ring it in the accent.
+
+        A GHOST, NOT A HOLE. The tab is still drawn underneath by
+        `super().paintEvent`, so its icon and title stay legible through the
+        veil, which is what tells you WHICH document is about to land there
+        rather than only that something is. Chrome does the same thing with the
+        same reasoning.
+        """
+        shape = QRectF(self.ghost_slot_rect())
+        if shape.isEmpty():
+            return
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        veil = self._strip_background()
+        veil.setAlphaF(GHOST_VEIL_ALPHA)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(veil)
+        painter.drawRoundedRect(shape, TAB_CORNER_RADIUS, TAB_CORNER_RADIUS)
+
+        outline = self._accent()
+        outline.setAlphaF(GHOST_OUTLINE_ALPHA)
+        painter.setPen(QPen(outline, GHOST_OUTLINE_WIDTH))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        # Half the pen width in on every side, so a 1.5px stroke lands inside
+        # the shape instead of straddling its edge and bleeding into the tab
+        # next door.
+        inset = GHOST_OUTLINE_WIDTH / 2
+        painter.drawRoundedRect(
+            shape.adjusted(inset, inset, -inset, -inset),
+            TAB_CORNER_RADIUS, TAB_CORNER_RADIUS)
+
+    def paintEvent(self, event):
+        """The tabs, then the ghost slot, then the tick marks, then the line.
+
+        THE GHOST GOES FIRST of the three overlays, because it is the only one
+        that is meant to take something AWAY. It fades a tab toward the strip,
+        so anything drawn before it would be faded with the tab and anything
+        drawn after it stays at full strength, which is the right way round: a
+        ticked tab that is also being carried should still read as ticked.
+
+        The other three are drawn on top rather than as part of a tab, and for the
         same reason in each case: they belong to somewhere a tab is not. The
         insertion line belongs to the gap BETWEEN two tabs and there is no tab
         at the end of the bar for it to belong to, and the tick marks are the
@@ -759,10 +887,16 @@ class DocumentTabBar(QTabBar):
         around the tab rather than a lit strip, and Edge draws neither.
         """
         super().paintEvent(event)
-        if not self._checked and self._drop_x is None:
+        if not self._checked and self._drop_x is None \
+                and self._ghost_index is None:
             return
         painter = QPainter(self)
         accent = self._accent()
+
+        # Before the tick marks and before the line, so anything else that
+        # belongs to this tab is drawn ON the ghost rather than under it.
+        if self._ghost_index is not None:
+            self._paint_ghost_slot(painter)
 
         for index in self._checked:
             if 0 <= index < self.count():

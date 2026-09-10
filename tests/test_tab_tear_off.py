@@ -33,6 +33,9 @@ SECTIONS.
 5. THE SINGLE-TAB CASE. One tab drags its own window, and never spawns an
    empty one.
 6. THE MRU. A visit history for tabs, frozen while the walk is in flight.
+7. THE ZONES AND THE GHOST SLOT. Getting a tab in is a large target and
+   getting one out is a small one, and the gap the tabs part into is what
+   says where it will land.
 """
 
 import fitz
@@ -44,7 +47,10 @@ from PySide6.QtWidgets import QApplication, QMessageBox, QTabBar
 
 from core.settings import Settings, set_settings
 from ui.main_window import MainWindow
-from ui.tab_tear_off import DETACH_MARGIN, insertion_index, tab_pixmap
+from ui.tab_tear_off import (
+    DETACH_MARGIN, DOCK_MARGIN, INCOMING_SLACK, REDOCK_MARGIN, insertion_index,
+    tab_pixmap,
+)
 from ui.window_registry import WindowRegistry
 
 
@@ -149,6 +155,23 @@ def _below_bar(bar, global_pos, extra=DETACH_MARGIN + 20):
     """The same x, far enough below the bar to be a tear rather than a reorder."""
     return QPoint(global_pos.x(), bar.mapToGlobal(
         QPoint(0, bar.rect().bottom())).y() + extra)
+
+
+def _bar_bottom(window) -> int:
+    """The global y of the bottom edge of `window`'s tab bar."""
+    bar = window.document_area().bar()
+    return bar.mapToGlobal(QPoint(0, bar.rect().bottom())).y()
+
+
+def _in_zone(window, dx, below):
+    """A global point `dx` in from the left edge of `window` and `below`
+    pixels under the bottom of its tab bar.
+
+    Built off the WINDOW's own left edge rather than off the bar's, because
+    what is being tested is that the zone is the window's full width and the
+    bar's is a fraction of it.
+    """
+    return QPoint(window.frameGeometry().left() + dx, _bar_bottom(window) + below)
 
 
 # ======================================================================
@@ -469,14 +492,19 @@ def test_going_back_up_to_the_source_bar_still_re_docks(qt_app, store, registry,
     assert moving.window() is source
 
 
-def test_the_ghost_is_small_enough_not_to_hide_the_drop_feedback(
+def test_the_ghost_cannot_hide_the_landing_spot(
         qt_app, store, registry, tmp_path):
-    """The reason the old window needed a 46 px dodge, removed at the source.
+    """Two guarantees, and the second one is the stronger.
 
-    A window-sized object under the cursor covers the strip the insertion line
-    and the highlight are painted on, so it had to be pushed out of the way. A
-    ghost is one tab wide and one tab tall, so it cannot swallow a strip and
-    the clearance constant is gone.
+    It is one tab wide and one tab tall, which is what removed the 46 px
+    downward dodge the old floating WINDOW needed so as not to cover the strip
+    its own feedback was painted on.
+
+    And it is not on screen at all while the cursor is anywhere in the tab zone
+    of the window holding the tab. That is what answers "it almost even blocks
+    the view of the highlithed bar and where it will fall": the parting tabs
+    and the ghost slot only ever happen inside that zone, and the picture under
+    the cursor is gone for the whole of it.
     """
     source = _window(registry, tmp_path, ["a.pdf", "b.pdf"], at=(100, 100))
     other = _window(registry, tmp_path, ["x.pdf"], at=(2000, 100))
@@ -485,16 +513,18 @@ def test_the_ghost_is_small_enough_not_to_hide_the_drop_feedback(
 
     start = _tab_point(bar, 0)
     _press(bar, start)
-    _move(bar, _below_bar(bar, start))
-    over = _tab_point(other_bar, 0)
-    _move(bar, over)
+    mid_air = _below_bar(bar, start)
+    _move(bar, mid_air)
 
     ghost = bar.tear_off().ghost()
     assert ghost is not None
-    # No taller than the tab it is a picture of, so the target strip below the
-    # cursor is never covered by it.
     assert ghost.height() <= bar.tabRect(0).height() + 2
+    assert ghost.width() <= bar.tabRect(0).width() + 2
+
+    over = _tab_point(other_bar, 0)
+    _move(bar, over)
     assert bar.tear_off().drop_target() is not None
+    assert bar.tear_off().ghost() is None
     _release(bar, over)
 
 
@@ -1063,3 +1093,303 @@ def test_one_tab_has_no_mru_walk(qt_app, store, registry, tmp_path):
     window.next_recent_tab()
     assert not area.is_walking_mru()
     assert window._mru_filter_on is False
+
+
+# ======================================================================
+# 7. The zones, and the ghost slot
+#
+# TWO SIZES ON PURPOSE. Getting a tab INTO a window is a large target, the
+# window's full width and a whole tab row below the strip; getting one OUT of a
+# window is a small one, four pixels, so the tear registers as fast as it can
+# without a reorder ever reaching it. Everything below is one half of that
+# asymmetry, or the ghost slot that makes the large half readable.
+# ======================================================================
+
+def test_the_incoming_zone_spans_the_full_width_of_the_window(
+        qt_app, store, registry, tmp_path):
+    """THE COMPLAINT, AS AN ASSERTION. Lucas: "when i drag a tab to another
+    window so its added there, i cant drop it in the tab area, i need o bring
+    it as close as posible to the only tab in the window."
+
+    The bar hugs its tabs, so with one document open it is about 250 px wide on
+    a 1200 px window, and the old zone was that rect plus 18 px. Two thirds of
+    the way across the caption was not the tab area at all.
+    """
+    source = _window(registry, tmp_path, ["a.pdf", "b.pdf"], at=(100, 100))
+    other = _window(registry, tmp_path, ["x.pdf"], at=(2000, 100))
+    bar = source.document_area().bar()
+    other_bar = other.document_area().bar()
+    moving = source.document_area().view_at(0)
+
+    # Far to the right of the only tab, and a little below the row: nowhere
+    # near the bar, and squarely inside the window's tab area.
+    over = _in_zone(other, other.width() - 60, 6)
+    old_band = other_bar.rect().adjusted(0, -DOCK_MARGIN, 0, DOCK_MARGIN)
+    assert not old_band.contains(other_bar.mapFromGlobal(over)), \
+        "the point has to be outside the band this replaces"
+
+    start = _tab_point(bar, 0)
+    _press(bar, start)
+    _move(bar, _below_bar(bar, start))
+    _move(bar, over)
+
+    target = bar.tear_off().drop_target()
+    assert target is not None and target[0] is other
+    assert other.document_area().count() == 2
+    assert other.document_area().view_at(1) is moving
+
+    _release(bar, over)
+    assert other.document_area().view_at(1) is moving
+    other.document_area().check_invariant()
+
+
+def test_the_incoming_zone_reaches_well_below_the_tab_row(
+        qt_app, store, registry, tmp_path):
+    """His words for the tab area: the full width of the window "plus a
+    generous buffer below the tab row".
+
+    Below the row AND still precise, which is the half that matters. A point
+    that was not on a tab used to fall through to "append on the end", so
+    aiming at a position meant aiming at a 28 px strip.
+    """
+    source = _window(registry, tmp_path, ["a.pdf", "b.pdf"], at=(100, 100))
+    other = _window(registry, tmp_path, ["x.pdf", "y.pdf"], at=(2000, 100))
+    bar = source.document_area().bar()
+    other_bar = other.document_area().bar()
+    moving = source.document_area().view_at(0)
+
+    # Under the left quarter of the FIRST tab, well below the row.
+    quarter = other_bar.tabRect(0).width() // 4
+    deep = _in_zone(other, 0, INCOMING_SLACK - 6)
+    over = QPoint(other_bar.mapToGlobal(QPoint(quarter, 0)).x(), deep.y())
+    assert other_bar.tabAt(other_bar.mapFromGlobal(over)) < 0, \
+        "the point has to be off the tabs themselves"
+
+    start = _tab_point(bar, 0)
+    _press(bar, start)
+    _move(bar, _below_bar(bar, start))
+    _move(bar, over)
+
+    assert bar.tear_off().drop_target() == (other, 0)
+    assert other.document_area().index_of(moving) == 0
+    _release(bar, over)
+    assert other.document_area().view_at(0) is moving
+    other.document_area().check_invariant()
+
+
+def test_the_tear_registers_a_short_way_out_of_the_row(
+        qt_app, store, registry, tmp_path):
+    """It was forty pixels, which is a third of the way down the toolbar, and
+    it read as the app not responding: pulling a tab out of a two-tab window
+    took too long to become a ghost."""
+    window = _window(registry, tmp_path, ["a.pdf", "b.pdf"])
+    bar = window.document_area().bar()
+    start = _tab_point(bar, 0)
+
+    _press(bar, start)
+    _move(bar, _below_bar(bar, start, extra=DETACH_MARGIN + 1))
+    assert bar.tear_off().is_dragging()
+    assert bar.tear_off().ghost() is not None
+
+    _escape(bar)
+    assert window.document_area().count() == 2
+
+
+def test_the_outgoing_zone_is_smaller_than_the_incoming_one(
+        qt_app, store, registry, tmp_path):
+    """THE ASYMMETRY ITSELF, at one depth, on two windows.
+
+    The same distance below the tab row is inside another window's tab area and
+    outside the source's. That is the whole design in one assertion: a tab
+    arriving is offered a large target and a tab leaving is let go of quickly.
+    """
+    assert REDOCK_MARGIN < DETACH_MARGIN < INCOMING_SLACK
+    depth = (REDOCK_MARGIN + INCOMING_SLACK) // 2
+
+    source = _window(registry, tmp_path, ["a.pdf", "b.pdf"], at=(100, 100))
+    other = _window(registry, tmp_path, ["x.pdf", "y.pdf"], at=(2000, 100))
+    bar = source.document_area().bar()
+
+    start = _tab_point(bar, 0)
+    _press(bar, start)
+    _move(bar, _below_bar(bar, start))
+
+    _move(bar, _in_zone(source, 300, depth))
+    assert bar.tear_off().drop_target() is None, "the source let go"
+
+    _move(bar, _in_zone(other, 300, depth))
+    target = bar.tear_off().drop_target()
+    assert target is not None and target[0] is other, "the other window caught"
+
+    _escape(bar)
+
+
+def test_the_tabs_part_and_a_ghost_takes_the_first_slot(
+        qt_app, store, registry, tmp_path):
+    """TWO tabs in the target and not three, deliberately. At three the bar is
+    past its width and scrolls, so `tabRect(0)` is a rectangle off the left of
+    the widget and a point built from it is not on screen at all. That is a
+    property of the strip, not of this gesture, and aiming at it would test the
+    scroll offset instead of the ghost."""
+    source = _window(registry, tmp_path, ["a.pdf", "b.pdf"], at=(100, 100))
+    other = _window(registry, tmp_path, ["x.pdf", "y.pdf"], at=(2000, 100))
+    bar = source.document_area().bar()
+    other_bar = other.document_area().bar()
+    moving = source.document_area().view_at(0)
+    was = [other.document_area().view_at(i) for i in range(2)]
+
+    start = _tab_point(bar, 0)
+    _press(bar, start)
+    _move(bar, _below_bar(bar, start))
+    over = _tab_point(other_bar, 0, dx=4)
+    _move(bar, over)
+
+    assert other.document_area().count() == 3
+    assert other.document_area().index_of(moving) == 0
+    assert other_bar.ghost_index() == 0
+    # The strip PARTED rather than shuffled: the two that were there are still
+    # in order, one place to the right.
+    assert [other.document_area().view_at(i) for i in (1, 2)] == was
+
+    _release(bar, over)
+    assert other_bar.ghost_index() is None
+    assert other.document_area().view_at(0) is moving
+    other.document_area().check_invariant()
+
+
+def test_the_tabs_part_and_a_ghost_takes_the_last_slot(
+        qt_app, store, registry, tmp_path):
+    source = _window(registry, tmp_path, ["a.pdf", "b.pdf"], at=(100, 100))
+    other = _window(registry, tmp_path, ["x.pdf", "y.pdf", "z.pdf"],
+                    at=(2000, 100))
+    bar = source.document_area().bar()
+    other_bar = other.document_area().bar()
+    moving = source.document_area().view_at(0)
+    was = [other.document_area().view_at(i) for i in range(3)]
+
+    start = _tab_point(bar, 0)
+    _press(bar, start)
+    _move(bar, _below_bar(bar, start))
+    # Past the right-hand end of the last tab, still inside the zone.
+    over = _in_zone(other, other.width() - 80, 4)
+    _move(bar, over)
+
+    assert other.document_area().count() == 4
+    assert other.document_area().index_of(moving) == 3
+    assert other_bar.ghost_index() == 3
+    assert [other.document_area().view_at(i) for i in (0, 1, 2)] == was
+
+    _release(bar, over)
+    assert other_bar.ghost_index() is None
+    assert other.document_area().view_at(3) is moving
+    other.document_area().check_invariant()
+
+
+def test_the_ghost_moves_slot_as_the_cursor_does(qt_app, store, registry,
+                                                 tmp_path):
+    """The gap follows the cursor along the strip, which is the whole reason
+    the feedback is worth having: it answers "where will it fall" before the
+    button comes up, at every position and not only at the ends."""
+    source = _window(registry, tmp_path, ["a.pdf", "b.pdf"], at=(100, 100))
+    other = _window(registry, tmp_path, ["x.pdf", "y.pdf"], at=(2000, 100))
+    bar = source.document_area().bar()
+    other_bar = other.document_area().bar()
+    moving = source.document_area().view_at(0)
+
+    start = _tab_point(bar, 0)
+    _press(bar, start)
+    _move(bar, _below_bar(bar, start))
+
+    # Global x, not a tab index: the strip relayouts under the tab it has just
+    # taken in, so an index read before the move names a different tab after
+    # it. The left edge of the strip and the far right of the caption are two
+    # fixed points that mean the same thing on both sides of the move.
+    left = other_bar.mapToGlobal(QPoint(4, 0)).x()
+    right = other.frameGeometry().left() + other.width() - 80
+    seen = []
+    for x in (left, right):
+        _move(bar, QPoint(x, _bar_bottom(other) + 4))
+        assert other_bar.ghost_index() == other.document_area().index_of(moving)
+        seen.append(other_bar.ghost_index())
+    assert seen == [0, other.document_area().count() - 1], seen
+
+    _escape(bar)
+
+
+def test_leaving_the_tab_area_closes_the_gap(qt_app, store, registry, tmp_path):
+    """Approaching a strip opens a gap in it, so leaving has to close one.
+
+    Without this a tab that brushed past a window on its way to the desktop
+    stayed parked in that window's bar, ghosted, for the rest of the drag, and
+    the drop then made its new window out of the wrong one.
+    """
+    source = _window(registry, tmp_path, ["a.pdf", "b.pdf"], at=(100, 100))
+    other = _window(registry, tmp_path, ["x.pdf", "y.pdf"], at=(2000, 100))
+    bar = source.document_area().bar()
+    other_bar = other.document_area().bar()
+    moving = source.document_area().view_at(0)
+
+    start = _tab_point(bar, 0)
+    _press(bar, start)
+    _move(bar, _below_bar(bar, start))
+    over = _tab_point(other_bar, 1, dx=4)
+    _move(bar, over)
+    assert other.document_area().count() == 3
+    assert other_bar.ghost_index() == 1
+
+    far = QPoint(3000, 2000)          # nowhere near any window
+    _move(bar, far)
+
+    assert bar.tear_off().drop_target() is None
+    assert other_bar.ghost_index() is None
+    assert other.document_area().count() == 2
+    assert source.document_area().count() == 2
+    assert source.document_area().index_of(moving) == 0
+    assert bar.tear_off().ghost() is not None, "mid-air again, so on screen again"
+    other.document_area().check_invariant()
+    source.document_area().check_invariant()
+
+    _release(bar, far)
+    assert registry.count() == 3
+    assert moving.window() not in (source, other)
+
+
+def test_a_whole_window_drag_still_only_merges_on_the_strip(
+        qt_app, store, registry, tmp_path):
+    """THE ZONE THAT MUST NOT GROW. A tab under the cursor is tab-sized and
+    aimed; a window under the cursor covers whatever it is over, and sliding
+    one window across another is what arranging a desk looks like. Charging
+    that gesture a merge would make windows impossible to place.
+
+    So the wide incoming zone is a rule about carrying a TAB. A carried WINDOW
+    still has to be over the target's strip, and the middle assertion is what
+    proves the new zone did not leak into it: a depth that a carried tab would
+    call the tab area is not one a carried window may merge from.
+    """
+    source = _window(registry, tmp_path, ["a.pdf"], at=(100, 100))
+    other = _window(registry, tmp_path, ["x.pdf", "y.pdf"], at=(2000, 100))
+    bar = source.document_area().bar()
+    other_bar = other.document_area().bar()
+
+    start = _tab_point(bar, 0)
+    _press(bar, start)
+    _move(bar, start + QPoint(QApplication.startDragDistance() + 4, 0))
+    assert bar.tear_off().is_dragging()
+
+    body = other.mapToGlobal(QPoint(other.width() // 2, other.height() // 2))
+    _move(bar, body)
+    assert bar.tear_off().drop_target() is None, "the body is not a merge"
+
+    between = _in_zone(other, other.width() // 2, DOCK_MARGIN + 8)
+    assert between.y() < _bar_bottom(other) + INCOMING_SLACK, \
+        "the point has to be inside what a carried TAB would call the zone"
+    _move(bar, between)
+    assert bar.tear_off().drop_target() is None, "and neither is the zone"
+
+    over = _tab_point(other_bar, 0, dx=4)
+    _move(bar, over)
+    assert bar.tear_off().drop_target() == (other, 0)
+
+    _escape(bar)
+    assert source.document_area().count() == 1
+    assert other.document_area().count() == 2

@@ -7,11 +7,13 @@ procedure, no compositor and no z-order, so it can tell you a widget's state
 and its geometry but it cannot tell you that a single pixel reached a screen.
 Specifically, nothing below proves:
 
-  - that the drag feedback is VISIBLE. These tests assert that `drop_active` is
-    set and that `drop_indicator` is at the right x. Whether the wash, the
-    outline and the line actually paint, in the accent, over the frameless
-    chrome, under a drag ghost, and legibly in both themes, is a question about
-    pixels on a screen and this suite cannot ask it.
+  - that the drag feedback is VISIBLE. These tests assert that `ghost_index`
+    names the right tab and that `drop_indicator` is at the right x. Whether
+    the veil and the line actually paint, in the accent, over the frameless
+    chrome, and legibly in both themes, is a question about pixels on a screen
+    and this suite cannot ask it. `test_the_ghost_paints_on_its_own_tab_and_
+    nowhere_else` gets closest: it compares two grabs of the widget, which
+    proves the paint code ran and where, not that a screen received it.
   - that the close button LOOKS centred. The arithmetic is checked here; how it
     reads against a rounded tab is not.
   - anything involving real mouse capture, `grabMouse`, or the OS hit test.
@@ -33,7 +35,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from core.settings import Settings, set_settings
 from ui.document_area import (
     CLOSE_BUTTON_RIGHT_INSET, CLOSE_BUTTON_SIZE, DROP_FEEDBACK_MIN_WIDTH,
-    DROP_LINE_WIDTH,
+    TAB_SHAPE_MARGIN_X, TAB_SHAPE_MARGIN_Y,
 )
 from ui.main_window import MainWindow
 from ui.theme import DARK, LIGHT, build_qss
@@ -259,108 +261,193 @@ def _pretend_dragging(tear, window, view):
     tear._whole_window = False
 
 
-def test_the_receiving_strip_gets_a_line_and_nothing_else(two_windows):
-    """THE HIGHLIGHT IS GONE, and this is where that is pinned.
+def _carried_into(tear, source, target, view, at):
+    """The state after the live attach has put `view` into `target` at `at`.
 
-    The strip used to be washed in the accent and outlined in it as well, so
-    "which window is this going into" could be read without hunting for a
-    hairline. Since the bar hugs its tabs, a strip is barely wider than the
-    tabs on it, and a wash plus a 2px outline around that reads as a heavy
-    amber box drawn around the tab. Lucas, with a screenshot: "if we follow an
-    already pretty advnced UI like edge, no hgihglight exists so lets
-    replciate that."
+    The approach moves the tab for real (`TabTearOff._attach_to_strip`), and
+    the ghost slot is a fact about a tab that is already in the strip, so a
+    test of the feedback has to start from a strip that has parted.
+    """
+    assert source.move_view_to_window(view, target, at)
+    _pretend_dragging(tear, source, view)
+    tear._attached_to = target
 
-    The insertion line survives, because Edge draws one too and because the
-    live attach it marks is otherwise invisible: see
-    `TabTearOff._show_drop_feedback`.
+
+def test_the_receiving_strip_gets_a_ghost_slot_and_no_line(two_windows):
+    """THE LINE IS GONE FOR A CARRIED TAB, and this is where that is pinned.
+
+    The strip used to be washed in the accent and outlined in it, which on a
+    bar that hugs its tabs read as an amber box around the tab. That was cut
+    back to a 4px insertion line, and the line was then reported as something
+    the drag ghost sat half on top of: "it almost even blocks the view of the
+    highlithed bar and where it will fall."
+
+    So the feedback is the SHAPE of the strip rather than a mark on it. The
+    tabs part, the carried tab sits in the gap, and it is painted as a ghost
+    until the button comes up. See `TabTearOff._show_drop_feedback`.
     """
     a, b = two_windows
     bar = b.document_area().bar()
+    view = a.document_area().view_at(0)
     tear = a.document_area().bar()._tear_off
-    _pretend_dragging(tear, a, a.document_area().view_at(0))
+    _carried_into(tear, a, b, view, 1)
+
     tear._show_drop_feedback((b, 1))
-    assert bar.drop_indicator() is not None
-    assert a.document_area().bar().drop_indicator() is None
+    assert bar.ghost_index() == 1
+    assert bar.drop_indicator() is None
+    assert a.document_area().bar().ghost_index() is None
     # There is no strip-wide state left to set, so nothing can paint one.
     assert not hasattr(bar, "drop_active")
     assert not hasattr(bar, "set_drop_active")
 
 
-def test_no_box_is_painted_around_the_arriving_tab(two_windows):
-    """The paint itself, as far as offscreen can reach it.
+def test_the_ghost_lands_on_the_shape_the_stylesheet_paints(two_windows):
+    """The slot is the TAB's shape, not the tab's rect.
 
-    A wash and an outline both cover the whole bar rect, so the way to ask "is
-    there a box" without a compositor is to paint the bar into a pixmap twice,
-    with the feedback down and then up, and check that everything well away
-    from the insertion line came out identical. The box changed all of it; a
-    slim mark changes only where it is.
-
-    This proves the paint and not merely the state, which is the half
-    tests/test_tab_bar_chrome.py's own docstring says offscreen usually cannot
-    reach. It works here because the question is about one widget painting
-    itself, not about pixels arriving on a screen.
+    `::tab` carries `margin: 4px 2px`, so a rectangle drawn on the bare rect
+    would stand two pixels proud of the tab on each side and four above and
+    below it, which reads as a box around the tab rather than as the tab faded
+    out. This is the arithmetic; the look is `tools/shoot_tab_drag.py`.
     """
     a, b = two_windows
     bar = b.document_area().bar()
+    view = a.document_area().view_at(0)
     tear = a.document_area().bar()._tear_off
-    _pretend_dragging(tear, a, a.document_area().view_at(0))
+    _carried_into(tear, a, b, view, 1)
+    tear._show_drop_feedback((b, 1))
+
+    rect = bar.tabRect(1)
+    slot = bar.ghost_slot_rect()
+    assert not slot.isEmpty()
+    assert slot == rect.adjusted(TAB_SHAPE_MARGIN_X, TAB_SHAPE_MARGIN_Y,
+                                 -TAB_SHAPE_MARGIN_X, -TAB_SHAPE_MARGIN_Y)
+    assert rect.contains(slot)
+
+
+def test_the_ghost_paints_on_its_own_tab_and_nowhere_else(two_windows):
+    """The paint itself, as far as offscreen can reach it.
+
+    A wash covers the whole bar rect, so the way to ask "is there a box"
+    without a compositor is to paint the bar into a pixmap twice, with the
+    feedback down and then up, and compare. Everything outside the ghost's own
+    tab has to come out identical, and the ghost's own tab has to come out
+    different, because a veil that changes nothing is not a veil.
+
+    This proves the paint and not merely the state, which is the half this
+    file's docstring says offscreen usually cannot reach. It works because the
+    question is about one widget painting itself, not about pixels arriving on
+    a screen.
+    """
+    a, b = two_windows
+    bar = b.document_area().bar()
+    view = a.document_area().view_at(0)
+    tear = a.document_area().bar()._tear_off
+    _carried_into(tear, a, b, view, 1)
 
     clean = bar.grab().toImage()
     tear._show_drop_feedback((b, 1))
-    line_x = bar.drop_indicator()
-    assert line_x is not None
+    slot = bar.ghost_slot_rect()
+    assert not slot.isEmpty()
     lit = bar.grab().toImage()
 
     probes = [(x, y)
-              for x in (4, bar.width() // 4, bar.width() - 5)
+              for x in (4, slot.left() - 4, slot.right() + 4, bar.width() - 5)
               for y in (0, 1, bar.height() // 2, bar.height() - 1)
-              if abs(x - line_x) > DROP_LINE_WIDTH + 4]
-    assert probes, "every probe landed on the line itself"
+              if not slot.contains(x, y) and 0 <= x < bar.width()]
+    assert probes, "every probe landed on the ghost itself"
     for x, y in probes:
         assert lit.pixel(x, y) == clean.pixel(x, y), f"painted at ({x}, {y})"
+
+    inside = slot.center()
+    assert lit.pixel(inside) != clean.pixel(inside), "the veil painted nothing"
 
 
 def test_only_one_strip_is_marked_at_a_time(two_windows):
     """Moving from one window to another has to take the mark off the first,
-    or a drag across three windows leaves a trail of insertion lines."""
+    or a drag across three windows leaves a trail of ghost slots."""
     a, b = two_windows
+    view = a.document_area().view_at(0)
     tear = a.document_area().bar()._tear_off
-    _pretend_dragging(tear, a, a.document_area().view_at(0))
+    _carried_into(tear, a, b, view, 0)
     tear._show_drop_feedback((b, 0))
-    assert b.document_area().bar().drop_indicator() is not None
+    assert b.document_area().bar().ghost_index() == 0
+
+    assert b.move_view_to_window(view, a, 0)
+    tear._attached_to = a
     tear._show_drop_feedback((a, 0))
-    assert b.document_area().bar().drop_indicator() is None
-    assert a.document_area().bar().drop_indicator() is not None
+    assert b.document_area().bar().ghost_index() is None
+    assert a.document_area().bar().ghost_index() == 0
 
 
 def test_the_feedback_is_cleared_when_the_drag_ends(two_windows):
     a, b = two_windows
+    view = a.document_area().view_at(0)
     tear = a.document_area().bar()._tear_off
-    _pretend_dragging(tear, a, a.document_area().view_at(0))
+    _carried_into(tear, a, b, view, 1)
     tear._show_drop_feedback((b, 1))
+    assert b.document_area().bar().ghost_index() is not None
     tear._clear_drop_feedback()
     for window in (a, b):
-        assert window.document_area().bar().drop_indicator() is None
+        bar = window.document_area().bar()
+        assert bar.drop_indicator() is None
+        assert bar.ghost_index() is None
 
 
-def test_the_line_marks_the_tab_being_carried(two_windows):
-    """The index is read AFTER the live attach, not before.
+def test_the_drop_turns_the_ghost_into_the_tab_it_was_over(two_windows):
+    """The whole promise of the ghost in one assertion.
 
-    The tab joins the target strip on approach, so by the time the feedback
-    goes up the carried tab is already sitting at its landing position and
-    `insertion_x` of that index is its own left edge. Reading the hit test's
-    index instead would put the line one position stale on every frame.
+    Nothing moves on the drop. The tab is already at the index the ghost was
+    drawn on, and clearing the ghost is the entire transition from "about to
+    land here" to "landed here".
     """
     a, b = two_windows
     view = a.document_area().view_at(0)
-    assert a.move_view_to_window(view, b, 1)
     tear = a.document_area().bar()._tear_off
-    _pretend_dragging(tear, a, view)
-    tear._attached_to = b
+    _carried_into(tear, a, b, view, 1)
+    tear._show_drop_feedback((b, 1))
+    bar = b.document_area().bar()
+    ghosted = bar.ghost_index()
+
+    tear._clear_drop_feedback()
+
+    assert bar.ghost_index() is None
+    assert b.document_area().index_of(view) == ghosted
+
+
+def test_the_ghost_marks_the_tab_being_carried(two_windows):
+    """The index is read AFTER the live attach, not before.
+
+    The tab joins the target strip on approach, so by the time the feedback
+    goes up it is already sitting at its landing position and its own index is
+    the answer. Reading the hit test's index instead would ghost the wrong tab
+    on every frame.
+    """
+    a, b = two_windows
+    view = a.document_area().view_at(0)
+    tear = a.document_area().bar()._tear_off
+    _carried_into(tear, a, b, view, 1)
     tear._show_drop_feedback((b, 0))     # a deliberately stale index
     bar = b.document_area().bar()
-    landed = b.document_area().index_of(view)
-    assert bar.drop_indicator() == bar.insertion_x(landed)
+    assert bar.ghost_index() == b.document_area().index_of(view)
+    assert bar.ghost_index() == 1
+
+
+def test_a_whole_window_being_carried_still_gets_the_line(two_windows):
+    """The one case the ghost cannot cover, and the reason the line survives.
+
+    A lone tab drags its own window and the merge is deferred to the release,
+    so nothing has joined the target strip: there is no tab to ghost and no gap
+    to open. The line is the only feedback available there.
+    """
+    a, b = two_windows
+    bar = b.document_area().bar()
+    tear = a.document_area().bar()._tear_off
+    _pretend_dragging(tear, a, a.document_area().view_at(0))
+    tear._whole_window = True
+
+    tear._show_drop_feedback((b, 1))
+    assert bar.drop_indicator() == bar.insertion_x(1)
+    assert bar.ghost_index() is None
 
 
 def test_an_empty_strip_is_never_marked(two_windows):
@@ -381,11 +468,13 @@ def test_a_hidden_strip_is_never_marked(two_windows):
     and the state is not set rather than being set and then not drawn."""
     a, b = two_windows
     bar = b.document_area().bar()
-    b.document_area().header().setVisible(False)
+    view = a.document_area().view_at(0)
     tear = a.document_area().bar()._tear_off
-    _pretend_dragging(tear, a, a.document_area().view_at(0))
-    tear._show_drop_feedback((b, 0))
+    _carried_into(tear, a, b, view, 1)
+    b.document_area().header().setVisible(False)
+    tear._show_drop_feedback((b, 1))
     assert bar.drop_indicator() is None
+    assert bar.ghost_index() is None
 
 
 def test_a_narrow_strip_is_never_marked(two_windows):
