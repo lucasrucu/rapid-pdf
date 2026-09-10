@@ -164,10 +164,16 @@ TAB_CORNER_RADIUS = 8
 # height: it has to read as "between these two tabs" from the corner of the eye,
 # while the thing actually being looked at is the window under the cursor.
 #
-# IT IS NOW THE WHOLE-WINDOW CASE ONLY. A tab being carried gets the ghost slot
-# above instead. A lone tab drags its own window and the merge is deferred to
-# the release, so nothing has joined the target strip, so there is no tab to
-# ghost: the line is the only feedback available there and it is still right.
+# NOTHING IN THE APP RAISES IT ANY MORE, and that is deliberate rather than an
+# oversight. It survived one pass as the whole-window case's feedback, on the
+# grounds that a deferred merge has no tab in the strip to ghost. Lucas merges
+# two one-tab windows constantly, so in practice the line was what he saw every
+# time and the ghost was what he never saw: "the ghost never appears". That case
+# now gets an EMPTY ghost slot (`set_ghost_slot`), which is the same gap in the
+# same place. What is kept here is the primitive and its state, because
+# tools/shoot_tab_drag.py photographs `drop_indicator()` alongside
+# `ghost_index()` and a bar that could not answer would be a bar that could not
+# be photographed. It should read None for the whole of every drag.
 #
 # IT IS NOW THE WHOLE OF THE DRAG FEEDBACK. It used to be drawn on top of an
 # accent wash over the entire target strip, plus a 2px accent outline round it,
@@ -378,6 +384,32 @@ class _TabCloseButton(QAbstractButton):
         self.update()
         super().leaveEvent(event)
 
+    def moveEvent(self, event):
+        """Tell the bar, because Qt moves this button behind the bar's back.
+
+        `DocumentTabBar._place_close_buttons` runs off three hooks and Qt uses
+        more paths than those three. `QTabBarPrivate::layoutWidgets` sets every
+        tab button's geometry directly and raises no `tabLayoutChange`, so a
+        press on a tab, or a tab-move animation finishing, repositions this
+        button at Qt's own placement and nothing puts it back. That was
+        MEASURED rather than guessed: a press on a tab moves the X by two
+        pixels from inside `QTabBar::mousePressEvent`, and in that trace the
+        only thing that ever corrected it was an unrelated `setTabText` a few
+        events later. When nothing unrelated happens, which is the whole of a
+        tear-off drag, the X stays where Qt put it for the rest of the gesture.
+        Lucas, looking at the tab left behind by a drag: "it has the x too
+        close to the sid eof the tab, when its normal it doesnt change and th
+        position is ok but after when in gohst it changes".
+
+        The bar decides whether to correct it, because during a REORDER the
+        button is supposed to slide with the tab it belongs to. See
+        `DocumentTabBar.close_button_moved`.
+        """
+        super().moveEvent(event)
+        notify = getattr(self.parentWidget(), "close_button_moved", None)
+        if notify is not None:
+            notify(self)
+
     def sizeHint(self) -> QSize:
         return QSize(CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE)
 
@@ -445,6 +477,15 @@ class DocumentTabBar(QTabBar):
     #: (tab index, global position) - right-clicked on a tab.
     tab_menu_requested = Signal(int, QPoint)
 
+    # CLASS DEFAULTS, AND THEY ARE LOAD-BEARING. `setExpanding` and its
+    # neighbours in `__init__` reach straight back into `tabLayoutChange` and
+    # `sizeHint` before the constructor has run a single assignment, so any of
+    # these read as an instance attribute there would be an AttributeError
+    # raised out of a Qt virtual method. The instance rebinds them below.
+    _ghost_slot_x = None
+    _pinned_close_buttons = False
+    _placing_close_buttons = False
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("documentTabBar")
@@ -469,6 +510,16 @@ class DocumentTabBar(QTabBar):
         # this is only what makes it look like a ghost until the button comes
         # up. See GHOST_VEIL_ALPHA.
         self._ghost_index = None
+        # The x of an EMPTY ghost slot, or None. The other half of the same
+        # feedback, for the case where the tab cannot have joined this strip
+        # yet: a whole window being carried. See set_ghost_slot.
+        self._ghost_slot_x = None
+        # Whether Qt is allowed to reposition the close buttons right now.
+        # Off during a reorder, where the button must slide with its tab; on
+        # for the length of a tear, where it must not move at all. See
+        # close_button_moved.
+        self._pinned_close_buttons = False
+        self._placing_close_buttons = False
         # Tabs ticked for "Move Selected to New Window", by index. Pushed down
         # from DocumentArea, which holds the real answer as VIEWS: an index goes
         # stale the moment a tab is dragged along the bar.
@@ -582,19 +633,93 @@ class DocumentTabBar(QTabBar):
         cannot see the veil but can ask what it is drawn over."""
         return self._ghost_index
 
+    def set_ghost_slot(self, x):
+        """Hold an EMPTY ghost slot open at `x`. None clears it.
+
+        THE SAME FEEDBACK AS `set_ghost_index`, FOR THE CASE WHERE THERE IS NO
+        TAB TO GHOST. A tab carried out of a multi-tab window joins the target
+        strip on approach, so the slot is a real tab painted as a ghost. A
+        window carrying its only tab cannot do that: adopting it would empty
+        and close the very window the cursor is pinned to, so the move is
+        deferred to the release and nothing has joined this strip.
+
+        It used to get a four-pixel insertion line instead, which is what
+        Lucas saw and did not want: the ghost "never appears", only the line.
+        From his seat the two gestures are the same gesture, so they get the
+        same feedback. This reserves a tab's width in `sizeHint`, so the strip
+        visibly opens up, and paints a slot in the gap.
+        """
+        if x == self._ghost_slot_x:
+            return
+        opening = (self._ghost_slot_x is None) != (x is None)
+        self._ghost_slot_x = x
+        if opening:
+            # The slot is real width, not a mark drawn over the tabs, so the
+            # bar has to be allowed to grow into it before anything can be
+            # painted there. `updateGeometry` alone is not enough INSIDE A
+            # DRAG: it posts a layout request to the parent, whose own resize
+            # posts another one to ITS parent, and the strip only reaches its
+            # new width two or three event loop passes later. The slot would
+            # be clamped on top of the tabs for those passes and then jump.
+            # The bar is four widgets deep in the title row, so the chain is
+            # walked and activated once, here, instead.
+            self._relayout_strip()
+        self.update()
+
+    def _relayout_strip(self):
+        """Make this bar's new width real now rather than next frame."""
+        self.updateGeometry()
+        widget = self
+        while widget is not None and not widget.isWindow():
+            layout = widget.parentWidget().layout()
+            if layout is not None:
+                layout.invalidate()
+                layout.activate()
+            widget = widget.parentWidget()
+
+    def ghost_slot_x(self):
+        """Where the empty ghost slot is, or None. For the tests."""
+        return self._ghost_slot_x
+
+    def ghost_slot_width(self) -> int:
+        """How wide a slot a tab arriving in this strip needs.
+
+        A tab's width, because that is what is going to land in it. On an
+        empty strip there is no tab to measure, so the share a single tab
+        would get stands in.
+        """
+        if self.count() > 0:
+            return self.tabRect(0).width()
+        return max(TAB_MIN_WIDTH, min(TAB_MAX_WIDTH, self._share_budget()))
+
     def ghost_slot_rect(self) -> QRect:
         """The shape the ghost is painted on, in this bar's coordinates.
 
-        Empty when there is no ghost. It is the tab's rect brought in to the
-        shape the stylesheet actually paints (see TAB_SHAPE_MARGIN_X), so a test
-        can pin the two together without reading pixels.
+        Empty when there is no ghost of either kind. It is brought in to the
+        shape the stylesheet actually paints (see TAB_SHAPE_MARGIN_X), so a
+        test can pin the two together without reading pixels.
+
+        ONE ACCESSOR FOR BOTH KINDS on purpose: "where is the tab going to
+        land" has one answer whether or not the tab has joined the strip yet,
+        and a caller that had to ask twice would be a caller that could get
+        two answers.
         """
         index = self._ghost_index
-        if index is None or not 0 <= index < self.count():
+        if index is not None and 0 <= index < self.count():
+            return self.tabRect(index).adjusted(
+                TAB_SHAPE_MARGIN_X, TAB_SHAPE_MARGIN_Y,
+                -TAB_SHAPE_MARGIN_X, -TAB_SHAPE_MARGIN_Y)
+        if self._ghost_slot_x is None:
             return QRect()
-        return self.tabRect(index).adjusted(
-            TAB_SHAPE_MARGIN_X, TAB_SHAPE_MARGIN_Y,
-            -TAB_SHAPE_MARGIN_X, -TAB_SHAPE_MARGIN_Y)
+        width = self.ghost_slot_width()
+        rect = QRect(int(self._ghost_slot_x), self.rect().top(),
+                     width, self.rect().height())
+        # Held on the strip, because `insertion_x` past the last tab is that
+        # tab's right edge and the reserved width may not have been laid out
+        # yet. A slot half off the end of the bar would be a mark, not a gap.
+        rect.moveLeft(max(0, min(rect.left(), self.width() - width)))
+        return rect.adjusted(TAB_SHAPE_MARGIN_X, TAB_SHAPE_MARGIN_Y,
+                             -TAB_SHAPE_MARGIN_X, -TAB_SHAPE_MARGIN_Y)
 
     def _can_paint_drop_feedback(self) -> bool:
         """Whether this bar is a real strip rather than a few stray pixels.
@@ -727,18 +852,58 @@ class DocumentTabBar(QTabBar):
         happened to the bar. `resizeEvent` is the third because the share
         budget, and therefore every tab rect, moves with the window.
         """
-        side = self._button_side()
-        for i in range(self.count()):
-            button = self.tabButton(i, side)
-            if not isinstance(button, _TabCloseButton):
-                continue
-            rect = self.tabRect(i)
-            if rect.isEmpty():
-                continue
-            geometry = button.geometry()
-            x = rect.right() - geometry.width() - CLOSE_BUTTON_RIGHT_INSET
-            if x != geometry.x():
-                button.move(x, geometry.y())
+        if self._placing_close_buttons:
+            # Re-entered from a button's own moveEvent. The loop below is what
+            # moved it, so there is nothing here that has not already been
+            # decided one frame up the stack.
+            return
+        self._placing_close_buttons = True
+        try:
+            side = self._button_side()
+            for i in range(self.count()):
+                button = self.tabButton(i, side)
+                if not isinstance(button, _TabCloseButton):
+                    continue
+                rect = self.tabRect(i)
+                if rect.isEmpty():
+                    continue
+                geometry = button.geometry()
+                x = rect.right() - geometry.width() - CLOSE_BUTTON_RIGHT_INSET
+                if x != geometry.x():
+                    button.move(x, geometry.y())
+        finally:
+            self._placing_close_buttons = False
+
+    def set_close_buttons_pinned(self, pinned: bool):
+        """Whether the close buttons may be moved by anything but this bar.
+
+        ON FOR THE LENGTH OF A TEAR, OFF THE REST OF THE TIME, and the split
+        is not fussiness. During a REORDER, QTabBar slides the pressed tab by
+        a drag offset that `tabRect` does not report and moves that tab's
+        close button along with it; correcting that would peg the X to the
+        tab's un-slid position and it would sit still while its tab slid out
+        from under it. Once a tear has started, the reorder is over (see
+        `TabTearOff._settle_tab_bar`), the tab is back at the rect it reports,
+        and any further move of the button is Qt relayout noise that must not
+        be allowed to change how the tab looks mid-gesture.
+        """
+        pinned = bool(pinned)
+        if pinned == self._pinned_close_buttons:
+            return
+        self._pinned_close_buttons = pinned
+        if pinned:
+            self._place_close_buttons()
+
+    def close_button_moved(self, button):
+        """One of the close buttons was moved. Put it back if it is pinned.
+
+        Called from `_TabCloseButton.moveEvent`, which is the only hook that
+        catches every path Qt uses. The re-entrancy guard in
+        `_place_close_buttons` is what stops the correction from chasing its
+        own tail: the move it makes comes straight back here.
+        """
+        if self._pinned_close_buttons:
+            self._place_close_buttons()
 
     def tabLayoutChange(self):
         super().tabLayoutChange()
@@ -756,9 +921,19 @@ class DocumentTabBar(QTabBar):
 
         It is also what a browser looks like. Chrome and Edge both leave a gap
         between the last tab and the plus, and neither butts them together.
+
+        AND THE EMPTY GHOST SLOT IS REAL WIDTH. A slot held open for a tab
+        that has not joined this strip yet has nowhere to be drawn unless the
+        bar makes room for it, and on a strip that hugs its tabs there is no
+        spare room at all: the slot would be clipped to the ten pixels of
+        trailing slack. Reserving it here is what makes the strip part around
+        the arriving tab the way it does when the tab has really joined.
         """
         hint = super().sizeHint()
-        hint.setWidth(hint.width() + TRAILING_SLACK)
+        extra = TRAILING_SLACK
+        if self._ghost_slot_x is not None:
+            extra += self.ghost_slot_width()
+        hint.setWidth(hint.width() + extra)
         return hint
 
     def resizeEvent(self, event):
@@ -849,7 +1024,13 @@ class DocumentTabBar(QTabBar):
             return
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         veil = self._strip_background()
-        veil.setAlphaF(GHOST_VEIL_ALPHA)
+        # OPAQUE WHEN THERE IS NOTHING UNDERNEATH TO SHOW THROUGH. The veil
+        # fades a real tab toward the strip, which is only a fade while there
+        # is a tab to fade; an empty slot held open for a whole window being
+        # carried has to cover whatever the reserved width happens to overlap,
+        # or it reads as a ring drawn around somebody else's tab.
+        if self._ghost_index is not None:
+            veil.setAlphaF(GHOST_VEIL_ALPHA)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(veil)
         painter.drawRoundedRect(shape, TAB_CORNER_RADIUS, TAB_CORNER_RADIUS)
@@ -888,14 +1069,14 @@ class DocumentTabBar(QTabBar):
         """
         super().paintEvent(event)
         if not self._checked and self._drop_x is None \
-                and self._ghost_index is None:
+                and self._ghost_index is None and self._ghost_slot_x is None:
             return
         painter = QPainter(self)
         accent = self._accent()
 
         # Before the tick marks and before the line, so anything else that
         # belongs to this tab is drawn ON the ghost rather than under it.
-        if self._ghost_index is not None:
+        if self._ghost_index is not None or self._ghost_slot_x is not None:
             self._paint_ghost_slot(painter)
 
         for index in self._checked:

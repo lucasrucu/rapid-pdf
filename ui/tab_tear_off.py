@@ -47,11 +47,20 @@ THE SHAPE OF ONE GESTURE.
 
 TWO ZONES, DIFFERENT SIZES, ON PURPOSE. Getting a tab INTO a window and getting
 one OUT of a window are not the same job and do not get the same target. The
-incoming zone is the full width of the window and a whole tab row deep below the
-strip, because a document should land wherever it is aimed; the outgoing one is
-four pixels, because a tear that takes forty pixels of travel to register reads
-as the app not responding. The numbers, and the chrome they are measured off,
-are at the top of the constants below.
+incoming zone is the full width of the window and every pixel of chrome below
+the strip, because a document should land wherever it is aimed; the outgoing one
+is four pixels, because a tear that takes forty pixels of travel to register
+reads as the app not responding. The numbers, and the chrome they are measured
+off, are at the top of the constants below.
+
+ONE ZONE FOR BOTH GESTURES, THOUGH. A tab carried out of a two-tab window and a
+whole one-tab window being carried by its tab used to be hit-tested against
+different targets, and the window's was the target's bar plus 18 px, which on a
+strip that hugs its tabs is a quarter of the window. Lucas does not make that
+distinction and should not have to: "i even need to over lap the tab in order
+for it to catch like amagnet". Both now merge on the same zone, and the rule
+that stops two overlapping windows swallowing each other comes out of WHERE the
+zone stops rather than out of which gesture is in flight. See INCOMING_SLACK.
 
 HIT-TESTING ASKS THE OS FIRST. `QApplication.topLevelAt` gives true z-order,
 and the ghost is invisible to it because of `WindowTransparentForInput`. The
@@ -75,20 +84,23 @@ overshoot is required only when there is a row to overshoot OUT of, and one tab
 hands the window to the pointer as soon as Qt calls it a drag at all. Edge and
 Chrome both do exactly this.
 
-Merging that window into another one still works, and it is the target's TAB
-STRIP that accepts it rather than the whole of the target window. See
-`_strip_index`: a tab being carried on its own can land anywhere over a window,
-because the thing following the cursor is tab-sized and aimed; a whole window
-following the cursor covers whatever is under it, and "the windows overlapped"
-must never be enough to swallow one into the other.
+Merging that window into another one still works, on the target's TAB ZONE:
+the full width of the window and down to the last row of chrome above its page.
+A whole window following the cursor covers whatever is under it, and "the
+windows overlapped" must never be enough to swallow one into the other, so the
+page is out. Everything above it is in, which is what makes the merge feel like
+a magnet instead of a bullseye. The feedback is the same empty ghost slot a
+carried tab gets: see `_show_drop_feedback`.
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager
 
-from PySide6.QtCore import QPoint, QPointF, QRect, Qt
-from PySide6.QtGui import QCursor, QGuiApplication, QMouseEvent, QPainter
+from PySide6.QtCore import QPoint, QPointF, QRect, QSize, Qt
+from PySide6.QtGui import (
+    QGuiApplication, QMouseEvent, QPainter, QPixmap, QRegion,
+)
 from PySide6.QtWidgets import QApplication, QTabBar, QWidget
 
 from ui.window_registry import WindowRegistry
@@ -166,23 +178,45 @@ REDOCK_MARGIN = 4
 # window's tab area. This is only the DEPTH: the zone is the full width of the
 # window. See `_tab_zone`.
 #
-# A WHOLE TAB ROW OF SLACK, which makes the zone two rows deep measured from the
-# top of the window. That is the generous half of the asymmetry. What it
-# replaces is the BAR's own rect plus 18 px, and since the bar hugs its tabs
-# that rect is 490 px wide on a 1200 px window with two tabs and 250 px with
-# one. Everything outside it fell through to "append on the end", so aiming at a
-# position meant finding a strip a fifth of the window wide: "i cant drop it in
-# the tab area, i need o bring it as close as posible to the only tab in the
-# window."
-INCOMING_SLACK = 38
-
-# The band a WHOLE WINDOW being carried has to be inside to merge, above and
-# below the target's bar.
+# EVERY PIXEL OF CHROME AND NOT ONE PIXEL OF THE PAGE, and that is where the
+# line is drawn rather than at a round number. Measured down a 1200x800 window
+# at 100%, from the top of the frame:
 #
-# NOT THE INCOMING ZONE ABOVE, AND THAT IS THE POINT. A tab under the cursor is
-# tab-sized and aimed, so it can afford a large target. A window under the
-# cursor covers whatever it is over, and "the windows overlapped" must never be
-# enough to swallow one into the other. See `_hit_test` and `_strip_index`.
+#   0 - 37    the title row, with the tab bar at 5 - 32
+#   38 - 56   the menu bar
+#   57 - 80   the view's own tab strip
+#   81 -      THE DOCUMENT. Canvas, page panel, tools.
+#
+# The bar's bottom edge is at 32, so 48 puts the zone's last row at 80 and the
+# page's first row at 81. Everything a person reads as "the top of the window"
+# is in; the page is out.
+#
+# IT WAS 38, WHICH STOPPED IN THE MIDDLE OF THE MENU BAR: "i need to get real
+# close, i even need to over lap the tab in order for it to catch like amagnet,
+# so make that are anot only the copete width of the idow but also the bottom
+# add mroe pixels". Most of what he was fighting was the WIDTH rather than this
+# number, and that half was worse than it looks: a whole window being carried
+# was hit-tested against the BAR's own rect, and the bar hugs its tabs, so on a
+# 1200 px window holding one tab the target was a 250 px box. Width and depth
+# together take the target from about 14,000 square pixels to about 97,000.
+#
+# WHY NOT DEEPER. Two or three tab rows below the bar, which is the shape of
+# Chrome's, would be 76 to 114 px and would reach 30 or more pixels into the
+# page. That is fine for a tab, which lands anywhere over a window anyway, and
+# wrong for a WINDOW: the cursor is pinned inside the window being carried, so
+# a zone that reaches into the page would merge two windows for the crime of
+# being moved past each other. Chrome can afford the depth because a browser
+# window is all tab strip at the top; this one has 48 px of chrome under the
+# row and then a document.
+INCOMING_SLACK = 48
+
+# The band a window being carried has to be inside to merge into a target that
+# has NO TAB STRIP ON SCREEN, above and below that target's caption row.
+#
+# The only thing left that is measured off chrome rather than off `_tab_zone`.
+# A window holding one empty document hides its whole header, so there is no
+# strip to build a zone from and the caption row stands in for it. See
+# `_strip_index`.
 DOCK_MARGIN = 18
 
 # How solid the ghost is. Enough to read the tab's own title through, little
@@ -190,7 +224,8 @@ DOCK_MARGIN = 18
 #
 # IT CANNOT COVER THE LANDING SPOT ANY MORE, whatever its opacity: the ghost is
 # hidden outright for as long as the cursor is anywhere in the holder's tab zone
-# (`_track`), which is now the full width of the window and two rows deep, and
+# (`_track`), which is now the full width of the window and every row of its
+# chrome, and
 # the parting tabs and the ghost slot only ever happen inside that zone. The
 # opacity is what keeps it honest in mid-air, where it is the only thing on
 # screen that says a tab is being carried.
@@ -288,28 +323,57 @@ def zone_insertion_index(bar: QTabBar, global_pos: QPoint) -> int:
     return insertion_index(bar, QPoint(local.x(), bar.rect().center().y()))
 
 
+# How far outside a tab's own rect the picture of it has to reach.
+#
+# ONE PIXEL, AND IT IS THE DIFFERENCE BETWEEN A TAB AND A CUT-OFF TAB. A tab's
+# border is stroked ON the boundary of its rect, so a 1px pen straddles that
+# boundary and half of it falls OUTSIDE. Measured on the real strip, a selected
+# tab whose rect is x=0..239 paints its left border at x=0 and its right border
+# at x=240: `grab(rect)` keeps the left edge hard against the pixmap with no air
+# beside it and drops the right edge entirely. Floating over a page, that is a
+# tab with a line down one side, no line down the other, and nothing between the
+# line and the edge. Lucas: "the visual of it seems like the left side is
+# cutoff, the tab look cutoff (the ghost tab)".
+GHOST_BLEED = 1
+
+
 def tab_pixmap(bar: QTabBar, rect: QRect):
-    """A picture of one tab, with a device pixel ratio that is actually true.
+    """A picture of one WHOLE tab, with a device pixel ratio that is true.
 
-    THE HOTSPOT DEPENDS ON THIS. The cursor is pinned to the point inside the
-    tab that it took hold of, in logical pixels, and the ghost is positioned by
-    subtracting that offset. All of that is only correct while the ghost is the
-    same logical size as the tab it is a picture of.
+    THE BLEED IS THE POINT. `rect` is the tab's own rect and the tab paints
+    outside it, so the picture is taken of `rect` grown by GHOST_BLEED on every
+    side. Where the bleed falls off the end of the bar there is nothing to
+    render and the pixmap is left transparent there, which is the right answer:
+    that pixel is not part of the tab, it is the strip the tab was sitting on.
 
-    `QWidget.grab` is documented to tag the pixmap with the widget's device
-    pixel ratio, and where it does the arithmetic here is a no-op. Where it
-    does not, a 150% display hands back a pixmap half again as large in raw
-    pixels still tagged 1.0, the ghost is built half again too big, and the
-    grab point lands two thirds of the way along a tab the user took hold of in
-    the middle. That is the classic shape of a drag image that will not stay
-    under the pointer on a scaled screen, so the ratio is MEASURED off the
-    pixmap against the rect that was asked for rather than trusted.
+    THE HOTSPOT DEPENDS ON THIS, and on the caller. The cursor is pinned to the
+    point inside the tab that it took hold of, in logical pixels, and the ghost
+    is positioned by subtracting that offset. The picture now starts one pixel
+    up and to the left of the tab, so `_begin` adds the same bleed back into the
+    offset. Getting one and not the other moves the ghost a pixel off the
+    pointer.
+
+    THE RATIO IS SET RATHER THAN GUESSED AT. `QWidget.grab` is documented to tag
+    its pixmap with the widget's device pixel ratio and does not always manage
+    it; a 150% display handing back a pixmap half again as large still tagged
+    1.0 builds a ghost half again too big and puts the grab point two thirds of
+    the way along a tab the user took hold of in the middle. Rendering into a
+    pixmap this function made itself removes the question: the ratio is the
+    bar's own, stamped on the target before anything is painted into it.
     """
-    pixmap = bar.grab(rect)
-    if rect.width() > 0 and pixmap.width() > 0:
-        ratio = pixmap.width() / rect.width()
-        if abs(ratio - pixmap.devicePixelRatio()) > 1e-3:
-            pixmap.setDevicePixelRatio(ratio)
+    bleed = rect.adjusted(-GHOST_BLEED, -GHOST_BLEED, GHOST_BLEED, GHOST_BLEED)
+    source = bleed.intersected(bar.rect())
+    if source.isEmpty() or bleed.width() <= 0 or bleed.height() <= 0:
+        return bar.grab(rect)                # nothing on screen to picture
+    ratio = max(1.0, float(bar.devicePixelRatioF()))
+    pixmap = QPixmap(QSize(round(bleed.width() * ratio),
+                           round(bleed.height() * ratio)))
+    pixmap.setDevicePixelRatio(ratio)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    bar.render(pixmap, source.topLeft() - bleed.topLeft(), QRegion(source),
+               QWidget.RenderFlag.DrawWindowBackground
+               | QWidget.RenderFlag.DrawChildren
+               | QWidget.RenderFlag.IgnoreMask)
     return pixmap
 
 
@@ -342,6 +406,9 @@ class TabTearOff:
     # ------------------------------------------------------------------
 
     def _reset(self):
+        # First, and on every exit path, because it is the one piece of state
+        # that lives on another object. See `_pin_close_buttons`.
+        self._pin_close_buttons(False)
         self._armed = False           # pressed on a tab, may still become a tear
         self._dragging = False        # past the threshold, we own the mouse
         self._press_local = QPoint()
@@ -519,6 +586,13 @@ class TabTearOff:
         # so it is not left believing a drag is still in flight. The index is
         # re-read afterwards, because that reorder may have moved this tab.
         self._settle_tab_bar(global_pos)
+        # The reorder is over, so the tabs are back at the rects they report
+        # and nothing may move their close buttons again until this gesture
+        # ends. Qt would otherwise: a press, or the tail of a move animation,
+        # repositions them without raising `tabLayoutChange`, and the tab left
+        # behind in this window would change shape halfway through a drag. See
+        # `DocumentTabBar.set_close_buttons_pinned`.
+        self._pin_close_buttons(True)
         index = area.index_of(view)
         if index < 0:
             return False
@@ -558,7 +632,10 @@ class TabTearOff:
             else:
                 # The hotspot is where in the tab the cursor took hold, so the
                 # ghost sits under the pointer exactly where the real tab was.
-                self._offset = QPoint(self._grab_in_tab)
+                # Plus the bleed, because the picture starts one pixel up and
+                # to the left of the tab it is a picture of. See `tab_pixmap`.
+                self._offset = (QPoint(self._grab_in_tab)
+                                + QPoint(GHOST_BLEED, GHOST_BLEED))
                 self._pixmap = tab_pixmap(bar, bar.tabRect(index))
                 self._attached_to = source
                 # It starts life attached to the window it came from, so the
@@ -568,6 +645,19 @@ class TabTearOff:
             self._abort()
             raise
         return True
+
+    def _pin_close_buttons(self, pinned: bool):
+        """Hold the source strip's close buttons still, or let them go again.
+
+        Guarded because `_reset` runs on every exit path including the ones
+        that get there through a window that has already closed, and because
+        the bar is not required to be a `DocumentTabBar` in a test that builds
+        a bare one.
+        """
+        try:
+            self._bar.set_close_buttons_pinned(pinned)
+        except (AttributeError, RuntimeError):   # pragma: no cover - defensive
+            pass
 
     def _settle_tab_bar(self, global_pos: QPoint):
         """Hand QTabBar a release so its own drag state ends cleanly.
@@ -599,11 +689,11 @@ class TabTearOff:
             # emptying and closing the very window under the pointer.
             if self._source_window is not None:
                 self._source_window.move(self.ghost_position(global_pos))
-            # The lone tab has nothing to attach, so the line is the ONLY thing
-            # telling you the window will merge on release rather than just sit
-            # where you dropped it. Its own strip never gets one, and that is
-            # `_hit_test`'s doing rather than a second rule here: a window is
-            # not a target for itself.
+            # The lone tab has nothing to attach, so the empty ghost slot in
+            # the target's strip is the ONLY thing telling you the window will
+            # merge on release rather than just sit where you dropped it. Its
+            # own strip never gets one, and that is `_hit_test`'s doing rather
+            # than a second rule here: a window is not a target for itself.
             self._show_drop_feedback(target)
             return
 
@@ -647,8 +737,9 @@ class TabTearOff:
         AND THE DEPTH DEPENDS ON WHICH WINDOW IS ASKING. That is the whole
         asymmetry:
 
-          another window gets INCOMING_SLACK, a whole tab row of clearance
-          below the bar, because getting a tab INTO a window should be easy;
+          another window gets INCOMING_SLACK, every row of chrome below the
+          bar and none of the page, because getting a tab INTO a window should
+          be easy;
 
           the window the tab is being torn OUT of gets REDOCK_MARGIN, four
           pixels, because the tear gesture is "drag the tab down out of the
@@ -814,8 +905,8 @@ class TabTearOff:
         AND THE ZONE IS NOW WORTH AIMING AT. It used to be the bar's own rect
         plus 18 px, and the bar hugs its tabs, so on a window with one tab open
         that was a 250 px box on a 1200 px window. `_tab_zone` makes it the full
-        width of the window and a whole tab row deep, which is the area a person
-        already reads as the tab area.
+        width of the window and as deep as its chrome goes, which is the area a
+        person already reads as the top of the window.
 
         THE SOURCE WINDOW IS THE EXCEPTION, and it has to be. The tear gesture
         is "drag the tab DOWN out of the bar", and down out of the bar is still
@@ -823,7 +914,7 @@ class TabTearOff:
         and the tab re-docks into it the instant it leaves the bar, which is to
         say the tear-off stops existing. So the window a tab is being torn out
         of keeps a shallow zone, four pixels below the row rather than
-        thirty-eight, and going back up into the row is how you change your
+        forty-eight, and going back up into the row is how you change your
         mind. That is the rule Chrome uses too, for the same reason.
 
         Activation order is what breaks the tie when two windows overlap under
@@ -848,27 +939,38 @@ class TabTearOff:
             if not hasattr(window, "document_area"):
                 continue
             if self._whole_window:
-                # A WHOLE WINDOW IS BEING CARRIED, so the rules above are the
-                # wrong ones and both halves of that matter.
+                # A WHOLE WINDOW IS BEING CARRIED, and two things change.
                 #
                 # The source is not a target at all. It is the thing in flight,
                 # it is on top, and the cursor is pinned to a point inside it
                 # for the whole drag, so leaving it in the walk means it answers
                 # every hit test and nothing underneath is ever reachable.
                 #
-                # And a target's dock zone shrinks to its TAB STRIP. The
-                # body-sized zone below is right for a tab: the thing under the
-                # cursor is tab-sized, aimed, and lands where it is put. It is
-                # wrong for a window, because a window covers whatever it is
-                # over, and two windows overlapping is what moving a window
-                # across a desk looks like. Charging that gesture a merge would
-                # make windows impossible to arrange. Edge draws the same line:
-                # drop on the strip to merge, drop anywhere else to just be
-                # there.
+                # AND THE ANTI-SWALLOW RULE COMES OUT OF THE ZONE NOW, NOT OUT
+                # OF THE GESTURE. It used to come out of the gesture: a window
+                # could only merge over the target's BAR, plus 18 px, while a
+                # tab could merge anywhere over the target. That was two
+                # targets for what is, from the other side of the screen, one
+                # movement, and the window's was the 250 px box that made him
+                # aim. So both gestures now merge on the same zone, and the
+                # protection is that the zone stops above the page: two windows
+                # overlapping is what moving a window across a desk looks like,
+                # and it must never be enough to swallow one into the other.
+                # A window dropped over another window's DOCUMENT is just a
+                # window sitting there. See INCOMING_SLACK for where that line
+                # is and why it is not deeper.
                 if window is self._source_window:
                     continue
                 if not window.frameGeometry().contains(global_pos):
                     continue
+                zone = self._tab_zone(window)
+                if zone is not None:
+                    if not zone.contains(global_pos):
+                        continue
+                    return window, zone_insertion_index(
+                        window.document_area().bar(), global_pos)
+                # No strip on screen, so there is no zone to build and the
+                # caption row stands in for one.
                 index = self._strip_index(window, global_pos)
                 if index is None:
                     continue
@@ -896,23 +998,19 @@ class TabTearOff:
         return None
 
     def _strip_index(self, window, global_pos: QPoint):
-        """Where a WHOLE WINDOW dropped at `global_pos` merges into `window`.
+        """Where a whole window dropped at `global_pos` merges into a window
+        that has NO TAB STRIP ON SCREEN.
 
         The insertion index, or None when this drop is not a merge at all.
-        Only the tab strip accepts one: see `_hit_test` for why the body-sized
-        dock zone is a tab's rule and not a window's.
 
         A window holding one empty document hides its strip, and it is still a
         perfectly good thing to merge into, so its own top row stands in. That
-        is the row you would have aimed at if there had been tabs on it.
+        is the row you would have aimed at if there had been tabs on it. Every
+        window that DOES have a strip is answered by `_tab_zone` instead, which
+        is the same zone a carried tab is answered by; this is the one case
+        that cannot build one.
         """
         try:
-            bar = window.document_area().bar()
-            if bar.isVisible():
-                local = bar.mapFromGlobal(global_pos)
-                band = bar.rect().adjusted(0, -DOCK_MARGIN, 0, DOCK_MARGIN)
-                return (zone_insertion_index(bar, global_pos)
-                        if band.contains(local) else None)
             title_bar = getattr(window, "title_bar", None)
             if title_bar is None:
                 return None
@@ -936,8 +1034,10 @@ class TabTearOff:
     def _show_drop_feedback(self, target):
         """Mark where in the target strip the tab is going.
 
-        A GHOST SLOT FOR A TAB, A LINE FOR A WINDOW, and that split is the
-        whole of this method.
+        A GHOST SLOT, WHICHEVER GESTURE PUT THE TAB IN THE AIR. That used to
+        be a split: a slot for a carried tab, a four-pixel insertion line for a
+        whole window. There is no split any more, and taking it out is the
+        point of this pass. See below.
 
         THE LINE ALONE WAS NOT ENOUGH, and this is the third pass over the same
         feedback. It was a wash over the strip plus a 2px outline, which on a
@@ -956,11 +1056,16 @@ class TabTearOff:
         and the same tab is a full-colour tab, in exactly that position,
         without anything moving.
 
-        THE LINE SURVIVES FOR ONE CASE, AND ONLY ONE: a whole window being
-        carried. A lone tab drags its own window and the merge is deferred to
-        the release (`_track`), so nothing has joined the target strip, so there
-        is no tab to ghost and no gap to open. The line is the only feedback
-        available there and it is still the right one.
+        AND THE WINDOW CASE GETS AN EMPTY SLOT RATHER THAN THE LINE. A lone
+        tab drags its own window and the merge is deferred to the release
+        (`_track`), so nothing has joined the target strip and there is no tab
+        to ghost. That was taken as a reason to fall back to the line, and the
+        line is what Lucas actually saw every time he merged: the ghost "never
+        appears". From his side of the screen dragging a lone tab's window onto
+        another window and dragging a tab out of a two-tab window are the same
+        movement, so they get the same feedback. `set_ghost_slot` holds a slot
+        of a tab's width open with nothing in it, which is the same gap, minus
+        only the picture of the tab that has not arrived yet.
 
         THE INDEX IS READ AFTER THE ATTACH, NOT BEFORE, and that is why this is
         not folded into `_set_target`. By the time this runs the tab is sitting
@@ -984,7 +1089,7 @@ class TabTearOff:
                 # empties behind the tab that just left it.
                 return
             if self._whole_window:
-                bar.set_drop_indicator(bar.insertion_x(target[1]))
+                bar.set_ghost_slot(bar.insertion_x(target[1]))
             else:
                 at = window.document_area().index_of(self._view)
                 if at < 0:
@@ -1005,10 +1110,10 @@ class TabTearOff:
     def _clear_drop_feedback_on(window):
         """Take the paint off one window's strip.
 
-        BOTH KINDS, unconditionally, without asking which one was put up. The
+        EVERY KIND, unconditionally, without asking which one was put up. The
         drag can change shape between the frame that marked a strip and the
         frame that clears it, and a strip left holding a ghost slot is a tab
-        that stays dimmed for the rest of the session.
+        that stays dimmed, or a gap held open, for the rest of the session.
 
         Guarded like everything else that touches a window reference mid-drag:
         the window being cleared may have emptied and closed since the frame
@@ -1021,6 +1126,7 @@ class TabTearOff:
             bar = window.document_area().bar()
             bar.set_drop_indicator(None)
             bar.set_ghost_index(None)
+            bar.set_ghost_slot(None)
         except (AttributeError, RuntimeError):   # pragma: no cover - defensive
             pass
 
