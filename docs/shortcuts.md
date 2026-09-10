@@ -138,16 +138,27 @@ them to one folder instead.
 |---|---|
 | `Ctrl+P` | Print the document in front |
 
-`Ctrl+P` asks two things in turn. First what to print: all pages, the page you
-are on, the pages selected in the left strip, or a range you type (`1-5, 8`,
-`12-` for twelve to the end, `-4` for the start to four; backwards and
-overlapping ranges are read the way you meant them). Then the system printer
-dialog, which owns the printer, the paper, the copies and the collation. The
-choices you made stay put for the next `Ctrl+P` in that window.
+`Ctrl+P` opens the Windows print dialog and nothing else. It owns the printer,
+the paper, the copies, the colour, the page range and print to file. There is
+no second dialog in front of it any more.
 
-`Preview…` in the first dialog shows the job before it goes anywhere. It draws
-at most the first 50 pages, because a preview renders every page it is given up
-front; the print itself is not capped.
+Two things are always on and have no control, because the Windows dialog has no
+field that could carry them:
+
+- **Every page is fitted to the paper.** An A1 drawing shrinks onto A4 whole,
+  with its shape intact and nothing cut off. There is no actual-size choice.
+- **Every sheet takes the orientation of its own page.** A pack of A4 check
+  sheets with A3 drawings in the middle prints each sheet the way round its
+  page wants, whatever the dialog's single Orientation control is set to.
+
+Printing only the pages ticked in the left strip is gone. Use the Windows
+dialog's own page range instead.
+
+The Windows dialog's preview pane says "This app doesn't support print
+preview". That is a Windows 11 limitation for every classic desktop app,
+Notepad included, and not something this app can turn on: the pane is fed by a
+newer printing interface that Qt's print dialog does not use. An in-app preview
+drawn in this app's own chrome is a separate job.
 
 **What comes out is what you can see, including markup you have not saved.**
 Rectangles, lines, highlights and text boxes are on the canvas until a save
