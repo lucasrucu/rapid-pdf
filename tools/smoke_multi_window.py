@@ -320,14 +320,20 @@ def run(app, folder):
     target = bar.tear_off().drop_target()
     check("the first window is the drop target",
           target is not None and target[0] is first and target[1] == 0, target)
-    check("the insertion line is drawn", bar.drop_indicator() is not None)
+    # A TAB is being carried, so the feedback is the ghost slot and not the
+    # line: the strip has parted and the arriving tab is sitting in the gap,
+    # painted as a ghost until the button comes up. The line is what a whole
+    # WINDOW being carried gets, because nothing has joined the strip for it
+    # to ghost. See TabTearOff._show_drop_feedback.
+    check("the ghost slot is held open", bar.ghost_index() is not None)
+    check("no insertion line for a carried tab", bar.drop_indicator() is None)
     _release(bar, over)
     check("the document docked at index 0",
           area.view_at(0) is torn_view, area.index_of(torn_view))
     check("three tabs again", area.count() == 3, area.count())
     check("the emptied window closed itself", registry.count() == 2,
           registry.count())
-    check("the insertion line was cleared", bar.drop_indicator() is None)
+    check("the ghost became a real tab", bar.ghost_index() is None)
     # The one thing offscreen genuinely cannot check: a leaked grabMouse() is a
     # frozen application, and only a real platform plugin has a grab to leak.
     check("the mouse grab was given back",

@@ -32,16 +32,26 @@ THE SHAPE OF ONE GESTURE.
             event so its own reorder and current-tab change still work.
   threshold DETACH_MARGIN px BEYOND the bar VERTICALLY, plus Qt's own
             `startDragDistance`. Sideways travel never counts, which is also
-            what Chromium does. Coming back costs only DOCK_MARGIN, and that
+            what Chromium does. Coming back costs only REDOCK_MARGIN, and that
             asymmetry is the hysteresis that stops the state flapping. ONE TAB
             SKIPS THE VERTICAL PART ENTIRELY: see `_crossed`.
   crossing  grab the mouse and show a picture of the tab. NOTHING MOVES.
-  approach  the tab JOINS the strip it is near, and a line in that strip says
-            where. The attach is the behaviour and the line is how you can tell
-            it happened. See `_show_drop_feedback`.
+  approach  the tab JOINS the strip it is near, the tabs either side part
+            around it, and it is painted as a GHOST until the button comes up.
+            See `_show_drop_feedback`.
+  departure the tab goes back where it came from and the gap closes.
+            See `_return_to_source`.
   release   `releaseMouse()` FIRST, always. Then, and only then: adopt into the
             window under the cursor, or create a new one.
   escape    nothing to undo, because nothing left.
+
+TWO ZONES, DIFFERENT SIZES, ON PURPOSE. Getting a tab INTO a window and getting
+one OUT of a window are not the same job and do not get the same target. The
+incoming zone is the full width of the window and a whole tab row deep below the
+strip, because a document should land wherever it is aimed; the outgoing one is
+four pixels, because a tear that takes forty pixels of travel to register reads
+as the app not responding. The numbers, and the chrome they are measured off,
+are at the top of the constants below.
 
 HIT-TESTING ASKS THE OS FIRST. `QApplication.topLevelAt` gives true z-order,
 and the ghost is invisible to it because of `WindowTransparentForInput`. The
@@ -104,33 +114,86 @@ def _usable(window) -> bool:
     return (window is not None and _cpp_alive(window)
             and hasattr(window, "document_area"))
 
-# How far past the top or bottom edge of the bar the cursor has to go before a
-# reorder becomes a tear. Sideways travel never counts, however far it goes.
+# ----------------------------------------------------------------------
+# THE ZONES, AND WHY THEY ARE NOT THE SAME SIZE
 #
-# TWO NUMBERS, NOT ONE, AND THAT IS THE HYSTERESIS. Leaving costs 40 px and
-# coming back costs 18 (DOCK_MARGIN below), so the gesture does not flutter
-# between torn and docked while the cursor sits on the boundary. Chromium does
-# the same thing with the same asymmetry; its own vertical figure is SLACK THAT
-# KEEPS YOU ATTACHED rather than a distance that detaches you, and it has no
-# horizontal detach at all, which is why sideways travel is ignored here too.
-DETACH_MARGIN = 40
+# Every number below is measured off the real chrome rather than picked. A
+# 1200x800 window holding two tabs, at 100%:
+#
+#   the title row that holds the tabs   38 px tall (title_bar.TITLE_BAR_HEIGHT)
+#   the tab bar inside it               28 px tall, inset 5 px from the top
+#   a tab's rect                        bottom edge at y=32 within the row
+#   the separator under the row         y=37, which is 4 px clear of the tab
+#                                       (TitleBar.tab_separator_gap measures it)
+#   the bar's own width                 490 px, because it hugs its tabs
+#
+# GETTING A TAB IN IS EASY, GETTING ONE OUT IS QUICK, and those are two
+# different jobs so they get two different sizes. That asymmetry is a deliberate
+# choice over copying a browser exactly, and it is the thing Lucas described:
+# the tab area is "the full width of the window plus a generous buffer below the
+# tab row" for a tab arriving, while pulling one out should not "take too long
+# to become a ghost".
+# ----------------------------------------------------------------------
 
-# How far above and below a target bar still counts as "on" it. A tab bar is
-# about 30 px tall and the cursor is holding a whole window, so the band people
-# actually aim at is taller than the widget.
+# OUTGOING. How far past the top or bottom edge of the bar the cursor has to go
+# before a reorder becomes a tear. Sideways travel never counts, however far it
+# goes.
 #
-# THIS IS NO LONGER THE DOCK ZONE. It is only the band inside which the drop
-# gets a PRECISE index, the one the insertion line points at. The dock zone is
-# the whole target window: see `_hit_test`. The band and the zone used to be the
-# same thing and the result was a 46-pixel strip, on a window the floating one
-# was sitting on top of, that you had to find before a drop would land. Everyone
-# who missed it got a second window on the desktop instead of a docked tab, and
-# nothing on screen had said why.
+# IT WAS 40 AND THAT IS WHY THE TEAR FELT SLOW. Forty pixels below the bar's
+# bottom edge lands at y=72 in the row's coordinates, which is 35 px below the
+# line that marks where the caption stops and the app starts: you had to drag a
+# tab a third of the way down the toolbar before anything happened. Twelve puts
+# it at y=44, seven pixels clear of that line, so the tear registers as soon as
+# the cursor has visibly left the tab row. It is still three times Qt's own
+# `startDragDistance` on a default Windows setup, so a shaky hand part way
+# through a reorder does not reach it.
+DETACH_MARGIN = 12
+
+# OUTGOING, COMING BACK. Changing your mind costs less than committing, and the
+# gap between the two is the hysteresis that stops the state flapping while the
+# cursor sits on the boundary.
+#
+# IT HAS TO BE SMALLER THAN DETACH_MARGIN, and that is a hard constraint rather
+# than a preference: if coming back cost more than leaving, the cursor would
+# cross the tear threshold while still inside the band that re-docks it and
+# nothing would appear to happen until it had left both. The old pair got this
+# right by accident at 40/18 and would have been broken by dropping 40 alone.
+# Four is the whole of the row that is not tab, so coming back into the row
+# re-docks and leaving the row does not.
+REDOCK_MARGIN = 4
+
+# INCOMING. How far BELOW the tab row of another window still counts as that
+# window's tab area. This is only the DEPTH: the zone is the full width of the
+# window. See `_tab_zone`.
+#
+# A WHOLE TAB ROW OF SLACK, which makes the zone two rows deep measured from the
+# top of the window. That is the generous half of the asymmetry. What it
+# replaces is the BAR's own rect plus 18 px, and since the bar hugs its tabs
+# that rect is 490 px wide on a 1200 px window with two tabs and 250 px with
+# one. Everything outside it fell through to "append on the end", so aiming at a
+# position meant finding a strip a fifth of the window wide: "i cant drop it in
+# the tab area, i need o bring it as close as posible to the only tab in the
+# window."
+INCOMING_SLACK = 38
+
+# The band a WHOLE WINDOW being carried has to be inside to merge, above and
+# below the target's bar.
+#
+# NOT THE INCOMING ZONE ABOVE, AND THAT IS THE POINT. A tab under the cursor is
+# tab-sized and aimed, so it can afford a large target. A window under the
+# cursor covers whatever it is over, and "the windows overlapped" must never be
+# enough to swallow one into the other. See `_hit_test` and `_strip_index`.
 DOCK_MARGIN = 18
 
 # How solid the ghost is. Enough to read the tab's own title through, little
-# enough that the strip and the insertion line underneath stay legible, which
-# is the job the old downward offset was doing badly.
+# enough that the strip underneath stays legible.
+#
+# IT CANNOT COVER THE LANDING SPOT ANY MORE, whatever its opacity: the ghost is
+# hidden outright for as long as the cursor is anywhere in the holder's tab zone
+# (`_track`), which is now the full width of the window and two rows deep, and
+# the parting tabs and the ghost slot only ever happen inside that zone. The
+# opacity is what keeps it honest in mid-air, where it is the only thing on
+# screen that says a tab is being carried.
 GHOST_OPACITY = 0.78
 
 
@@ -206,6 +269,23 @@ def insertion_index(bar: QTabBar, local: QPoint) -> int:
         return bar.count()
     rect = bar.tabRect(index)
     return index + 1 if local.x() > rect.center().x() else index
+
+
+def zone_insertion_index(bar: QTabBar, global_pos: QPoint) -> int:
+    """Where a tab dropped anywhere in a window's tab zone should be inserted.
+
+    THE X ALONE DECIDES, and that is what makes a zone taller than the bar
+    usable. `QTabBar.tabAt` answers -1 for any point outside a tab's rect, so
+    the same cursor that names index 1 while it is on the strip names "append"
+    the moment it drops a few pixels below it. Every point in the zone that is
+    not literally on a tab would have appended, which on a 1200 px window whose
+    bar is 490 px wide is most of the zone.
+
+    So the point is projected onto the bar's own vertical centre before it is
+    asked, and the horizontal answer is the one that was wanted all along.
+    """
+    local = bar.mapFromGlobal(global_pos)
+    return insertion_index(bar, QPoint(local.x(), bar.rect().center().y()))
 
 
 def tab_pixmap(bar: QTabBar, rect: QRect):
@@ -529,34 +609,82 @@ class TabTearOff:
 
         if target is not None:
             self._attach_to_strip(*target)
+        else:
+            # OFF EVERY TAB AREA, SO THE GAP CLOSES. Leaving a strip has to
+            # undo what approaching it did, or a tab that brushed past a window
+            # on the way to the desktop stays parked in that window's bar with
+            # a ghost slot held open in it. See `_return_to_source`.
+            self._return_to_source()
 
-        # After the attach, never before: the line marks where the tab now is.
+        # After the attach, never before: the feedback marks where the tab now
+        # is, not where it was about to be.
         self._show_drop_feedback(target)
 
-        # The ghost is shown only while the cursor is off the strip that holds
-        # the tab. On the strip, the tab itself is the feedback and a second
-        # picture of it would be one too many.
+        # The ghost is shown only while the cursor is outside the tab zone of
+        # the window that holds the tab. Inside it, the parted strip and the
+        # ghost slot in it are the feedback, and a second picture of the same
+        # tab hanging over them is the thing that "almost even blocks the view
+        # of the highlithed bar and where it will fall".
         holder = self._attached_to
-        if holder is not None and self._over_strip(holder, global_pos):
+        if holder is not None and self._in_tab_zone(holder, global_pos):
             self._hide_ghost()
         else:
             self._show_ghost(global_pos)
             if self._ghost is not None:
                 self._ghost.move(self.ghost_position(global_pos))
 
-    def _over_strip(self, window, global_pos: QPoint) -> bool:
-        """Whether the cursor is on `window`'s strip, give or take DOCK_MARGIN.
+    def _tab_zone(self, window):
+        """The rectangle that counts as `window`'s TAB AREA, in global pixels.
 
-        Asymmetric on purpose, and this is the hysteresis: arriving costs
-        DOCK_MARGIN and leaving costs DETACH_MARGIN, so the tab does not
-        flicker between two strips while the cursor sits on a boundary.
+        None when the window has no strip on screen.
+
+        THE FULL WIDTH OF THE WINDOW, ALWAYS. The bar hugs its tabs, so its own
+        rect is a fifth of the window with one tab open, and using that rect as
+        the target is what made a tab have to be brought "as close as posible to
+        the only tab in the window" before it would land anywhere on purpose.
+        The tab area a person sees is the row, and the row is the window.
+
+        AND THE DEPTH DEPENDS ON WHICH WINDOW IS ASKING. That is the whole
+        asymmetry:
+
+          another window gets INCOMING_SLACK, a whole tab row of clearance
+          below the bar, because getting a tab INTO a window should be easy;
+
+          the window the tab is being torn OUT of gets REDOCK_MARGIN, four
+          pixels, because the tear gesture is "drag the tab down out of the
+          row" and every pixel of slack here is a pixel of tear that does not
+          register. A body-sized zone on the source would mean the tab
+          re-docking the instant it left the bar, which is to say no tear-off
+          at all; a generous one would mean a slow one.
+
+        It starts at the top of the window rather than at the top of the bar, so
+        the caption above the tabs belongs to the strip the way it does in
+        Chrome and Edge.
         """
         try:
             bar = window.document_area().bar()
-            local = bar.mapFromGlobal(global_pos)
+            if not bar.isVisible():
+                return None
+            frame = window.frameGeometry()
+            top = min(frame.top(), bar.mapToGlobal(QPoint(0, 0)).y())
+            bottom = bar.mapToGlobal(QPoint(0, bar.rect().bottom())).y()
+            slack = (REDOCK_MARGIN if window is self._source_window
+                     else INCOMING_SLACK)
+            return QRect(frame.left(), top, frame.width(),
+                         bottom + slack - top + 1)
         except (AttributeError, RuntimeError):   # pragma: no cover - defensive
-            return False
-        return bar.rect().adjusted(0, -DOCK_MARGIN, 0, DOCK_MARGIN).contains(local)
+            return None
+
+    def _in_tab_zone(self, window, global_pos: QPoint) -> bool:
+        """Whether the cursor is inside `window`'s tab area.
+
+        The same question `_hit_test` asks, asked again for a different reason:
+        this is what hides the ghost. Sharing `_tab_zone` is what keeps the two
+        from ever disagreeing, which they would have to do for the ghost to end
+        up floating over the gap it is supposed to be showing you.
+        """
+        zone = self._tab_zone(window)
+        return zone is not None and zone.contains(global_pos)
 
     def _attach_to_strip(self, window, index: int):
         """Put the tab INTO that strip, now, rather than promising to.
@@ -620,6 +748,42 @@ class TabTearOff:
         except (AttributeError, RuntimeError):   # pragma: no cover - defensive
             return
 
+    def _return_to_source(self):
+        """The cursor is over no tab area at all, so the tab goes home.
+
+        THE OTHER HALF OF THE LIVE ATTACH, and it was missing. `_attach_to_strip`
+        puts the tab into whichever strip the cursor is over and the strip parts
+        around it; nothing put it back. Drag a tab across a second window on the
+        way to the desktop and it stayed in that second window's bar, holding a
+        ghost slot open, for as long as the button was down. The gap that opens
+        on approach has to close on departure or it is not feedback, it is a
+        move that happened by accident.
+
+        The source can never close under this: a window with one tab drags
+        itself (`_whole_window`), so a source that lost a tab still has at
+        least one and is still on screen. Guarded like every other window call
+        here anyway, and the grabs are dropped for the move for the reason
+        given in `_attach_to_strip`.
+
+        Deliberately no `activate_view`: that raises the window it is called on,
+        and yanking the source in front of everything else because the cursor
+        crossed empty desktop is a z-order change nobody asked for.
+        """
+        holder = self._attached_to
+        source = self._source_window
+        if holder is None or holder is source or self._view is None:
+            return
+        if not _usable(holder) or not _usable(source):
+            return
+        try:
+            with self._input_released():
+                moved = holder.move_view_to_window(
+                    self._view, source, self._source_index)
+            if moved:
+                self._attached_to = source
+        except (AttributeError, RuntimeError):   # pragma: no cover - defensive
+            return
+
     def ghost_position(self, global_pos: QPoint) -> QPoint:
         """Where the ghost sits for a cursor at `global_pos`.
 
@@ -640,19 +804,26 @@ class TabTearOff:
 
         THE WHOLE WINDOW IS THE ZONE, FOR EVERY WINDOW BUT THE ONE IT CAME FROM.
         Anywhere over another window docks into it. Only WHERE in its bar the
-        tab lands still depends on aiming: inside the bar band you get the index
+        tab lands still depends on aiming: inside the TAB ZONE you get the index
         under the cursor, and anywhere else in the window the tab goes on the
         end. That split is the point. Precision should be available to the
         people who want it and should never be the price of admission, and the
         old arrangement charged it: miss a 46-pixel strip and the document
         became a second window instead.
 
+        AND THE ZONE IS NOW WORTH AIMING AT. It used to be the bar's own rect
+        plus 18 px, and the bar hugs its tabs, so on a window with one tab open
+        that was a 250 px box on a 1200 px window. `_tab_zone` makes it the full
+        width of the window and a whole tab row deep, which is the area a person
+        already reads as the tab area.
+
         THE SOURCE WINDOW IS THE EXCEPTION, and it has to be. The tear gesture
         is "drag the tab DOWN out of the bar", and down out of the bar is still
         inside the window it came from: give that window a body-sized dock zone
         and the tab re-docks into it the instant it leaves the bar, which is to
         say the tear-off stops existing. So the window a tab is being torn out
-        of keeps the narrow band, and going back up to it is how you change your
+        of keeps a shallow zone, four pixels below the row rather than
+        thirty-eight, and going back up into the row is how you change your
         mind. That is the rule Chrome uses too, for the same reason.
 
         Activation order is what breaks the tie when two windows overlap under
@@ -707,14 +878,15 @@ class TabTearOff:
             area = window.document_area()
             bar = area.bar()
             if bar.isVisible():
-                local = bar.mapFromGlobal(global_pos)
-                band = bar.rect().adjusted(0, -DOCK_MARGIN, 0, DOCK_MARGIN)
-                if band.contains(local):
-                    return window, insertion_index(bar, local)
+                zone = self._tab_zone(window)
+                if zone is not None and zone.contains(global_pos):
+                    return window, zone_insertion_index(bar, global_pos)
                 if window is self._source_window:
                     continue
-                # Over the window but not over its bar: append. The document
-                # still lands, which is the whole change.
+                # Over the window but below its tab zone: append. The document
+                # still lands, which is the older half of this rule and the one
+                # that must not be lost. Only the PRECISION is what the zone
+                # buys; landing at all was never supposed to need aim.
                 return window, bar.count()
             if window is self._source_window:
                 continue
@@ -739,8 +911,8 @@ class TabTearOff:
             if bar.isVisible():
                 local = bar.mapFromGlobal(global_pos)
                 band = bar.rect().adjusted(0, -DOCK_MARGIN, 0, DOCK_MARGIN)
-                return (insertion_index(bar, local) if band.contains(local)
-                        else None)
+                return (zone_insertion_index(bar, global_pos)
+                        if band.contains(local) else None)
             title_bar = getattr(window, "title_bar", None)
             if title_bar is None:
                 return None
@@ -762,35 +934,38 @@ class TabTearOff:
         self._target = target
 
     def _show_drop_feedback(self, target):
-        """Mark where in the target strip the tab is going. A LINE, AND NOTHING
-        ELSE.
+        """Mark where in the target strip the tab is going.
 
-        THE BOX IS GONE, and that is the change here. This used to wash the
-        whole target strip in the accent and draw a 2px accent outline round it
-        as well, so that "which window is this going into" could be read
-        without hunting for a hairline. On a strip that is barely wider than
-        its tabs, which is what the bar became when it started hugging them,
-        that reads as a heavy amber box drawn around the tab itself. Lucas,
-        with a screenshot of it: "please remove th ehighlighting of the tabs
-        when it going back into another window... if we follow an already
-        pretty advnced UI like edge, no hgihglight exists so lets replciate
-        that."
+        A GHOST SLOT FOR A TAB, A LINE FOR A WINDOW, and that split is the
+        whole of this method.
 
-        THE LINE STAYS, AND EDGE IS WHY. Edge has no highlight because it does
-        not need one: the tab is already IN the strip, the strip has already
-        reflowed around it, and a slim insertion mark is the only thing it draws
-        on top. This does the same live attach (see `_attach_to_strip`), so the
-        same slim mark is the whole of the feedback here too. Taking the line
-        out as well would leave a tab quietly appearing among five others while
-        the eye is on the cursor, which is how this feedback got reported as
-        missing by the person who had asked for it and already had it.
+        THE LINE ALONE WAS NOT ENOUGH, and this is the third pass over the same
+        feedback. It was a wash over the strip plus a 2px outline, which on a
+        bar that hugs its tabs read as a heavy amber box drawn around the tab
+        itself. That was cut back to a 4px insertion line, and the line turned
+        out to be a hairline you had to hunt for, half hidden by the ghost the
+        cursor was carrying: "it almost even blocks the view of the highlithed
+        bar and where it will fall."
+
+        So the feedback is no longer a mark ON the strip, it is the SHAPE of
+        the strip. The tab has already joined it (`_attach_to_strip`), the tabs
+        either side have already parted around it, and all this does is tell
+        the bar to paint that one tab as a ghost. A gap the width of a tab,
+        with a dimmed picture of the arriving tab sitting in it, is a thing you
+        see with the corner of your eye. On the drop the ghost index is cleared
+        and the same tab is a full-colour tab, in exactly that position,
+        without anything moving.
+
+        THE LINE SURVIVES FOR ONE CASE, AND ONLY ONE: a whole window being
+        carried. A lone tab drags its own window and the merge is deferred to
+        the release (`_track`), so nothing has joined the target strip, so there
+        is no tab to ghost and no gap to open. The line is the only feedback
+        available there and it is still the right one.
 
         THE INDEX IS READ AFTER THE ATTACH, NOT BEFORE, and that is why this is
-        not folded into `_set_target`. By the time this runs the tab is already
-        sitting in the target strip, so `insertion_x` returns the left edge of
-        the tab being carried and the line marks where it actually is. Reading
-        it before the attach would put the line one position stale on every
-        frame, which is worse than no line at all.
+        not folded into `_set_target`. By the time this runs the tab is sitting
+        at its landing position, so its own index is the answer. Reading the
+        hit test's index instead would be one position stale on every frame.
         """
         window = target[0] if target is not None else None
         if self._lit is not None and self._lit is not window:
@@ -802,20 +977,21 @@ class TabTearOff:
             bar = window.document_area().bar()
             if not bar.isVisible():
                 # A window holding one empty document hides its header, so
-                # there is no strip on screen to light. Lighting it anyway is
+                # there is no strip on screen to mark. Marking it anyway is
                 # what used to leave an accent box in the caption. `_hit_test`
                 # asks the same question before choosing an index; this asks it
                 # again because the answer can change mid-drag, when a window
                 # empties behind the tab that just left it.
                 return
-            index = target[1]
-            if not self._whole_window:
-                # The tab has already joined this strip, so the index the hit
-                # test produced counts it. Where it sits now IS the answer.
+            if self._whole_window:
+                bar.set_drop_indicator(bar.insertion_x(target[1]))
+            else:
                 at = window.document_area().index_of(self._view)
-                if at >= 0:
-                    index = at
-            bar.set_drop_indicator(bar.insertion_x(index))
+                if at < 0:
+                    # The attach did not take. Better to show nothing than to
+                    # ghost a tab that is not the one being carried.
+                    return
+                bar.set_ghost_index(at)
             self._lit = window
         except (AttributeError, RuntimeError):   # pragma: no cover - defensive
             self._lit = None
@@ -829,6 +1005,11 @@ class TabTearOff:
     def _clear_drop_feedback_on(window):
         """Take the paint off one window's strip.
 
+        BOTH KINDS, unconditionally, without asking which one was put up. The
+        drag can change shape between the frame that marked a strip and the
+        frame that clears it, and a strip left holding a ghost slot is a tab
+        that stays dimmed for the rest of the session.
+
         Guarded like everything else that touches a window reference mid-drag:
         the window being cleared may have emptied and closed since the frame
         that lit it, and calling through a dead wrapper from inside a Qt
@@ -837,7 +1018,9 @@ class TabTearOff:
         if not _usable(window):
             return
         try:
-            window.document_area().bar().set_drop_indicator(None)
+            bar = window.document_area().bar()
+            bar.set_drop_indicator(None)
+            bar.set_ghost_index(None)
         except (AttributeError, RuntimeError):   # pragma: no cover - defensive
             pass
 

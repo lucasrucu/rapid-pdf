@@ -158,14 +158,20 @@ def main():
     state = {"mode": ThemeMode.LIGHT, "ok": {}, "phase": 0}
 
     def feedback_of(window):
-        """Where the insertion line is on that window's strip, or None.
+        """(ghost slot index, insertion line x) on that window's strip.
 
-        It used to return a wash flag alongside this. The wash and the outline
-        it came with are gone: they read as a highlight box around the tab on a
-        strip that hugs its tabs, and Edge draws neither. The line is now the
-        whole of the feedback, so it is the whole of what this asks about.
+        TWO ANSWERS BECAUSE THERE ARE TWO KINDS OF FEEDBACK, and which one is
+        up says what is being carried. A TAB gets the ghost slot: the strip has
+        parted and the arriving tab is sitting in the gap, painted as a ghost
+        until the button comes up. A whole WINDOW being carried gets the line,
+        because nothing has joined the target strip for it to ghost.
+
+        The wash and the outline that used to come back alongside are both
+        gone; they read as a highlight box around the tab on a strip that hugs
+        its tabs.
         """
-        return window.document_area().bar().drop_indicator()
+        bar = window.document_area().bar()
+        return bar.ghost_index(), bar.drop_indicator()
 
     def run_pass(mode, done):
         """One full drag in one theme, photographed at the moment of truth."""
@@ -231,14 +237,18 @@ def main():
                     for dx in range(5):
                         move_to(spot.x() - (4 - dx) * 8, spot.y())
                 elif kind == "probe":
-                    line = feedback_of(win_b)
+                    ghost, line = feedback_of(win_b)
                     tear = win_a.document_area().bar()._tear_off
                     say(f"    [{arg}] dragging={tear.is_dragging()} "
                         f"A={win_a.document_area().count()} "
                         f"B={win_b.document_area().count()} "
-                        f"B.drop_indicator={line} "
+                        f"B.ghost_index={ghost} B.drop_indicator={line} "
+                        f"carrying_ghost={tear.ghost() is not None} "
                         f"cursor={QCursor.pos()}")
-                    state["ok"][arg] = line is not None
+                    # A TAB is being carried here, so the ghost slot is the
+                    # feedback that has to be up. The line belongs to the
+                    # whole-window merge and would be wrong on this path.
+                    state["ok"][arg] = ghost is not None
             except RuntimeError as exc:
                 say(f"!!! RuntimeError at step {kind}: {exc}")
                 timer.stop()
