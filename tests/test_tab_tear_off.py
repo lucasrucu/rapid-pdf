@@ -1660,6 +1660,12 @@ def test_a_lone_tabs_window_gets_a_ghost_slot_and_never_a_line(
         "and it is a gap, not a hairline"
     assert slot.left() >= other_bar.tabRect(0).right(), \
         "past the only tab, which is where this drop lands"
+    # And it says WHICH document is landing, which is the only thing that
+    # separates two windows that both read Untitled. The name is captured off
+    # the source strip when the tear begins, so this is the gesture's own
+    # plumbing and not the setter's.
+    assert other_bar.ghost_slot_title() == bar.tabText(0) != ""
+    assert other_bar.ghost_slot_text() == bar.tabText(0)
 
     _escape(bar)
     assert other_bar.ghost_slot_rect().isEmpty(), "and it closes again"

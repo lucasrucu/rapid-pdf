@@ -495,6 +495,7 @@ class TabTearOff:
         self._press_index = -1
         self._grab_in_tab = QPoint()  # where in the tab the cursor took hold
         self._view = None
+        self._carried_title = ""      # its tab's label, for the ghost slot
         self._ghost = None            # the picture following the cursor
         self._pixmap = None           # what the ghost draws, grabbed once
         self._ghost_size = None       # its LOGICAL size; see `ghost_rect`
@@ -525,6 +526,11 @@ class TabTearOff:
     def drop_target(self):
         """(window, index) under the cursor, or None. For the tests."""
         return self._target
+
+    def carried_title(self) -> str:
+        """The label of the tab in the air. What an empty ghost slot shows,
+        and empty when nothing is being carried."""
+        return self._carried_title
 
     # ------------------------------------------------------------------
     # The three mouse events, forwarded by DocumentTabBar
@@ -678,6 +684,15 @@ class TabTearOff:
             return False
 
         self._view = view
+        # THE NAME TRAVELS WITH THE TAB, taken once, here, off the strip it is
+        # leaving. A window carrying its only tab never joins the target strip
+        # (see `_track`), so the slot held open for it has no tab to read a
+        # label from and would otherwise be a nameless gap. Read from the bar
+        # rather than rebuilt from the path because the bar's label is the
+        # disambiguated one (`tab_titles`), which is the name Lucas is looking
+        # at while he drags. A lone tab's label cannot change under it: it is
+        # the only tab in that window and nothing else is there to clash with.
+        self._carried_title = self._bar.tabText(index)
         self._source_window = source
         self._source_index = index
         self._source_pos = source.pos()
@@ -1146,8 +1161,16 @@ class TabTearOff:
         appears". From his side of the screen dragging a lone tab's window onto
         another window and dragging a tab out of a two-tab window are the same
         movement, so they get the same feedback. `set_ghost_slot` holds a slot
-        of a tab's width open with nothing in it, which is the same gap, minus
-        only the picture of the tab that has not arrived yet.
+        of a tab's width open and writes the carried document's name into it,
+        which is the same gap minus only the tab's own chrome.
+
+        THE NAME IS PASSED IN, NOT LOOKED UP. It was captured off the source
+        strip when the gesture began (`_begin`), so this does not have to
+        reach back through a window that may have moved, emptied or closed
+        since. Lucas asked for it after a nameless gap opened between two
+        windows that both said Untitled: "the name of the tab that is going in
+        is not bein displayed, this isnt bad, but it could be better, name
+        shoudl display".
 
         THE INDEX IS READ AFTER THE ATTACH, NOT BEFORE, and that is why this is
         not folded into `_set_target`. By the time this runs the tab is sitting
@@ -1171,7 +1194,7 @@ class TabTearOff:
                 # empties behind the tab that just left it.
                 return
             if self._whole_window:
-                bar.set_ghost_slot(bar.insertion_x(target[1]))
+                bar.set_ghost_slot(target[1], self._carried_title)
             else:
                 at = window.document_area().index_of(self._view)
                 if at < 0:

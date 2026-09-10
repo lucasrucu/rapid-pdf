@@ -30,11 +30,14 @@ where the close-button bug actually lived: Qt's own placement, not the painting.
 import fitz
 import pytest
 
+from PySide6.QtCore import QRect, Qt
+from PySide6.QtGui import QFontMetrics, QImage
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from core.settings import Settings, set_settings
 from ui.document_area import (
     CLOSE_BUTTON_RIGHT_INSET, CLOSE_BUTTON_SIZE, DROP_FEEDBACK_MIN_WIDTH,
+    TAB_BORDER_WIDTH, TAB_MAX_WIDTH, TAB_PADDING_LEFT, TAB_PADDING_RIGHT,
     TAB_SHAPE_MARGIN_X, TAB_SHAPE_MARGIN_Y,
 )
 from ui.main_window import MainWindow
@@ -258,6 +261,11 @@ def _pretend_dragging(tear, window, view):
     tear._view = view
     tear._source_window = window
     tear._attached_to = window
+    # `_begin` reads this off the strip the tab is leaving, and an empty ghost
+    # slot has nothing else to put a name in. Taken the same way here so these
+    # tests exercise a slot with a name in it, which is what ships.
+    area = window.document_area()
+    tear._carried_title = area.bar().tabText(area.index_of(view))
     tear._whole_window = False
 
 
@@ -439,8 +447,9 @@ def test_a_whole_window_being_carried_gets_an_empty_ghost_slot(two_windows):
     so nothing has joined the target strip and there is no tab to ghost. That
     was taken as a reason to fall back to a four-pixel insertion line, and the
     line is what Lucas saw every single time he merged two windows: the ghost
-    "never appears". The slot is now held open empty instead, which is the same
-    gap in the same place, minus only the picture of the tab.
+    "never appears". A slot is held open instead, which is the same gap in the
+    same place, with the arriving document's name in it and minus only the
+    tab's own chrome.
     """
     a, b = two_windows
     bar = b.document_area().bar()
@@ -540,3 +549,286 @@ def test_a_narrow_strip_is_never_marked(two_windows):
     bar = b.document_area().bar()
     bar.resize(DROP_FEEDBACK_MIN_WIDTH - 1, bar.height())
     assert bar._can_paint_drop_feedback() is False
+
+
+# ---------------------------------------------------------------------------
+# The gap the slot opens, and the name in it
+#
+# TWO DEFECTS FROM ONE SCREENSHOT, AND THEY SHARED A CAUSE. Lucas merged two
+# windows and photographed the receiving strip: the tab that was already there
+# had lost its name entirely, and the gap held open for the arriving document
+# had no name in it either. "if i place the tab in a place where another tab
+# was previosuly (i only tested with 2 tabs, not sure what happens with more)
+# the name dispears, and right now the name of the tab that is going in is not
+# bein displayed, this isnt bad, but it could be better, name shoudl display".
+#
+# The slot was positioned by an x and drawn opaque, and nothing moved out from
+# under it. `sizeHint` reserved its width, so the bar DID get wider, but every
+# reserved pixel arrived at the end of the strip while the slot was drawn
+# wherever the cursor was: at the last position it looked right, anywhere else
+# it was a lid over a real tab. An x cannot say which tabs have to move, which
+# is why the change that opens the gap (an insertion INDEX) is the same change
+# that gave the slot something to hang a name on.
+#
+# These assert PAINTED OUTPUT, on a bar carrying the app's stylesheet, because
+# state on an unstyled bar is what the last two ghost defects got past.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def wide(qt_app, store, tmp_path):
+    """A factory for a window with `n` tabs, deliberately far too wide.
+
+    TAB WIDTHS ARE THE BUDGET SHARED OUT, and a held-open ghost slot takes a
+    share of its own (see `DocumentTabBar._tab_share`), so on a normal window
+    every tab narrows a little the moment the slot opens. That is right in the
+    product and useless to a test that wants to ask "did this tab move", which
+    can only be asked of a tab that is otherwise unchanged. At 1800 the share
+    is over TAB_MAX_WIDTH with the slot open and with it shut, so every tab is
+    at the ceiling either way and position is the only thing left to differ.
+    """
+    QApplication.instance().setStyleSheet(build_qss(LIGHT))
+    made = []
+
+    def make(n):
+        window = MainWindow()
+        window.resize(1800, 800)
+        window.show()
+        window.open_paths([_pdf(tmp_path, f"doc{len(made)}{i}.pdf")
+                           for i in range(n)])
+        qt_app.processEvents()
+        made.append(window)
+        assert window.document_area().count() == n
+        return window
+
+    yield make
+    for window in made:
+        _dispose(window)
+    QApplication.instance().setStyleSheet("")
+
+
+def _render(bar):
+    """The bar and its children painted onto a known white ground.
+
+    `grab()` would do for a straight comparison, but a known ground is what
+    lets a test say "there is ink here" rather than only "these two differ",
+    and the ghost slot's own fill is opaque, so on an unknown ground "nothing
+    was drawn" and "the slot was drawn" would look alike.
+    """
+    image = QImage(bar.size(), QImage.Format.Format_ARGB32)
+    image.fill(Qt.GlobalColor.white)
+    bar.render(image)
+    return image
+
+
+def _label_band(bar, rect):
+    """The part of a tab where its NAME goes: past the left padding, short of
+    the close button, and inside the top and bottom borders."""
+    left = TAB_SHAPE_MARGIN_X + TAB_BORDER_WIDTH + TAB_PADDING_LEFT
+    right = (TAB_SHAPE_MARGIN_X + TAB_BORDER_WIDTH + TAB_PADDING_RIGHT
+             + CLOSE_BUTTON_SIZE + CLOSE_BUTTON_RIGHT_INSET)
+    inset = TAB_SHAPE_MARGIN_Y + 2
+    return rect.adjusted(left, inset, -right, -inset)
+
+
+def _textured_columns(image, rect):
+    """Columns inside `rect` that are not one flat colour top to bottom.
+
+    Which is what a name is, and what a blank tab, an empty strip and a flat
+    veil are not. It is the cheapest question that separates "the title is
+    drawn" from "something is drawn", and a title that stopped being drawn is
+    exactly the defect being pinned.
+    """
+    return [x for x in range(rect.left(), rect.right() + 1)
+            if any(image.pixel(x, y) != image.pixel(x, rect.top())
+                   for y in range(rect.top() + 1, rect.bottom() + 1))]
+
+
+def _slot_positions(count):
+    """First, middle and last, by insertion index. `count` is past the last
+    tab, which is where two one-tab windows meet most often and the only
+    position the old code drew correctly."""
+    return [("first", 0), ("middle", max(1, count // 2)), ("last", count)]
+
+
+@pytest.mark.parametrize("count", [2, 3, 4])
+def test_the_slot_never_lands_on_top_of_a_real_tab(wide, count, qt_app):
+    """THE DEFECT, AS GEOMETRY. Lucas only tried two tabs and said so; three
+    and four are here because the fault was the slot's position against the
+    tabs, and more tabs is more positions for it to be wrong in."""
+    window = wide(count)
+    bar = window.document_area().bar()
+    for where, at in _slot_positions(count):
+        bar.set_ghost_slot(at, "incoming")
+        qt_app.processEvents()
+        slot = bar.ghost_slot_rect()
+        assert not slot.isEmpty(), where
+        for i in range(count):
+            painted = bar.painted_tab_rect(i)
+            assert not painted.intersects(slot), \
+                f"{where}: the slot covers tab {i} ({painted} vs {slot})"
+        bar.set_ghost_slot(None)
+        qt_app.processEvents()
+
+
+@pytest.mark.parametrize("count", [2, 3, 4])
+def test_every_real_tab_still_paints_its_name_while_the_slot_is_open(
+        wide, count, qt_app):
+    """THE DEFECT, AS PIXELS, and the assertion the last two ghost bugs got
+    past. Each tab is rendered before the slot opens and again after, and the
+    two have to be the same picture, moved: same title, same dirty dot, same
+    close button, same fill on the selected one.
+
+    A tab whose name has been painted over fails on the first row of the name,
+    which is the failure that shipped.
+    """
+    window = wide(count)
+    bar = window.document_area().bar()
+    clean = _render(bar)
+    before = [bar.tabRect(i) for i in range(count)]
+    assert {r.width() for r in before} == {TAB_MAX_WIDTH}, \
+        "the fixture is meant to pin every tab at the ceiling"
+
+    for where, at in _slot_positions(count):
+        bar.set_ghost_slot(at, "incoming")
+        qt_app.processEvents()
+        lit = _render(bar)
+        for i in range(count):
+            was, now = before[i], bar.painted_tab_rect(i)
+            assert now.size() == was.size(), f"{where}: tab {i} changed size"
+            for dx in range(was.width()):
+                for dy in range(was.height()):
+                    assert (lit.pixel(now.left() + dx, now.top() + dy)
+                            == clean.pixel(was.left() + dx,
+                                           was.top() + dy)), \
+                        f"{where}: tab {i} differs at ({dx}, {dy})"
+            band = _label_band(bar, now)
+            assert _textured_columns(lit, band), \
+                f"{where}: tab {i} has no name in it at all"
+        bar.set_ghost_slot(None)
+        qt_app.processEvents()
+
+
+def test_the_slot_shows_the_name_of_the_document_that_is_landing(
+        wide, qt_app):
+    """THE HALF LUCAS ASKED FOR RATHER THAN REPORTED. An empty gap says
+    something is arriving; a named one says which, which is the only question
+    worth asking when both windows say Untitled."""
+    window = wide(3)
+    bar = window.document_area().bar()
+    bar.set_ghost_slot(1, "arriving")
+    qt_app.processEvents()
+
+    assert bar.ghost_slot_text() == "arriving"
+    band = bar.ghost_slot_text_rect()
+    assert not band.isEmpty()
+    assert bar.ghost_slot_rect().contains(band), "the name is inside the slot"
+
+    # Held off the slot's top and bottom edges, which carry the amber ring and
+    # would read as texture whether or not a name had been drawn.
+    band = band.adjusted(0, 3, 0, -3)
+    lit = _render(bar)
+    bar.set_ghost_slot(1, "")
+    qt_app.processEvents()
+    nameless = _render(bar)
+    assert _textured_columns(lit, band), "nothing was painted in the slot"
+    assert not _textured_columns(nameless, band), \
+        "the nameless slot is a flat fill, so the texture above IS the name"
+
+
+def test_the_name_in_the_slot_elides_the_way_a_real_tabs_name_elides(
+        wide, qt_app):
+    """Same font, same elide mode, same room. A slot that let a long name run
+    on would push it under the close button and out of the gap, which is the
+    thing the ghost is supposed to be a picture of."""
+    window = wide(3)
+    bar = window.document_area().bar()
+    long_name = "a rather long document name that will not fit.pdf"
+    bar.set_ghost_slot(1, long_name)
+    qt_app.processEvents()
+
+    drawn = bar.ghost_slot_text()
+    metrics = QFontMetrics(bar.font())
+    assert drawn != long_name, "it has to be shortened"
+    assert drawn == metrics.elidedText(
+        long_name, bar.elideMode(), bar.ghost_slot_text_rect().width())
+    assert metrics.horizontalAdvance(drawn) \
+        <= bar.ghost_slot_text_rect().width()
+
+    bar.set_ghost_slot(1, "short")
+    qt_app.processEvents()
+    assert bar.ghost_slot_text() == "short", "and left alone when it fits"
+
+
+def test_a_carried_tabs_own_title_survives_being_ghosted(two_windows):
+    """THE OTHER GESTURE, WHICH WAS NEVER BROKEN AND MUST NOT BECOME SO.
+
+    A tab carried out of a multi-tab window really joins the target strip, so
+    its slot is a real tab painted as a ghost, and the veil is a fade rather
+    than a fill precisely so the tab's own name reads through it. That is what
+    says WHICH document is about to land, and it is the property the empty
+    slot was missing.
+    """
+    a, b = two_windows
+    bar = b.document_area().bar()
+    view = a.document_area().view_at(0)
+    tear = a.document_area().bar()._tear_off
+    _carried_into(tear, a, b, view, 1)
+
+    band = _label_band(bar, bar.tabRect(1))
+    clean = len(_textured_columns(_render(bar), band))
+    assert clean, "the fixture's tab has no name to lose"
+
+    tear._show_drop_feedback((b, 1))
+    assert bar.ghost_index() == 1
+    ghosted = len(_textured_columns(_render(bar), band))
+    assert ghosted >= clean * 0.6, \
+        f"the veil swallowed the title ({ghosted} columns of {clean})"
+
+
+def test_the_slot_is_named_from_the_tab_that_is_being_carried(two_windows):
+    """End to end through the gesture rather than through the setter. The name
+    is captured when the tear begins and handed to the strip under the cursor,
+    so a window that has since moved or emptied is never asked for it."""
+    a, b = two_windows
+    bar = b.document_area().bar()
+    tear = a.document_area().bar()._tear_off
+    view = a.document_area().view_at(0)
+    _pretend_dragging(tear, a, view)
+    tear._whole_window = True
+
+    carried = a.document_area().bar().tabText(0)
+    assert carried, "the source tab has a label to carry"
+    assert tear.carried_title() == carried
+
+    tear._show_drop_feedback((b, 1))
+    assert bar.ghost_slot_index() == 1
+    assert bar.ghost_slot_title() == carried
+    assert bar.ghost_slot_text().rstrip("…") in carried
+
+    tear._clear_drop_feedback()
+    assert bar.ghost_slot_index() is None
+    assert bar.ghost_slot_text() == ""
+
+
+def test_the_slot_takes_a_share_of_the_strip_like_the_tab_it_stands_for(
+        wide, qt_app):
+    """The gap is the width the arriving tab will actually have, not a width
+    borrowed from the tabs that are already there.
+
+    It matters twice. The gap has to be honest, or the strip jumps on the
+    drop; and the bar has to be able to HAVE the width it asks for, which it
+    could not while the slot was a whole extra tab on top of a full budget. A
+    bar denied its hint scrolls instead of parting.
+    """
+    window = wide(4)
+    bar = window.document_area().bar()
+    was = bar.width()
+    bar.set_ghost_slot(2, "incoming")
+    qt_app.processEvents()
+
+    assert bar.width() >= was + bar.ghost_slot_width(), "the strip parted"
+    assert bar.width() <= bar.sizeHint().width(), "and it fits"
+    assert bar.ghost_slot_width() == bar.tabRect(0).width(), \
+        "the gap is one tab wide"
+    last = bar.painted_tab_rect(bar.count() - 1)
+    assert last.right() < bar.width(), "and the last tab is still on the bar"
