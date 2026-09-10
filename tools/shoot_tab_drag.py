@@ -2,9 +2,17 @@
 
 WHY THIS EXISTS. The test suite runs under QT_QPA_PLATFORM=offscreen, forced in
 tests/conftest.py, and offscreen has no window procedure, no compositor and no
-z-order. It will happily tell you that `drop_indicator()` is set while nothing
-whatsoever is on screen, so a green suite is not evidence that drag feedback is
-visible. Two defects in one day got through exactly that gap.
+z-order. It will happily tell you that `ghost_index()` names a tab, or that
+`drop_indicator()` is set, while nothing whatsoever is on screen, so a green
+suite is not evidence that drag feedback is visible. Two defects in one day got
+through exactly that gap.
+
+WHAT IT IS PHOTOGRAPHING IS A GHOST. Nothing is torn out until the button comes
+up: a carried tab is a tab-sized picture following the cursor, the strip it is
+near parts around it and paints the arriving tab dimmed, and the window is only
+built on the release. So the shots are, in order, the strip at rest, the ghost
+in mid-air, the target strip parted with the ghost slot open, and the tab
+landed. See ui/tab_tear_off.py.
 
 So this does the two things the suite cannot. It drives the gesture through
 Win32 SendInput, which is the same real input path a hand produces, and it
@@ -39,7 +47,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import fitz
 from PySide6.QtCore import QPoint, QTimer
 from PySide6.QtGui import QCursor, QGuiApplication
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QWidget
 
 from ui.theme import ThemeMode, apply_theme
 from ui.window_registry import WindowRegistry
@@ -186,6 +194,12 @@ def main():
         below = bar.mapToGlobal(QPoint(bar.rect().center().x(),
                                        bar.rect().bottom()))
         target = bar_point(win_b, 0)
+        # Read before the button goes down, so the landing probe has something
+        # to compare against. A tab joins the target strip LIVE, on approach,
+        # so B is already up by one by the time the drop happens; what the
+        # release has to leave behind is that move made permanent, with the
+        # feedback off both strips and the grab given back.
+        counts = (win_a.document_area().count(), win_b.document_area().count())
 
         script = [
             ("shot", f"{name}-1-before"),
@@ -194,12 +208,13 @@ def main():
             ("move", QPoint(start.x(), start.y() + 12)),
             ("move", QPoint(start.x(), below.y() + 40)),
             ("move", QPoint(start.x(), below.y() + 90)),
-            ("shot", f"{name}-2-torn"),
+            ("shot", f"{name}-2-ghost-in-flight"),
             ("move", QPoint(target.x() + 140, target.y() - 120)),
             ("aim", None),
             ("probe", name),
             ("shot", f"{name}-3-over-target-strip"),
             ("up", None),
+            ("landed", name),
             ("shot", f"{name}-4-after-drop"),
         ]
 
@@ -249,6 +264,29 @@ def main():
                     # feedback that has to be up. The line belongs to the
                     # whole-window merge and would be wrong on this path.
                     state["ok"][arg] = ghost is not None
+                elif kind == "landed":
+                    # THE EXIT CODE CLAIMS THE DRAG LANDED, so something has to
+                    # ask. Nothing did until now, and a tool that reports on a
+                    # thing it never checked is worse than one that says less.
+                    app.processEvents()
+                    tear = win_a.document_area().bar()._tear_off
+                    a_now = win_a.document_area().count()
+                    b_now = win_b.document_area().count()
+                    ghost, line = feedback_of(win_b)
+                    _, a_line = feedback_of(win_a)
+                    landed = (not tear.is_dragging()
+                              and tear.ghost() is None
+                              and a_now == counts[0] - 1
+                              and b_now == counts[1] + 1
+                              and ghost is None and line is None
+                              and a_line is None
+                              and QWidget.mouseGrabber() is None)
+                    say(f"    [{arg}] landed: dragging={tear.is_dragging()} "
+                        f"A={a_now} (was {counts[0]}) "
+                        f"B={b_now} (was {counts[1]}) "
+                        f"B.ghost_index={ghost} B.drop_indicator={line} "
+                        f"grabber={QWidget.mouseGrabber()}")
+                    state["ok"][f"{arg}-landed"] = landed
             except RuntimeError as exc:
                 say(f"!!! RuntimeError at step {kind}: {exc}")
                 timer.stop()
